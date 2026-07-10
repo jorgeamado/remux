@@ -1,0 +1,184 @@
+//! End-to-end integration test of the WebSocket <-> tmux path, on an isolated
+//! tmux server (REMUX_TMUX_SOCKET). Skipped when tmux is not installed.
+
+mod common;
+
+use futures_util::{SinkExt, StreamExt};
+use std::process::Command;
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+type Ws = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+async fn next_json(ws: &mut Ws) -> serde_json::Value {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("timed out waiting for JSON frame")
+            .expect("socket closed")
+            .expect("socket error");
+        if let WsMsg::Text(t) = msg {
+            return serde_json::from_str(&t).expect("invalid JSON from server");
+        }
+    }
+}
+
+async fn collect_output_until(ws: &mut Ws, needle: &str) -> String {
+    let mut acc = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for output containing {needle:?}; got so far: {acc:?}"))
+            .expect("socket closed")
+            .expect("socket error");
+        if let WsMsg::Binary(b) = msg {
+            acc.push_str(&String::from_utf8_lossy(&b));
+            if acc.contains(needle) {
+                return acc;
+            }
+        }
+    }
+}
+
+fn tmux_sock(sock: &str, args: &[&str]) -> String {
+    let out = Command::new("tmux")
+        .arg("-L")
+        .arg(sock)
+        .args(args)
+        .output()
+        .expect("tmux");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn full_terminal_flow_over_tmux() {
+    if !common::tmux_available() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let sock = format!("remux-it-{}", common::rand_suffix());
+    std::env::set_var("REMUX_TMUX_SOCKET", &sock);
+    let session = "itmain";
+    let (addr, app) = common::start_server(session).await;
+
+    let pairing = app.auth.new_pairing_token();
+    let device_token = app.auth.pair(&pairing, "it-device").unwrap();
+    let url = format!("ws://{addr}/ws");
+
+    // --- Bad token is rejected before anything happens. ---
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "auth", "token": "bogus"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = next_json(&mut ws).await;
+    assert_eq!(err["type"], "error");
+    assert_eq!(err["code"], "auth_failed");
+    drop(ws);
+
+    // --- Real flow. ---
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "auth", "token": device_token, "cols": 100, "rows": 30})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let status = next_json(&mut ws).await;
+    assert_eq!(status["type"], "status", "unexpected: {status}");
+    assert_eq!(status["state"], "observer");
+    assert_eq!(status["session"], session);
+
+    // Observers cannot type.
+    ws.send(WsMsg::binary(b"ls\r".to_vec())).await.unwrap();
+    let err = next_json(&mut ws).await;
+    assert_eq!(err["code"], "observer");
+
+    // Take control.
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "take_control"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let status = next_json(&mut ws).await;
+    assert_eq!(status["type"], "status", "unexpected: {status}");
+    assert_eq!(status["state"], "controller");
+
+    // Type a command; $((...)) ensures the marker only exists in *output*,
+    // never in our typed input echo.
+    ws.send(WsMsg::binary(b"echo remux$((1+1))marker\r".to_vec()))
+        .await
+        .unwrap();
+    collect_output_until(&mut ws, "remux2marker").await;
+
+    // Resize: as the latest active client we should drive the window size.
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "resize", "cols": 90, "rows": 28}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut sized = false;
+    for _ in 0..50 {
+        let wh = tmux_sock(
+            &sock,
+            &[
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                "#{window_width} #{window_height}",
+            ],
+        );
+        // window height = client rows minus one for the tmux status line
+        if wh == "90 27" {
+            sized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !sized {
+        let dbg_clients = tmux_sock(
+            &sock,
+            &["list-clients", "-F", "#{client_width}x#{client_height} #{client_flags}"],
+        );
+        let dbg_win = tmux_sock(
+            &sock,
+            &["list-windows", "-a", "-F", "#{session_name}:#{window_index} #{window_width}x#{window_height} #{window_size}"],
+        );
+        panic!("window did not resize to 90x28; clients: {dbg_clients:?}; window: {dbg_win:?}");
+    }
+
+    // tmux should report exactly one attached client, in writable mode.
+    let clients = tmux_sock(&sock, &["list-clients", "-F", "#{client_flags}"]);
+    assert_eq!(clients.lines().count(), 1, "clients: {clients:?}");
+    assert!(
+        !clients.contains("read-only"),
+        "controller should not be read-only: {clients:?}"
+    );
+
+    // Disconnect: the attach client must disappear (this is what gives the
+    // Mac its dimensions back instantly).
+    ws.close(None).await.unwrap();
+    drop(ws);
+    let mut gone = false;
+    for _ in 0..50 {
+        let clients = tmux_sock(&sock, &["list-clients", "-F", "#{client_name}"]);
+        if clients.is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "tmux client still attached after disconnect");
+
+    // Session itself must survive the disconnect (persistence!).
+    let sessions = tmux_sock(&sock, &["list-sessions", "-F", "#{session_name}"]);
+    assert!(sessions.contains(session));
+
+    tmux_sock(&sock, &["kill-server"]);
+}

@@ -1,0 +1,53 @@
+use clap::Parser;
+use remux::{auth::Auth, server, App, Args};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// Start the real router on an ephemeral port with a fresh state dir.
+/// Returns the bound address and the app (for minting pairing tokens).
+pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("remux=trace")
+        .try_init();
+    let dir = std::env::temp_dir().join(format!(
+        "remux-it-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = Auth::load(dir.join("devices.json")).unwrap();
+
+    let args = Args::parse_from(["remux", "--session", session, "--no-pair"]);
+    let app = Arc::new(App {
+        allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+        auth,
+        args,
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = server::router(app.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (addr, app)
+}
+
+pub fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+pub fn tmux_available() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}

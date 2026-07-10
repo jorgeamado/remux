@@ -7,12 +7,13 @@ export interface TermHandle {
   fit: () => void;
   onResize: (cb: (cols: number, rows: number) => void) => void;
   size: () => { cols: number; rows: number };
+  setFontSize: (px: number) => void;
 }
 
-export function createTerminal(container: HTMLElement): TermHandle {
+export function createTerminal(container: HTMLElement, fontSize = 14): TermHandle {
   const term = new Terminal({
     cursorBlink: true,
-    fontSize: 14,
+    fontSize,
     fontFamily: "ui-monospace, Menlo, Consolas, monospace",
     scrollback: 2000,
     allowProposedApi: false,
@@ -62,5 +63,9 @@ export function createTerminal(container: HTMLElement): TermHandle {
     fit,
     onResize: (cb) => (resizeCb = cb),
     size: () => ({ cols: term.cols, rows: term.rows }),
+    setFontSize: (px) => {
+      term.options.fontSize = px;
+      fit();
+    },
   };
 }

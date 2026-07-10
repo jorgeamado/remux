@@ -4,6 +4,9 @@ import { setupKeyRow, applyCtrl } from "./keys";
 import { setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
+const FONT_KEY = "remux.font";
+const FONT_MIN = 10;
+const FONT_MAX = 22;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -12,6 +15,9 @@ const connDot = $("conn-dot");
 const sessionName = $("session-name");
 const rolePill = $("role-pill");
 const controlBtn = $<HTMLButtonElement>("control-btn");
+const menuBtn = $<HTMLButtonElement>("menu-btn");
+const menu = $("menu");
+const hint = $<HTMLButtonElement>("hint");
 const setup = $("setup");
 const setupError = $("setup-error");
 
@@ -19,11 +25,18 @@ const encoder = new TextEncoder();
 
 let ws: WebSocket | null = null;
 let isController = false;
+let sessionTitle = "";
 let reconnectDelay = 500;
 let reconnectTimer: number | undefined;
 let intentionalClose = false;
 
-const handle = createTerminal($("terminal"));
+// Input typed while still an observer is buffered and flushed once the
+// server grants control ("type to take control").
+let pendingInput = "";
+let controlRequested = false;
+
+let fontSize = parseInt(localStorage.getItem(FONT_KEY) ?? "14", 10) || 14;
+const handle = createTerminal($("terminal"), fontSize);
 
 // ---------- pairing ----------
 
@@ -60,25 +73,20 @@ function showSetup(message?: string): void {
   }
 }
 
-// ---------- connection ----------
+// ---------- status & hints ----------
 
-function sendJson(obj: unknown): void {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
+function setStatus(text: string, state: "connected" | "connecting" | "offline"): void {
+  sessionName.textContent = text;
+  connDot.classList.toggle("connected", state === "connected");
+  connDot.classList.toggle("connecting", state === "connecting");
 }
 
-function sendInput(data: string): void {
-  if (!isController) {
-    // Hint that input (typing, scrolling) needs control.
-    controlBtn.classList.remove("pulse");
-    void controlBtn.offsetWidth; // restart the animation
-    controlBtn.classList.add("pulse");
-    return;
-  }
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(encoder.encode(data));
-  }
+let hintTimer: number | undefined;
+function showHint(text: string): void {
+  hint.textContent = text;
+  hint.hidden = false;
+  clearTimeout(hintTimer);
+  hintTimer = window.setTimeout(() => (hint.hidden = true), 2500);
 }
 
 function setRole(controller: boolean): void {
@@ -88,7 +96,56 @@ function setRole(controller: boolean): void {
   rolePill.classList.toggle("controller", controller);
   controlBtn.hidden = false;
   controlBtn.textContent = controller ? "Release" : "Take control";
+  menuBtn.hidden = false;
 }
+
+// ---------- connection ----------
+
+function sendJson(obj: unknown): void {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+function requestControl(): void {
+  if (!controlRequested) {
+    controlRequested = true;
+    sendJson({ type: "take_control" });
+    showHint("Taking control…");
+  }
+}
+
+/// Send terminal input. Typing as an observer implicitly requests control
+/// and buffers the keystrokes; scrolling as an observer only hints (a glance
+/// shouldn't resize the session under the desktop user); automatic terminal
+/// protocol replies never take control and never hint.
+function sendInput(
+  data: string,
+  opts: { takeControl?: boolean; silent?: boolean } = {}
+): void {
+  if (!isController) {
+    if (opts.takeControl === false) {
+      if (!opts.silent) {
+        showHint("Observing — tap here to take control");
+      }
+      return;
+    }
+    pendingInput = (pendingInput + data).slice(-1024);
+    requestControl();
+    return;
+  }
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(encoder.encode(data));
+  }
+}
+
+/// xterm.js auto-answers terminal queries arriving in the output stream
+/// (Device Attributes, cursor position reports, DECRPM, OSC/DCS replies).
+/// These surface through onData exactly like keystrokes, but they are
+/// protocol, not typing — they must never trigger take-control.
+const RESPONSE_RE =
+  // eslint-disable-next-line no-control-regex
+  /^(?:\x1b\[\?[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\d+;\d+R|\x1b\[\??\d+n|\x1b\[\?[\d;]*\$y|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\)+$/;
 
 function connect(): void {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -97,6 +154,7 @@ function connect(): void {
     return;
   }
   setup.hidden = true;
+  setStatus("connecting…", "connecting");
 
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${scheme}://${location.host}/ws`);
@@ -116,9 +174,11 @@ function connect(): void {
   };
 
   ws.onclose = () => {
-    connDot.classList.remove("connected");
+    controlRequested = false;
+    pendingInput = "";
     setRole(false);
     if (!intentionalClose) {
+      setStatus("offline — reconnecting…", "offline");
       scheduleReconnect();
     }
     intentionalClose = false;
@@ -135,12 +195,26 @@ interface ControlMsg {
 
 function handleControl(msg: ControlMsg): void {
   switch (msg.type) {
-    case "status":
-      connDot.classList.add("connected");
+    case "status": {
       reconnectDelay = 500;
-      sessionName.textContent = msg.session ?? "";
-      setRole(msg.state === "controller");
+      sessionTitle = msg.session ?? "";
+      setStatus(sessionTitle, "connected");
+      const nowController = msg.state === "controller";
+      setRole(nowController);
+      if (nowController) {
+        hint.hidden = true;
+        controlRequested = false;
+        if (pendingInput) {
+          const buffered = pendingInput;
+          pendingInput = "";
+          sendInput(buffered);
+        }
+      } else {
+        controlRequested = false;
+        pendingInput = "";
+      }
       break;
+    }
     case "error":
       if (msg.code === "auth_failed") {
         localStorage.removeItem(TOKEN_KEY);
@@ -160,17 +234,72 @@ function scheduleReconnect(): void {
   }, reconnectDelay);
 }
 
+// ---------- menu (font size, paste) ----------
+
+function applyFont(px: number): void {
+  fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, px));
+  localStorage.setItem(FONT_KEY, String(fontSize));
+  handle.setFontSize(fontSize);
+}
+
+async function pasteFromClipboard(): Promise<void> {
+  let text = "";
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    /* insecure context or permission denied */
+  }
+  if (!text) {
+    text = window.prompt("Paste text to send:") ?? "";
+  }
+  if (text) {
+    // Goes through xterm so bracketed paste is applied when the app wants it.
+    handle.term.paste(text);
+  }
+  menu.hidden = true;
+}
+
+menuBtn.addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  menu.hidden = !menu.hidden;
+});
+document.addEventListener("click", (ev) => {
+  if (!menu.hidden && !menu.contains(ev.target as Node)) {
+    menu.hidden = true;
+  }
+});
+$("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
+$("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
+$("paste-btn").addEventListener("click", () => void pasteFromClipboard());
+
 // ---------- wire up ----------
 
-handle.term.onData((data) => sendInput(applyCtrl(data)));
+handle.term.onData((data) => {
+  if (RESPONSE_RE.test(data)) {
+    sendInput(data, { takeControl: false, silent: true });
+  } else {
+    sendInput(applyCtrl(data));
+  }
+});
 handle.onResize((cols, rows) => sendJson({ type: "resize", cols, rows }));
 
 controlBtn.addEventListener("click", () => {
-  sendJson({ type: isController ? "release_control" : "take_control" });
+  if (isController) {
+    sendJson({ type: "release_control" });
+  } else {
+    requestControl();
+  }
+});
+
+hint.addEventListener("click", () => {
+  hint.hidden = true;
+  requestControl();
 });
 
 setupKeyRow(sendInput);
-setupTouchScroll($("terminal"), handle.term, sendInput);
+setupTouchScroll($("terminal"), handle.term, (data) =>
+  sendInput(data, { takeControl: false })
+);
 
 $("pair-btn").addEventListener("click", async () => {
   const input = $<HTMLInputElement>("pair-input").value.trim();

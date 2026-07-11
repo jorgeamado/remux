@@ -8,9 +8,8 @@ use std::process::Command;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn next_json(ws: &mut Ws) -> serde_json::Value {
     loop {
@@ -31,7 +30,9 @@ async fn collect_output_until(ws: &mut Ws, needle: &str) -> String {
     loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
             .await
-            .unwrap_or_else(|_| panic!("timed out waiting for output containing {needle:?}; got so far: {acc:?}"))
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for output containing {needle:?}; got so far: {acc:?}")
+            })
             .expect("socket closed")
             .expect("socket error");
         if let WsMsg::Binary(b) = msg {
@@ -149,11 +150,20 @@ async fn full_terminal_flow_over_tmux() {
     if !sized {
         let dbg_clients = tmux_sock(
             &sock,
-            &["list-clients", "-F", "#{client_width}x#{client_height} #{client_flags}"],
+            &[
+                "list-clients",
+                "-F",
+                "#{client_width}x#{client_height} #{client_flags}",
+            ],
         );
         let dbg_win = tmux_sock(
             &sock,
-            &["list-windows", "-a", "-F", "#{session_name}:#{window_index} #{window_width}x#{window_height} #{window_size}"],
+            &[
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index} #{window_width}x#{window_height} #{window_size}",
+            ],
         );
         panic!("window did not resize to 90x28; clients: {dbg_clients:?}; window: {dbg_win:?}");
     }
@@ -165,6 +175,53 @@ async fn full_terminal_flow_over_tmux() {
         !clients.contains("read-only"),
         "controller should not be read-only: {clients:?}"
     );
+
+    // --- Session picker: an auth carrying a session name attaches (and
+    // creates) that session; invalid names are rejected before any tmux call. ---
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws2.send(WsMsg::text(
+        serde_json::json!({"type": "auth", "token": device_token, "session": "it-alt"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let status = next_json(&mut ws2).await;
+    assert_eq!(status["type"], "status", "unexpected: {status}");
+    assert_eq!(status["session"], "it-alt");
+    let sessions = tmux_sock(&sock, &["list-sessions", "-F", "#{session_name}"]);
+    assert!(sessions.contains("it-alt"), "sessions: {sessions:?}");
+    ws2.close(None).await.unwrap();
+    drop(ws2);
+
+    // The sessions API sees the same tmux server and parses real output.
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("http://{addr}/api/sessions"))
+        .header("Authorization", format!("Bearer {device_token}"))
+        .send()
+        .await
+        .unwrap();
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"itmain") && names.contains(&"it-alt"),
+        "sessions: {names:?}"
+    );
+
+    let (mut ws3, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws3.send(WsMsg::text(
+        serde_json::json!({"type": "auth", "token": device_token, "session": "bad:name"})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = next_json(&mut ws3).await;
+    assert_eq!(err["code"], "invalid_session", "unexpected: {err}");
+    drop(ws3);
 
     // --- Attention: a busy period (>= 1s of output) followed by quiet must
     // produce an attention frame on the websocket. ---

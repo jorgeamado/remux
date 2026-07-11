@@ -6,6 +6,7 @@ import { setupTouchScroll } from "./scroll";
 const TOKEN_KEY = "remux.device_token";
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
+const SESSION_KEY = "remux.session";
 const FONT_MIN = 10;
 const FONT_MAX = 22;
 
@@ -13,7 +14,8 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 
 const connDot = $("conn-dot");
-const sessionName = $("session-name");
+const sessionName = $<HTMLButtonElement>("session-name");
+const sessionMenu = $("session-menu");
 const rolePill = $("role-pill");
 const controlBtn = $<HTMLButtonElement>("control-btn");
 const menuBtn = $<HTMLButtonElement>("menu-btn");
@@ -163,7 +165,13 @@ function connect(): void {
 
   ws.onopen = () => {
     const { cols, rows } = handle.size();
-    sendJson({ type: "auth", token, cols, rows });
+    sendJson({
+      type: "auth",
+      token,
+      cols,
+      rows,
+      session: localStorage.getItem(SESSION_KEY) || undefined,
+    });
   };
 
   ws.onmessage = (ev) => {
@@ -225,6 +233,10 @@ function handleControl(msg: ControlMsg): void {
         intentionalClose = true;
         ws?.close();
         showSetup("This device is no longer paired. Pair it again.");
+      } else if (msg.code === "invalid_session") {
+        // Fall back to the server default; onclose will reconnect.
+        localStorage.removeItem(SESSION_KEY);
+        showHint("Session unavailable — using default");
       }
       break;
   }
@@ -237,6 +249,81 @@ function scheduleReconnect(): void {
     connect();
   }, reconnectDelay);
 }
+
+// ---------- session picker ----------
+
+interface SessionInfo {
+  name: string;
+  windows: number;
+  attached: number;
+}
+
+function menuItem(label: string, onClick: () => void): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.className = "btn";
+  btn.textContent = label;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+async function openSessionMenu(): Promise<void> {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) return;
+  let sessions: SessionInfo[];
+  try {
+    const resp = await fetch("/api/sessions", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) throw new Error(String(resp.status));
+    sessions = (await resp.json()) as SessionInfo[];
+  } catch {
+    showHint("Couldn't list sessions");
+    return;
+  }
+  sessionMenu.textContent = "";
+  for (const s of sessions) {
+    const marker = s.name === sessionTitle ? "● " : "";
+    const attached = s.attached > 0 ? " · attached" : "";
+    sessionMenu.appendChild(
+      menuItem(`${marker}${s.name} — ${s.windows}w${attached}`, () =>
+        switchSession(s.name)
+      )
+    );
+  }
+  sessionMenu.appendChild(
+    menuItem("New session…", () => {
+      const name = window.prompt("New session name:")?.trim();
+      if (!name) return;
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+        sessionMenu.hidden = true;
+        showHint("Names: letters, digits, - and _ only");
+        return;
+      }
+      switchSession(name);
+    })
+  );
+  sessionMenu.hidden = false;
+}
+
+function switchSession(name: string): void {
+  sessionMenu.hidden = true;
+  if (name === sessionTitle) return;
+  localStorage.setItem(SESSION_KEY, name);
+  intentionalClose = true;
+  ws?.close();
+  handle.term.reset(); // fresh grid; the new attach repaints everything
+  connect();
+}
+
+sessionName.addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  menu.hidden = true;
+  if (sessionMenu.hidden) {
+    void openSessionMenu();
+  } else {
+    sessionMenu.hidden = true;
+  }
+});
 
 // ---------- attention notifications ----------
 
@@ -324,11 +411,15 @@ async function pasteFromClipboard(): Promise<void> {
 
 menuBtn.addEventListener("click", (ev) => {
   ev.stopPropagation();
+  sessionMenu.hidden = true;
   menu.hidden = !menu.hidden;
 });
 document.addEventListener("click", (ev) => {
   if (!menu.hidden && !menu.contains(ev.target as Node)) {
     menu.hidden = true;
+  }
+  if (!sessionMenu.hidden && !sessionMenu.contains(ev.target as Node)) {
+    sessionMenu.hidden = true;
   }
 });
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));

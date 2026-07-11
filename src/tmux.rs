@@ -5,7 +5,9 @@ use std::process::Command;
 
 /// Socket name override so tests can run against an isolated tmux server.
 fn socket_name() -> Option<String> {
-    std::env::var("REMUX_TMUX_SOCKET").ok().filter(|s| !s.is_empty())
+    std::env::var("REMUX_TMUX_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn tmux() -> Command {
@@ -105,6 +107,54 @@ pub fn client_name_for_pid(pid: u32) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Only names tmux itself accepts everywhere and that are inert inside a
+/// target spec (no `:` `.` whitespace, which delimit tmux targets).
+pub fn valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+pub struct SessionInfo {
+    pub name: String,
+    pub windows: u32,
+    pub attached: u32,
+    pub activity: u64,
+}
+
+/// All sessions on the tmux server. Empty when no server is running yet.
+/// NB: tmux 3.3a replaces control characters (tabs included) in expanded
+/// formats with `_`, so fields are space-separated and parsed from the right
+/// (the name may contain spaces; the numeric fields cannot).
+pub fn list_sessions() -> Result<Vec<SessionInfo>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "list-sessions",
+        "-F",
+        "#{session_name} #{session_windows} #{session_attached} #{session_activity}",
+    ]);
+    let Ok(out) = run(cmd) else {
+        return Ok(Vec::new()); // no tmux server running
+    };
+    Ok(out.lines().filter_map(parse_session_line).collect())
+}
+
+fn parse_session_line(line: &str) -> Option<SessionInfo> {
+    let mut f = line.rsplitn(4, ' ');
+    let activity = f.next()?.parse().ok()?;
+    let attached = f.next()?.parse().ok()?;
+    let windows = f.next()?.parse().ok()?;
+    Some(SessionInfo {
+        name: f.next()?.to_string(),
+        windows,
+        attached,
+        activity,
+    })
+}
+
 /// Unix timestamp (seconds) of the most recent content change in any window
 /// of the session, from tmux's own activity tracking. None when the session
 /// does not exist (yet).
@@ -142,6 +192,38 @@ pub fn demote_client(client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_line_parsing() {
+        assert_eq!(
+            parse_session_line("main 2 1 1783793484"),
+            Some(SessionInfo {
+                name: "main".into(),
+                windows: 2,
+                attached: 1,
+                activity: 1783793484,
+            })
+        );
+        // Session names may contain spaces; numeric fields parse from the right.
+        assert_eq!(
+            parse_session_line("my session 12 0 99").unwrap().name,
+            "my session"
+        );
+        assert_eq!(parse_session_line("garbage"), None);
+        assert_eq!(parse_session_line(""), None);
+    }
+
+    #[test]
+    fn session_name_validation() {
+        assert!(valid_session_name("main"));
+        assert!(valid_session_name("work-2_a"));
+        assert!(!valid_session_name(""));
+        assert!(!valid_session_name("a:b")); // target separator
+        assert!(!valid_session_name("a.b")); // target separator
+        assert!(!valid_session_name("a b"));
+        assert!(!valid_session_name("../etc"));
+        assert!(!valid_session_name(&"x".repeat(65)));
+    }
 
     #[test]
     fn attach_args_shape() {

@@ -63,7 +63,10 @@ mod tests {
 
     #[test]
     fn host_of_url_variants() {
-        assert_eq!(host_of_url("https://a.ts.net:7777/x"), Some("a.ts.net".into()));
+        assert_eq!(
+            host_of_url("https://a.ts.net:7777/x"),
+            Some("a.ts.net".into())
+        );
         assert_eq!(host_of_url("http://10.0.0.1"), Some("10.0.0.1".into()));
         assert_eq!(host_of_url("no-scheme"), None);
     }

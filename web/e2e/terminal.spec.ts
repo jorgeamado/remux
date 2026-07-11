@@ -216,6 +216,27 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("200");
+
+  // --- Session picker: list, create a new session, switch back. ---
+  await page.locator("#session-name").click();
+  await expect(page.locator("#session-menu")).toBeVisible();
+  await expect(page.locator("#session-menu")).toContainText("e2emain");
+  page.once("dialog", (d) => void d.accept("e2etwo"));
+  await page
+    .locator("#session-menu .btn", { hasText: "New session…" })
+    .click();
+  await expect(page.locator("#session-name")).toHaveText("e2etwo", {
+    timeout: 10_000,
+  });
+  await page.locator("#session-name").click();
+  await page.locator("#session-menu .btn", { hasText: "e2emain" }).click();
+  await expect(page.locator("#session-name")).toHaveText("e2emain", {
+    timeout: 10_000,
+  });
+  // The original session's screen is intact after the roundtrip.
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("200");
 });
 
 test("invalid pairing token shows setup with error", async ({ page }) => {

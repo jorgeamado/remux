@@ -96,6 +96,40 @@ async fn pairing_flow() {
 }
 
 #[tokio::test]
+async fn sessions_require_device_token() {
+    let (addr, app) = start_server("it-sessions").await;
+    let client = reqwest::Client::new();
+
+    // no/bad token -> 401
+    let resp = client
+        .get(format!("http://{addr}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = client
+        .get(format!("http://{addr}/api/sessions"))
+        .header("Authorization", "Bearer bogus")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // paired device -> JSON array
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "t").unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/sessions"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.is_array(), "expected array, got {body}");
+}
+
+#[tokio::test]
 async fn serves_embedded_index() {
     let (addr, _app) = start_server("it-static").await;
     let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();

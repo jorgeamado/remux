@@ -84,7 +84,9 @@ impl Auth {
         let mut inner = self.inner.lock().unwrap();
 
         let now = Instant::now();
-        inner.attempts.retain(|t| now.duration_since(*t).as_secs() < 60);
+        inner
+            .attempts
+            .retain(|t| now.duration_since(*t).as_secs() < 60);
         if inner.attempts.len() as u32 >= PAIR_ATTEMPTS_PER_MIN {
             return Err(PairError::RateLimited);
         }

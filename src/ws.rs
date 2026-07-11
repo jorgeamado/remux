@@ -26,6 +26,9 @@ enum ClientMsg {
         cols: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        /// tmux session to attach (created if missing); server default if absent.
+        #[serde(default)]
+        session: Option<String>,
     },
     Resize {
         cols: u16,
@@ -69,39 +72,57 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // ---- Auth: nothing happens before a valid token arrives. ----
-    let (device, mut cols, mut rows) = match tokio::time::timeout(AUTH_TIMEOUT, ws_rx.next()).await
-    {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str(&text) {
-            Ok(ClientMsg::Auth { token, cols, rows }) => match app.auth.authenticate(&token) {
-                Some(device) => (device, cols.unwrap_or(80), rows.unwrap_or(24)),
-                None => {
+    let (device, mut cols, mut rows, requested_session) =
+        match tokio::time::timeout(AUTH_TIMEOUT, ws_rx.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str(&text) {
+                Ok(ClientMsg::Auth {
+                    token,
+                    cols,
+                    rows,
+                    session,
+                }) => match app.auth.authenticate(&token) {
+                    Some(device) => (device, cols.unwrap_or(80), rows.unwrap_or(24), session),
+                    None => {
+                        let _ = ws_tx
+                            .send(json(&ServerMsg::Error {
+                                code: "auth_failed",
+                                message: "invalid device token — re-pair this device",
+                            }))
+                            .await;
+                        let _ = ws_tx.send(Message::Close(None)).await;
+                        return Ok(());
+                    }
+                },
+                _ => {
                     let _ = ws_tx
                         .send(json(&ServerMsg::Error {
-                            code: "auth_failed",
-                            message: "invalid device token — re-pair this device",
+                            code: "auth_required",
+                            message: "first message must be auth",
                         }))
                         .await;
                     let _ = ws_tx.send(Message::Close(None)).await;
                     return Ok(());
                 }
             },
-            _ => {
-                let _ = ws_tx
-                    .send(json(&ServerMsg::Error {
-                        code: "auth_required",
-                        message: "first message must be auth",
-                    }))
-                    .await;
-                let _ = ws_tx.send(Message::Close(None)).await;
-                return Ok(());
-            }
-        },
-        _ => return Ok(()), // timeout, close or protocol error
-    };
+            _ => return Ok(()), // timeout, close or protocol error
+        };
     tracing::info!(%device, "client authenticated");
 
-    // ---- Spawn the per-connection tmux client inside a PTY. ----
-    let session = app.args.session.clone();
+    // ---- Resolve the target session (picker), then spawn the tmux client. ----
+    let session = match requested_session {
+        Some(name) if !tmux::valid_session_name(&name) => {
+            let _ = ws_tx
+                .send(json(&ServerMsg::Error {
+                    code: "invalid_session",
+                    message: "invalid session name",
+                }))
+                .await;
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return Ok(());
+        }
+        Some(name) => name,
+        None => app.args.session.clone(),
+    };
     tokio::task::spawn_blocking({
         let session = session.clone();
         move || tmux::ensure_session(&session)
@@ -239,8 +260,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                 Ok(ClientMsg::TakeControl) => match &client_name {
                     Some(name) => {
                         let name = name.clone();
-                        let res =
-                            tokio::task::spawn_blocking(move || tmux::promote_client(&name)).await?;
+                        let res = tokio::task::spawn_blocking(move || tmux::promote_client(&name))
+                            .await?;
                         match res {
                             Ok(()) => {
                                 controller = true;

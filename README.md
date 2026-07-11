@@ -24,6 +24,8 @@ Phone  → PWA (xterm.js) → remux → tmux client (PTY)
   (`window-size latest`). Typing on your desktop takes it back automatically.
 - Locking the phone or losing signal just detaches that tmux client — your
   desktop immediately gets its dimensions back.
+- Tap the session name in the top bar to switch to another tmux session or
+  create a new one.
 
 ## Install
 
@@ -133,10 +135,11 @@ session has been busy and then goes quiet — a build finished, Claude Code is
 waiting for your answer — remux notifies you, but only while the app isn't
 visible on screen. Note: if the OS suspends the page (locked iPhone), delivery
 resumes when the socket does; real push is on the roadmap (V2, Web Push).
+Attention is tracked for the daemon's default session (`--session`).
 
 ## Roadmap
 
-V1.x: session picker, device management UI.
+V1.x: device management UI, launchd/systemd unit files.
 V2: tmux control-mode metadata (panes as tabs/cards), snapshot/delta sync with
 a custom renderer, server-paged scrollback. V3: shell integration (OSC 133),
 semantic command feed, Claude Code approval cards, push notifications.

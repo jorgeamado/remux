@@ -20,10 +20,27 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/pair", post(pair))
+        .route("/api/sessions", get(sessions))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
+}
+
+/// Device-token check for plain HTTP endpoints (`Authorization: Bearer <token>`).
+fn bearer_device(app: &App, headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    app.auth.authenticate(value.strip_prefix("Bearer ")?)
+}
+
+async fn sessions(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if bearer_device(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    }
+    match tokio::task::spawn_blocking(crate::tmux::list_sessions).await {
+        Ok(Ok(list)) => Json(list).into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "tmux error").into_response(),
+    }
 }
 
 pub async fn run(app: Arc<App>) -> Result<()> {
@@ -97,7 +114,9 @@ fn strip_port(host: &str) -> &str {
 }
 
 fn allowed(app: &App, host: &str) -> bool {
-    app.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+    app.allowed_hosts
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(host))
 }
 
 #[derive(Deserialize)]

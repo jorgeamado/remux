@@ -203,7 +203,10 @@ wake lock while visible.
 - **V1 (built)**: daemon + PWA, pair, attach, live terminal, input, resize,
   take/release control, reconnect, TLS via tailscale cert.
 - **V1.x**: ~~attention notification (pane quiet + waiting heuristic)~~ done;
-  session picker, launchd/systemd unit files, device management UI.
+  ~~session picker~~ done (tap the session name: list/switch/create; any paired
+  device may attach to any session, per the original design's decision #7);
+  launchd/systemd unit files, device management UI.
+  NB: the attention monitor watches the daemon's default `--session` only.
 - **V2**: control-mode metadata client (panes as cards/tabs), snapshot/delta sync +
   custom renderer, server-paged scrollback, paste confirmation UX.
 - **V3**: shell integration (OSC 133 / hooks), semantic feed ("chat mode"),

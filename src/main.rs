@@ -36,7 +36,11 @@ async fn main() -> Result<()> {
     tmux::ensure_session(&args.session)?;
     tracing::info!(session = %args.session, "tmux session ready");
 
-    let scheme = if args.tls_cert.is_some() { "https" } else { "http" };
+    let scheme = if args.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let public_url = args
         .url
         .clone()

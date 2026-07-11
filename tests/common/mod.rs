@@ -9,11 +9,8 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("remux=trace")
         .try_init();
-    let dir = std::env::temp_dir().join(format!(
-        "remux-it-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("remux-it-{}-{}", std::process::id(), rand_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     let auth = Auth::load(dir.join("devices.json")).unwrap();
 

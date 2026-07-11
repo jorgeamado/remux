@@ -204,6 +204,7 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect(page.locator("#menu")).toBeVisible();
   await page.locator("#font-inc").click();
   expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("15");
+  await expect(page.locator("#notify-btn")).toHaveText("Notifications: off");
   await page.locator("#topbar").click();
   await expect(page.locator("#menu")).toBeHidden();
 

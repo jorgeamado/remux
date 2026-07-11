@@ -61,6 +61,11 @@ async fn full_terminal_flow_over_tmux() {
     }
     let sock = format!("remux-it-{}", common::rand_suffix());
     std::env::set_var("REMUX_TMUX_SOCKET", &sock);
+    // Fast attention thresholds so the busy→quiet heuristic is testable.
+    // window_activity has whole-second resolution, hence >= 1s values.
+    std::env::set_var("REMUX_ATTENTION_POLL_SECS", "0.2");
+    std::env::set_var("REMUX_ATTENTION_MIN_BUSY_SECS", "1");
+    std::env::set_var("REMUX_ATTENTION_QUIET_SECS", "2");
     let session = "itmain";
     let (addr, app) = common::start_server(session).await;
 
@@ -160,6 +165,28 @@ async fn full_terminal_flow_over_tmux() {
         !clients.contains("read-only"),
         "controller should not be read-only: {clients:?}"
     );
+
+    // --- Attention: a busy period (>= 1s of output) followed by quiet must
+    // produce an attention frame on the websocket. ---
+    ws.send(WsMsg::binary(
+        b"for i in 1 2 3 4; do echo busy$i; sleep 0.5; done\r".to_vec(),
+    ))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("timed out waiting for attention frame")
+            .expect("socket closed")
+            .expect("socket error");
+        if let WsMsg::Text(t) = msg {
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "attention" {
+                break;
+            }
+        }
+    }
 
     // Disconnect: the attach client must disappear (this is what gives the
     // Mac its dimensions back instantly).

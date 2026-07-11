@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod auth;
 pub mod server;
 pub mod tmux;
@@ -46,6 +47,8 @@ pub struct App {
     pub args: Args,
     pub auth: auth::Auth,
     pub allowed_hosts: Vec<String>,
+    /// Attention events fanned out to every connected websocket.
+    pub attention: tokio::sync::broadcast::Sender<()>,
 }
 
 pub fn host_of_url(url: &str) -> Option<String> {

@@ -58,8 +58,10 @@ async fn main() -> Result<()> {
         allowed_hosts,
         auth,
         args,
+        attention: tokio::sync::broadcast::channel(16).0,
     });
 
+    remux::attention::spawn(app.clone());
     server::run(app).await
 }
 

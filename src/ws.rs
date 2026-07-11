@@ -48,6 +48,8 @@ enum ServerMsg<'a> {
         code: &'a str,
         message: &'a str,
     },
+    /// The session was busy and went quiet — likely finished or waiting.
+    Attention,
     Pong,
 }
 
@@ -168,6 +170,25 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Fan attention events from the monitor into this connection.
+    let attention_task = tokio::spawn({
+        let mut rx = app.attention.subscribe();
+        let out = out_tx.clone();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(()) => {
+                        if out.send(json(&ServerMsg::Attention)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -278,6 +299,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // Connection gone: kill the attach client. tmux drops it from sizing and the
     // remaining clients (e.g. the Mac) immediately get their dimensions back.
     let _ = child.kill();
+    attention_task.abort();
     sender.abort();
     tracing::info!(%device, "client disconnected");
     Ok(())

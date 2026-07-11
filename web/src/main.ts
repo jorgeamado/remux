@@ -5,6 +5,7 @@ import { setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
 const FONT_KEY = "remux.font";
+const NOTIFY_KEY = "remux.notify";
 const FONT_MIN = 10;
 const FONT_MAX = 22;
 
@@ -215,6 +216,9 @@ function handleControl(msg: ControlMsg): void {
       }
       break;
     }
+    case "attention":
+      onAttention();
+      break;
     case "error":
       if (msg.code === "auth_failed") {
         localStorage.removeItem(TOKEN_KEY);
@@ -232,6 +236,65 @@ function scheduleReconnect(): void {
     reconnectDelay = Math.min(reconnectDelay * 2, 8000);
     connect();
   }, reconnectDelay);
+}
+
+// ---------- attention notifications ----------
+
+/// The daemon says the session was busy and went quiet (job finished, or a
+/// program is waiting for input). Only relevant when the user isn't looking;
+/// while the terminal is on screen the event is self-evident.
+let notifyPref = localStorage.getItem(NOTIFY_KEY) === "on";
+const notifyBtn = $<HTMLButtonElement>("notify-btn");
+
+function renderNotifyBtn(): void {
+  notifyBtn.textContent = `Notifications: ${notifyPref ? "on" : "off"}`;
+}
+
+async function toggleNotify(): Promise<void> {
+  if (notifyPref) {
+    notifyPref = false;
+  } else {
+    if (!("Notification" in window)) {
+      showHint("Notifications aren't supported here");
+      return;
+    }
+    // Must happen inside this user gesture.
+    if ((await Notification.requestPermission()) !== "granted") {
+      showHint("Notifications are blocked by the browser");
+      return;
+    }
+    notifyPref = true;
+  }
+  localStorage.setItem(NOTIFY_KEY, notifyPref ? "on" : "off");
+  renderNotifyBtn();
+}
+
+function onAttention(): void {
+  if (document.visibilityState === "visible") {
+    return;
+  }
+  document.title = "● remux";
+  if (!notifyPref || !("Notification" in window) || Notification.permission !== "granted") {
+    return;
+  }
+  const opts: NotificationOptions = {
+    body: `${sessionTitle || "session"} may need your attention`,
+    tag: "remux-attention", // replaces, never stacks
+    icon: "/icon-512.png",
+  };
+  void navigator.serviceWorker
+    ?.getRegistration()
+    .then((reg) => {
+      if (reg) return reg.showNotification("remux", opts);
+      new Notification("remux", opts);
+    })
+    .catch(() => {
+      try {
+        new Notification("remux", opts);
+      } catch {
+        /* platform without page-created notifications */
+      }
+    });
 }
 
 // ---------- menu (font size, paste) ----------
@@ -271,6 +334,8 @@ document.addEventListener("click", (ev) => {
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
 $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
 $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
+notifyBtn.addEventListener("click", () => void toggleNotify());
+renderNotifyBtn();
 
 // ---------- wire up ----------
 
@@ -321,6 +386,7 @@ $("pair-btn").addEventListener("click", async () => {
 // background sockets; the daemon treats the dead socket as release).
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    document.title = "remux"; // clear the attention badge
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       clearTimeout(reconnectTimer);
       connect();

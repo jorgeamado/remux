@@ -126,9 +126,17 @@ cd web && npx playwright install chromium && npm run e2e
 The web client dev loop: `cd web && npm run dev` proxies `/api` and `/ws` to a
 locally running daemon on `127.0.0.1:7777`.
 
+## Notifications
+
+Toggle **Notifications** in the aA menu (asks for browser permission). When the
+session has been busy and then goes quiet — a build finished, Claude Code is
+waiting for your answer — remux notifies you, but only while the app isn't
+visible on screen. Note: if the OS suspends the page (locked iPhone), delivery
+resumes when the socket does; real push is on the roadmap (V2, Web Push).
+
 ## Roadmap
 
-V1.x: attention notifications, session picker, device management UI.
+V1.x: session picker, device management UI.
 V2: tmux control-mode metadata (panes as tabs/cards), snapshot/delta sync with
 a custom renderer, server-paged scrollback. V3: shell integration (OSC 133),
 semantic command feed, Claude Code approval cards, push notifications.

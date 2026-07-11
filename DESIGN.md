@@ -6,10 +6,25 @@ remux gives you your tmux session on your phone. Start work on the Mac (mosh →
 glance at Claude Code from the phone, type a reply, put the phone down, keep typing on
 the Mac — nothing restarts, nothing re-attaches.
 
-This document distills the original architecture discussion (see the ChatGPT design
-conversation) plus a four-perspective design review (Rust/systems architect, tmux
-internals expert, security engineer, frontend/product engineer) into the V1 design
-actually being built.
+This document distills the original architecture discussion (archived in
+[docs/design-chat.md](docs/design-chat.md)) plus a four-perspective design review
+(Rust/systems architect, tmux internals expert, security engineer, frontend/product
+engineer) into the V1 design actually being built.
+
+## Implementation status (2026-07-11)
+
+- **V1: done.** Daemon + PWA, pairing, attach, live terminal, input, resize,
+  take/release control, reconnect, TLS, Host/Origin guard; unit + integration +
+  Playwright e2e tests; UX polish (type-to-take-control, key repeat, aA menu).
+- **V1.x attention notifications: done.** Daemon-side busy→quiet heuristic on
+  tmux `window_activity`, broadcast as an `attention` frame; the PWA shows a
+  system notification (opt-in toggle in the aA menu) only when the app is not
+  visible. True push while the phone is locked still requires Web Push (V2) —
+  on iOS the socket dies in the background, so delivery today is desktop/
+  Android browsers and momentarily-hidden tabs.
+- Everything else the conversation wanted that isn't built (session picker, panes
+  as cards/tabs, chat feed, shell integration, push) is intentionally deferred —
+  see roadmap.
 
 ## Core use case
 
@@ -185,10 +200,10 @@ wake lock while visible.
 
 ## Roadmap
 
-- **V1 (this build)**: daemon + PWA, pair, attach, live terminal, input, resize,
+- **V1 (built)**: daemon + PWA, pair, attach, live terminal, input, resize,
   take/release control, reconnect, TLS via tailscale cert.
-- **V1.x**: attention notification (pane quiet + waiting heuristic), session picker,
-  launchd/systemd unit files, device management UI.
+- **V1.x**: ~~attention notification (pane quiet + waiting heuristic)~~ done;
+  session picker, launchd/systemd unit files, device management UI.
 - **V2**: control-mode metadata client (panes as cards/tabs), snapshot/delta sync +
   custom renderer, server-paged scrollback, paste confirmation UX.
 - **V3**: shell integration (OSC 133 / hooks), semantic feed ("chat mode"),

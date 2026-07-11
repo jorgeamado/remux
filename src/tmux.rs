@@ -105,6 +105,24 @@ pub fn client_name_for_pid(pid: u32) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Unix timestamp (seconds) of the most recent content change in any window
+/// of the session, from tmux's own activity tracking. None when the session
+/// does not exist (yet).
+pub fn last_activity(session: &str) -> Result<Option<u64>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "list-windows",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{window_activity}",
+    ]);
+    match run(cmd) {
+        Ok(out) => Ok(out.lines().filter_map(|l| l.trim().parse().ok()).max()),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Promote our attach client to controller (drives window size).
 pub fn promote_client(client: &str) -> Result<()> {
     let mut cmd = tmux();

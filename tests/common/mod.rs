@@ -22,7 +22,9 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
         auth,
         args,
+        attention: tokio::sync::broadcast::channel(16).0,
     });
+    remux::attention::spawn(app.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

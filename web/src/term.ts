@@ -9,6 +9,8 @@ export interface TermHandle {
   onResize: (cb: (cols: number, rows: number) => void) => void;
   size: () => { cols: number; rows: number };
   setFontSize: (px: number) => void;
+  /// Sizing diagnostics — surfaced in the UI to debug device-specific grids.
+  debug: () => string;
   /// Allow/forbid typing straight into the terminal. When off, taps never
   /// focus xterm's hidden textarea (no on-screen keyboard); the composer and
   /// key row remain the input surfaces. Mouse/touch reports are unaffected.
@@ -19,7 +21,9 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
   const term = new Terminal({
     cursorBlink: true,
     fontSize,
-    fontFamily: "ui-monospace, Menlo, Consolas, monospace",
+    // Concrete iOS-available monospace first: a font that resolves
+    // differently between measurement and render skews the cell size.
+    fontFamily: "Menlo, Monaco, 'Courier New', ui-monospace, monospace",
     scrollback: 2000,
     allowProposedApi: false,
     theme: {
@@ -37,9 +41,7 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
   // padding/border — tmux would then be told a larger size than is visible,
   // re-creating the very sizing mismatch we're eliminating.
   const box = document.createElement("div");
-  box.id = "termbox";
-  box.style.width = "100%";
-  box.style.height = "100%";
+  box.id = "termbox"; // CSS: absolute inset:8px — fills the content box exactly
   container.appendChild(box);
   term.open(box);
 
@@ -91,14 +93,41 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
   vv?.addEventListener("scroll", () => window.scrollTo(0, 0));
   window.addEventListener("orientationchange", () => setTimeout(onViewportResize, 80));
   new ResizeObserver(scheduleFit).observe(container);
+  new ResizeObserver(scheduleFit).observe(box);
 
-  fit();
+  // Fit only after the font is actually loaded and laid out. Fitting before
+  // the char-measure element has the real monospace metrics yields a wrong
+  // (often far too small) cell size, hence a hugely oversized grid.
+  const fitWhenReady = () => {
+    const go = () => requestAnimationFrame(() => requestAnimationFrame(fit));
+    if (document.fonts?.ready) {
+      document.fonts.ready.then(go);
+    } else {
+      go();
+    }
+  };
+  fitWhenReady();
 
   return {
     term,
     fit,
     onResize: (cb) => (resizeCb = cb),
     size: () => ({ cols: term.cols, rows: term.rows }),
+    debug: () => {
+      const b = box.getBoundingClientRect();
+      const cell =
+        (document.querySelector(".xterm-char-measure-element") as HTMLElement | null)
+          ?.getBoundingClientRect().width ?? 0;
+      const xtFont = (() => {
+        const xt = document.querySelector(".xterm") as HTMLElement | null;
+        return xt ? getComputedStyle(xt).fontSize : "?";
+      })();
+      return (
+        `${term.cols}×${term.rows} · box ${Math.round(b.width)}×${Math.round(b.height)}px · ` +
+        `cell ${cell.toFixed(1)}px · font ${xtFont} · dpr ${window.devicePixelRatio} · ` +
+        `vv ${window.visualViewport?.scale ?? "?"}`
+      );
+    },
     setFontSize: (px) => {
       term.options.fontSize = px;
       fit();

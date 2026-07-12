@@ -266,22 +266,37 @@ button {
   background: rgba(18, 22, 31, 0.95);
   color: var(--fg);
   font-size: 13px;
-  white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
 /* ---------- terminal card ---------- */
 
 #terminal {
+  position: relative;
   flex: 1;
   min-height: 0;
-  padding: 8px;
   background: #0d1117;
   border: 1px solid var(--card-border);
   border-radius: 12px;
   overflow: hidden;
+}
+
+/* The xterm host fills the content box exactly (inset = the visual padding),
+   so FitAddon measures the true usable area — not the padded card. */
+#termbox {
+  position: absolute;
+  inset: 8px;
+}
+
+/* Never let iOS text auto-sizing rescale terminal glyphs after xterm has
+   measured them — that desyncs the grid from the rendered cell size. */
+#terminal,
+#termbox,
+.xterm,
+.xterm span {
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
 }
 
 /* ---------- composer ---------- */

@@ -772,6 +772,13 @@ hint.addEventListener("click", () => {
   }
 });
 
+// Tap the connection status to see terminal sizing diagnostics (helps debug
+// device-specific grid problems). Shown as a long-lived hint.
+$("conn-status").addEventListener("click", () => {
+  // Tap again to refresh; kept up ~6s via the action variant.
+  showHint(handle.debug(), () => showHint(handle.debug(), () => {}));
+});
+
 setupKeyRow(sendInput);
 composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>

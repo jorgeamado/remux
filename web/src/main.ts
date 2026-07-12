@@ -9,9 +9,11 @@ const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
 const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
-const FONT_MIN = 11; // readable floor on a phone; below this text is unusable
+// Font size is effectively the tmux resolution: smaller font = more cols/rows.
+// Default to a compact grid; A-/A+ tune it, down to a still-legible floor.
+const FONT_MIN = 7;
 const FONT_MAX = 28;
-const FONT_DEFAULT = 15;
+const FONT_DEFAULT = 10;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;

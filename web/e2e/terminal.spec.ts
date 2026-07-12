@@ -309,8 +309,8 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#menu-btn").click();
   await expect(page.locator("#menu")).toBeVisible();
   await page.locator("#font-inc").click();
-  // Default is 15; the earlier A-/A+ test restored it, so +1 here → 16.
-  expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("16");
+  // Default is 10; the earlier A-/A+ test restored it, so +1 here → 11.
+  expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("11");
   await expect(page.locator("#notify-btn")).toHaveText("Notifications: off");
   await expect(page.locator("#termkb-btn")).toHaveText("Direct typing: on");
   await page.locator("#conn-status").click();

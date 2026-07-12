@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod attention;
 pub mod auth;
+pub mod push;
 pub mod server;
 pub mod tmux;
 pub mod ws;
@@ -68,6 +69,13 @@ pub struct App {
     pub attention: tokio::sync::broadcast::Sender<String>,
     /// URL clients use to reach the daemon (goes into pairing links).
     pub public_url: String,
+    /// Web Push state (VAPID key + subscriptions).
+    pub push: push::Push,
+    /// Live websocket connections: (device id, session) -> count. Push
+    /// delivery skips devices that already get the in-band frame.
+    pub connections: std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
+    /// Sessions with recent attention (session -> when), for /api/attention.
+    pub pending_attention: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 pub fn host_of_url(url: &str) -> Option<String> {

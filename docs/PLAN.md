@@ -1,5 +1,9 @@
 # remux — development plan (v2, 2026-07-12)
 
+> Progress: M0 shipped (CI + v0.1.0 release shakedown, onboarding fixes,
+> `remux pair`, cert renewal, repo public). M1 daemon/PWA stack implemented
+> — awaiting the real-device spike on an iPhone before M1 is called done.
+
 Where we are: V1 + V1.x are built and deployed (daemon + PWA, pairing/TLS,
 observer/controller handoff, session picker, windows/panes menu, attention
 notifications, observer scrollback, release pipeline). Guiding principle

@@ -22,6 +22,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/pair", post(pair))
         .route("/api/sessions", get(sessions))
         .route("/api/windows", get(windows))
+        .route("/api/push/key", get(push_key))
+        .route("/api/push/subscribe", post(push_subscribe))
+        .route("/api/push/unsubscribe", post(push_unsubscribe))
+        .route("/api/attention", get(attention_pending))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -29,7 +33,7 @@ pub fn router(app: Arc<App>) -> Router {
 }
 
 /// Device-token check for plain HTTP endpoints (`Authorization: Bearer <token>`).
-fn bearer_device(app: &App, headers: &HeaderMap) -> Option<String> {
+fn bearer_device(app: &App, headers: &HeaderMap) -> Option<crate::auth::Device> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     app.auth.authenticate(value.strip_prefix("Bearer ")?)
 }
@@ -42,6 +46,79 @@ async fn sessions(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         Ok(Ok(list)) => Json(list).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "tmux error").into_response(),
     }
+}
+
+async fn push_key(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if bearer_device(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    }
+    Json(serde_json::json!({ "key": app.push.public_key() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SubscribeRequest {
+    endpoint: String,
+    #[serde(default)]
+    keys: SubscriptionKeys,
+}
+
+#[derive(Deserialize, Default)]
+struct SubscriptionKeys {
+    #[serde(default)]
+    p256dh: String,
+    #[serde(default)]
+    auth: String,
+}
+
+async fn push_subscribe(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<SubscribeRequest>,
+) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    match app.push.subscribe(crate::push::Subscription {
+        device_id: device.id,
+        endpoint: req.endpoint,
+        p256dh: req.keys.p256dh,
+        auth: req.keys.auth,
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnsubscribeRequest {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<UnsubscribeRequest>,
+) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    app.push.unsubscribe(&device.id, &req.endpoint);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Sessions with recent attention — lets a notification tap land on the
+/// right session without putting its name inside the push payload.
+async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    if bearer_device(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    }
+    let mut pending = app.pending_attention.lock().unwrap();
+    let now = std::time::Instant::now();
+    pending.retain(|_, t| now.duration_since(*t) < PENDING_TTL);
+    let mut sessions: Vec<&String> = pending.keys().collect();
+    sessions.sort();
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
 #[derive(Deserialize)]

@@ -251,6 +251,24 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
     Ok(())
 }
 
+/// True when any attached tmux client sent input within `within_secs` —
+/// i.e. someone is sitting at a keyboard and does not need a push.
+pub fn any_client_active_within(within_secs: u64) -> Result<bool> {
+    let mut cmd = tmux();
+    cmd.args(["list-clients", "-F", "#{client_activity}"]);
+    let Ok(out) = run(cmd) else {
+        return Ok(false);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(out
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .any(|ts| now.saturating_sub(ts) < within_secs))
+}
+
 /// Promote our attach client to controller (drives window size).
 pub fn promote_client(client: &str) -> Result<()> {
     let mut cmd = tmux();

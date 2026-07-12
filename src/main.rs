@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use remux::{admin, attention, auth, host_of_url, server, tmux, App, Cli, Cmd};
+use remux::{admin, attention, auth, host_of_url, push, server, tmux, App, Cli, Cmd};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -67,6 +67,9 @@ async fn main() -> Result<()> {
         args,
         attention: tokio::sync::broadcast::channel(16).0,
         public_url,
+        push: push::Push::load(&state_dir)?,
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
 
     if !app.args.no_pair {
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
 
     admin::spawn(app.clone(), &state_dir)?;
     attention::spawn(app.clone());
+    push::spawn_dispatcher(app.clone());
     server::run(app).await
 }
 

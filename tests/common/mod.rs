@@ -21,6 +21,9 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         args,
         attention: tokio::sync::broadcast::channel(16).0,
         public_url: "http://127.0.0.1:0".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
     remux::attention::spawn(app.clone());
 

@@ -16,6 +16,9 @@ pub struct Device {
     pub name: String,
     pub token_sha256: String,
     pub created_unix: u64,
+    /// Unix seconds of the last successful websocket auth.
+    #[serde(default)]
+    pub last_seen_unix: u64,
 }
 
 struct Inner {
@@ -109,27 +112,45 @@ impl Auth {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            last_seen_unix: 0,
         };
         inner.devices.push(device);
-        let devices = inner.devices.clone();
-        drop(inner);
-
-        if let Err(e) = self.persist(&devices) {
+        // Persist under the lock: concurrent mutators (pair/touch) must not
+        // race each other's snapshots onto disk, or a device can be lost.
+        if let Err(e) = self.persist(&inner.devices) {
             tracing::error!("failed to persist devices: {e:#}");
+            inner.devices.pop();
             return Err(PairError::Internal);
         }
         Ok(device_token)
     }
 
-    /// Validate a device token; returns the device name.
-    pub fn authenticate(&self, device_token: &str) -> Option<String> {
+    /// Validate a device token; returns the device record.
+    pub fn authenticate(&self, device_token: &str) -> Option<Device> {
         let hash = sha256_hex(device_token);
         let inner = self.inner.lock().unwrap();
         inner
             .devices
             .iter()
             .find(|d| d.token_sha256 == hash)
-            .map(|d| d.name.clone())
+            .cloned()
+    }
+
+    /// Record websocket auth time for a device (best effort).
+    pub fn touch(&self, device_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let inner = &mut *self.inner.lock().unwrap();
+        match inner.devices.iter_mut().find(|d| d.id == device_id) {
+            Some(d) => d.last_seen_unix = now,
+            None => return,
+        }
+        // Persist under the lock — see pair().
+        if let Err(e) = self.persist(&inner.devices) {
+            tracing::debug!("failed to persist last-seen: {e:#}");
+        }
     }
 }
 
@@ -158,8 +179,11 @@ mod tests {
         let auth = temp_auth();
         let pairing = auth.new_pairing_token();
         let device_token = auth.pair(&pairing, "phone").unwrap();
-        assert_eq!(auth.authenticate(&device_token), Some("phone".into()));
-        assert_eq!(auth.authenticate("bogus"), None);
+        assert_eq!(
+            auth.authenticate(&device_token).map(|d| d.name),
+            Some("phone".into())
+        );
+        assert!(auth.authenticate("bogus").is_none());
     }
 
     #[test]
@@ -219,6 +243,9 @@ mod tests {
         let device_token = auth.pair(&pairing, "phone").unwrap();
         drop(auth);
         let reloaded = Auth::load(path).unwrap();
-        assert_eq!(reloaded.authenticate(&device_token), Some("phone".into()));
+        assert_eq!(
+            reloaded.authenticate(&device_token).map(|d| d.name),
+            Some("phone".into())
+        );
     }
 }

@@ -108,11 +108,13 @@ function setStatus(text: string, state: "connected" | "connecting" | "offline"):
 }
 
 let hintTimer: number | undefined;
-function showHint(text: string): void {
+let hintAction: (() => void) | null = null;
+function showHint(text: string, action: (() => void) | null = null): void {
+  hintAction = action;
   hint.textContent = text;
   hint.hidden = false;
   clearTimeout(hintTimer);
-  hintTimer = window.setTimeout(() => (hint.hidden = true), 2500);
+  hintTimer = window.setTimeout(() => (hint.hidden = true), action ? 6000 : 2500);
 }
 
 function setRole(controller: boolean): void {
@@ -492,9 +494,10 @@ function renderNotifyBtn(): void {
 async function toggleNotify(): Promise<void> {
   if (notifyPref) {
     notifyPref = false;
+    void unsubscribePush();
   } else {
     if (!("Notification" in window)) {
-      showHint("Notifications aren't supported here");
+      showHint("On iPhone: Add to Home Screen first, then enable here");
       return;
     }
     // Must happen inside this user gesture.
@@ -503,9 +506,96 @@ async function toggleNotify(): Promise<void> {
       return;
     }
     notifyPref = true;
+    void subscribePush();
   }
   localStorage.setItem(NOTIFY_KEY, notifyPref ? "on" : "off");
   renderNotifyBtn();
+}
+
+// ---------- Web Push (lock-screen delivery while the socket is dead) ----------
+
+function b64urlToBytes(value: string): Uint8Array {
+  const b64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), "="));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+function authHeader(): Record<string, string> {
+  return { authorization: `Bearer ${localStorage.getItem(TOKEN_KEY) ?? ""}` };
+}
+
+async function subscribePush(): Promise<void> {
+  if (!("serviceWorker" in navigator)) return;
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg?.pushManager) {
+    showHint("Lock-screen alerts need the installed app; in-app alerts active");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/push/key", { headers: authHeader() });
+    if (!resp.ok) throw new Error(String(resp.status));
+    const { key } = (await resp.json()) as { key: string };
+    let sub: PushSubscription;
+    try {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: b64urlToBytes(key).buffer as ArrayBuffer,
+      });
+    } catch {
+      // A stale subscription under a rotated VAPID key: drop and retry once.
+      await (await reg.pushManager.getSubscription())?.unsubscribe();
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: b64urlToBytes(key).buffer as ArrayBuffer,
+      });
+    }
+    const json = sub.toJSON();
+    const resp2 = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { ...authHeader(), "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: sub.endpoint, keys: json.keys ?? {} }),
+    });
+    if (!resp2.ok) throw new Error(await resp2.text());
+    showHint("Lock-screen notifications on");
+  } catch (e) {
+    showHint("Push setup failed — in-app alerts only");
+    console.warn("push subscribe failed:", e);
+  }
+}
+
+async function unsubscribePush(): Promise<void> {
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    const sub = await reg?.pushManager?.getSubscription();
+    if (!sub) return;
+    await fetch("/api/push/unsubscribe", {
+      method: "POST",
+      headers: { ...authHeader(), "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: sub.endpoint }),
+    });
+    await sub.unsubscribe();
+  } catch {
+    /* best effort */
+  }
+}
+
+/// After a notification tap (or any return to the app), land on the session
+/// that actually wants attention — the push payload deliberately can't say.
+async function checkPendingAttention(): Promise<void> {
+  if (!localStorage.getItem(TOKEN_KEY)) return;
+  try {
+    const resp = await fetch("/api/attention", { headers: authHeader() });
+    if (!resp.ok) return;
+    const { sessions } = (await resp.json()) as { sessions: string[] };
+    const others = sessions.filter((s) => s !== sessionTitle);
+    if (others.length > 0 && !sessions.includes(sessionTitle)) {
+      showHint(`Attention in ${others[0]} — tap to open`, () =>
+        switchSession(others[0])
+      );
+    }
+  } catch {
+    /* offline */
+  }
 }
 
 function onAttention(): void {
@@ -663,7 +753,13 @@ controlBtn.addEventListener("click", () => {
 
 hint.addEventListener("click", () => {
   hint.hidden = true;
-  requestControl();
+  if (hintAction) {
+    const action = hintAction;
+    hintAction = null;
+    action();
+  } else {
+    requestControl();
+  }
 });
 
 setupKeyRow(sendInput);
@@ -726,6 +822,7 @@ document.addEventListener("visibilitychange", () => {
       connect();
     }
     requestWakeLock();
+    void checkPendingAttention();
   }
 });
 
@@ -781,4 +878,7 @@ function offerInstallTip(pairUrl: string): void {
   }
   requestWakeLock();
   connect();
+  // A notification tap may cold-start the app (no visibilitychange fires):
+  // land on the session that wants attention.
+  void checkPendingAttention();
 })();

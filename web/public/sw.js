@@ -17,6 +17,19 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
+// Payload-less by design: the daemon never sends terminal content or session
+// names through the push service. iOS requires every push to surface a
+// notification — no conditional logic here, ever.
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    self.registration.showNotification("remux", {
+      body: "A session may need your attention",
+      tag: "remux-attention",
+      icon: "/icon-512.png",
+    })
+  );
+});
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(

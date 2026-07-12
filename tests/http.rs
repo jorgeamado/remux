@@ -81,7 +81,7 @@ async fn pairing_flow() {
     let device_token = body["device_token"].as_str().unwrap().to_string();
     assert_eq!(device_token.len(), 64);
     assert_eq!(
-        app.auth.authenticate(&device_token),
+        app.auth.authenticate(&device_token).map(|d| d.name),
         Some("test phone".to_string())
     );
 
@@ -162,6 +162,75 @@ async fn windows_endpoint_auth_and_validation() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body.is_array(), "expected array, got {body}");
+}
+
+#[tokio::test]
+async fn push_endpoints_auth_and_validation() {
+    let (addr, app) = start_server("it-push").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/api/push/key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "t").unwrap();
+    let auth = format!("Bearer {token}");
+
+    let resp = client
+        .get(format!("http://{addr}/api/push/key"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(!body["key"].as_str().unwrap().is_empty());
+
+    // Non-allowlisted endpoint is refused (SSRF guard).
+    let resp = client
+        .post(format!("http://{addr}/api/push/subscribe"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"endpoint": "https://evil.example.com/x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A real push-service endpoint is accepted, and unsubscribe works.
+    let resp = client
+        .post(format!("http://{addr}/api/push/subscribe"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({
+            "endpoint": "https://web.push.apple.com/QOXtest",
+            "keys": {"p256dh": "pk", "auth": "as"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = client
+        .post(format!("http://{addr}/api/push/unsubscribe"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"endpoint": "https://web.push.apple.com/QOXtest"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Attention listing starts empty.
+    let resp = client
+        .get(format!("http://{addr}/api/attention"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["sessions"], serde_json::json!([]));
 }
 
 #[tokio::test]

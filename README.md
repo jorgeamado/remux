@@ -177,13 +177,18 @@ locally running daemon on `127.0.0.1:7777`.
 
 ## Notifications
 
-Toggle **Notifications** in the aA menu (asks for browser permission). When the
+Toggle **Notifications** in the aA menu (asks for browser permission). When a
 session has been busy and then goes quiet — a build finished, Claude Code is
-waiting for your answer — remux notifies you, but only while the app isn't
-visible on screen. Note: if the OS suspends the page (locked iPhone), delivery
-resumes when the socket does; real push is on the roadmap (V2, Web Push).
-Every tmux session is tracked; you're only notified for the session you're
-attached to.
+waiting for your answer — remux notifies you.
+
+- In-app: an alert while the page is open but not visible; you're only
+  notified for the session you're attached to.
+- **Lock screen (Web Push)**: enabling the toggle inside the *installed* PWA
+  also subscribes the device with the OS push service, so a locked phone
+  gets notified even though its socket is dead. The push carries no terminal
+  content or session names — on open, the app asks the daemon which session
+  wants attention and offers to jump there. No pushes are sent while someone
+  is actively typing at any attached client, and delivery is throttled.
 
 ## Roadmap
 

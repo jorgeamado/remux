@@ -112,7 +112,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
             },
             _ => return Ok(()), // timeout, close or protocol error
         };
-    tracing::info!(%device, "client authenticated");
+    tracing::info!(device = %device.name, "client authenticated");
 
     // ---- Resolve the target session (picker), then spawn the tmux client. ----
     let session = match requested_session {
@@ -134,6 +134,24 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         move || tmux::ensure_session(&session)
     })
     .await??;
+
+    // Track the live (device, session) pair: device management (revocation)
+    // and push delivery ("already gets the in-band frame") both need it.
+    tokio::task::spawn_blocking({
+        let app = app.clone();
+        let id = device.id.clone();
+        move || app.auth.touch(&id)
+    });
+    let conn_key = (device.id.clone(), session.clone());
+    *app.connections
+        .lock()
+        .unwrap()
+        .entry(conn_key.clone())
+        .or_insert(0) += 1;
+    let _conn_guard = ConnGuard {
+        app: app.clone(),
+        key: conn_key,
+    };
 
     clamp_size(&mut cols, &mut rows);
     let pair = native_pty_system().openpty(PtySize {
@@ -228,7 +246,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         json(&ServerMsg::Status {
             state,
             session: &session,
-            device: &device,
+            device: &device.name,
         })
     };
     let _ = out_tx.send(status("observer")).await;
@@ -357,8 +375,26 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     let _ = child.kill();
     attention_task.abort();
     sender.abort();
-    tracing::info!(%device, "client disconnected");
+    tracing::info!(device = %device.name, "client disconnected");
     Ok(())
+}
+
+/// Decrements the live-connection registry on any exit path.
+struct ConnGuard {
+    app: Arc<App>,
+    key: (String, String),
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut conns = self.app.connections.lock().unwrap();
+        if let Some(n) = conns.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                conns.remove(&self.key);
+            }
+        }
+    }
 }
 
 fn clamp_size(cols: &mut u16, rows: &mut u16) {

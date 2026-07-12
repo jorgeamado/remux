@@ -19,6 +19,9 @@ async fn admin_socket_mints_usable_pairing_tokens() {
         args,
         attention: tokio::sync::broadcast::channel(4).0,
         public_url: "https://host.example:7777".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 
@@ -60,6 +63,9 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
         args,
         attention: tokio::sync::broadcast::channel(4).0,
         public_url: "http://x".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
     // A second spawn on the same state dir must refuse — and must NOT have
@@ -87,6 +93,9 @@ async fn stale_socket_file_is_replaced() {
         args,
         attention: tokio::sync::broadcast::channel(4).0,
         public_url: "http://x".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
     remux::admin::spawn(app, &dir).unwrap();
 }
@@ -103,6 +112,9 @@ async fn admin_socket_rejects_garbage() {
         args,
         attention: tokio::sync::broadcast::channel(4).0,
         public_url: "http://x".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 

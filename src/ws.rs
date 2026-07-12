@@ -137,15 +137,10 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         Some(name) => name,
         None => app.args.session.clone(),
     };
-    tokio::task::spawn_blocking({
-        let session = session.clone();
-        move || tmux::ensure_session(&session)
-    })
-    .await??;
 
-    // Connection caps (before spawning any tmux/PTY): a stolen token must not
-    // be able to exhaust the host by opening unbounded sessions. Decide under
-    // the lock, then release it before any await.
+    // Connection caps FIRST — before ensure_session, so a capped client can't
+    // create new detached tmux sessions (and their shells) by requesting
+    // unique names. Decide under the lock, then release it before any await.
     let conn_key = (device.id.clone(), session.clone());
     let admitted = {
         let mut conns = app.connections.lock().unwrap();
@@ -177,7 +172,13 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         key: conn_key,
     };
 
-    // Record last-seen for device management.
+    // Now that this connection is admitted under the cap, create/attach the
+    // session and record last-seen.
+    tokio::task::spawn_blocking({
+        let session = session.clone();
+        move || tmux::ensure_session(&session)
+    })
+    .await??;
     tokio::task::spawn_blocking({
         let app = app.clone();
         let id = device.id.clone();
@@ -332,17 +333,16 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
 
     // ---- Main receive loop. ----
     while let Some(Ok(msg)) = ws_rx.next().await {
-        if revoked_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            break; // no input is accepted after revocation
+        // Revocation gate for EVERY message type (input, resize, take_control,
+        // window_action): synchronous is_active() closes the window between
+        // revoke() committing and the async broadcast setting revoked_flag.
+        if revoked_flag.load(std::sync::atomic::Ordering::Relaxed)
+            || !app.auth.is_active(&device.id)
+        {
+            break;
         }
         match msg {
             Message::Binary(bytes) => {
-                // Synchronous revocation check: closes the window where frames
-                // buffered before the async revoke broadcast could still reach
-                // the PTY. `is_active` reflects the committed device list.
-                if !app.auth.is_active(&device.id) {
-                    break;
-                }
                 // Observers may scroll (mouse-wheel reports drive tmux
                 // copy-mode and cannot type or execute anything); all other
                 // input still requires control.

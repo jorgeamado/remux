@@ -18,13 +18,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// client-supplied — without this allowlist a paired device could aim the
 /// daemon's outbound requests at the tailnet (blind SSRF).
 const ALLOWED_SUFFIXES: &[&str] = &[
-    ".push.apple.com",
-    ".fcm.googleapis.com",
+    "push.apple.com",
     "fcm.googleapis.com",
-    ".push.services.mozilla.com",
-    "updates.push.services.mozilla.com",
-    ".notify.windows.com",
+    "push.services.mozilla.com",
+    "notify.windows.com",
 ];
+
+/// Global cap on stored subscriptions (per-device cap is separate). Bounds
+/// disk/memory even if many devices are paired.
+const MAX_SUBSCRIPTIONS: usize = 1024;
 
 const SUBS_PER_DEVICE: usize = 3;
 const PUSH_TTL_SECS: u32 = 300;
@@ -114,6 +116,9 @@ impl Push {
         if per_device >= SUBS_PER_DEVICE {
             bail!("too many push subscriptions for this device");
         }
+        if subs.len() >= MAX_SUBSCRIPTIONS {
+            bail!("subscription store is full");
+        }
         subs.push(sub);
         self.persist(&subs)
     }
@@ -174,6 +179,9 @@ impl Push {
     }
 
     async fn send(&self, sub: &Subscription) -> Result<()> {
+        // Re-validate before every outbound request: the store is trusted,
+        // but this is the last line before the daemon makes a network call.
+        validate_endpoint(&sub.endpoint)?;
         let jwt = self.vapid_jwt(&sub.endpoint)?;
         let resp = self
             .http
@@ -278,37 +286,41 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{host_port}"))
 }
 
+/// Parse and validate a push endpoint URL, returning the authoritative host.
+/// Uses a real URL parser (not string splitting): the naive `split(':')`
+/// approach treated `https://web.push.apple.com:443@127.0.0.1/x` as host
+/// `web.push.apple.com`, while the HTTP client connects to `127.0.0.1` —
+/// an SSRF into the tailnet. url::Url resolves userinfo/host correctly.
 fn validate_endpoint(endpoint: &str) -> Result<()> {
     if endpoint.len() > 2048 {
         bail!("endpoint too long");
     }
+    let url = url::Url::parse(endpoint).context("unparseable endpoint URL")?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("push endpoint must not contain userinfo");
+    }
+    let host = url
+        .host_str()
+        .context("endpoint has no host")?
+        .to_ascii_lowercase();
+
     // Test hook: REMUX_PUSH_ALLOW_HOST permits one extra host (any scheme)
     // so integration tests can run a local fake push service.
     if let Ok(allowed) = std::env::var("REMUX_PUSH_ALLOW_HOST") {
-        let host = endpoint
-            .split("://")
-            .nth(1)
-            .and_then(|r| r.split('/').next())
-            .and_then(|h| h.split(':').next())
-            .unwrap_or("");
-        if !allowed.is_empty() && host == allowed {
+        if !allowed.is_empty() && host == allowed.to_ascii_lowercase() {
             return Ok(());
         }
     }
-    let Some(rest) = endpoint.strip_prefix("https://") else {
+    if url.scheme() != "https" {
         bail!("push endpoints must be https");
-    };
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    if ALLOWED_SUFFIXES
-        .iter()
-        .any(|s| host == s.trim_start_matches('.') || host.ends_with(s))
-    {
+    }
+    // Exact host, or a subdomain of a provider domain we anchor on a leading
+    // dot (so "evilfcm.googleapis.com" cannot match "fcm.googleapis.com").
+    let ok = ALLOWED_SUFFIXES.iter().any(|s| {
+        let base = s.trim_start_matches('.');
+        host == base || host.ends_with(&format!(".{base}"))
+    });
+    if ok {
         Ok(())
     } else {
         bail!("push endpoint host {host:?} is not a known push service");
@@ -362,13 +374,21 @@ mod tests {
 
     #[test]
     fn endpoint_allowlist() {
+        std::env::remove_var("REMUX_PUSH_ALLOW_HOST");
         assert!(validate_endpoint("https://web.push.apple.com/QOX").is_ok());
         assert!(validate_endpoint("https://fcm.googleapis.com/fcm/send/x").is_ok());
         assert!(validate_endpoint("https://updates.push.services.mozilla.com/wpush/v2/x").is_ok());
+        assert!(validate_endpoint("https://WEB.PUSH.APPLE.COM/x").is_ok()); // case-folded
         assert!(validate_endpoint("http://web.push.apple.com/x").is_err()); // not https
         assert!(validate_endpoint("https://evil.example.com/x").is_err());
         assert!(validate_endpoint("https://127.0.0.1:9/x").is_err());
         assert!(validate_endpoint("https://internal.push.apple.com.evil.io/x").is_err());
+        // SSRF via userinfo: real host is 127.0.0.1, not the push service.
+        assert!(validate_endpoint("https://web.push.apple.com:443@127.0.0.1:8443/x").is_err());
+        assert!(validate_endpoint("https://user@web.push.apple.com/x").is_err());
+        // Suffix confusion: not a subdomain of the anchored base.
+        assert!(validate_endpoint("https://evilfcm.googleapis.com/x").is_err());
+        assert!(validate_endpoint("https://notapple.com/x").is_err());
     }
 
     #[test]

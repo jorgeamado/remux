@@ -12,10 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 /// Bytes buffered towards a slow client before the PTY reader blocks.
 /// A blocked reader simply pauses the tmux client; tmux repaints when we resume.
 const OUT_QUEUE: usize = 256;
+/// Each connection spawns a PTY + tmux client + threads; cap concurrency so a
+/// stolen token (or a buggy client) cannot exhaust the host's processes/FDs.
+const MAX_TOTAL_CONNECTIONS: usize = 64;
+const MAX_PER_DEVICE_CONNECTIONS: usize = 8;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -139,23 +143,46 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     })
     .await??;
 
-    // Track the live (device, session) pair: device management (revocation)
-    // and push delivery ("already gets the in-band frame") both need it.
+    // Connection caps (before spawning any tmux/PTY): a stolen token must not
+    // be able to exhaust the host by opening unbounded sessions. Decide under
+    // the lock, then release it before any await.
+    let conn_key = (device.id.clone(), session.clone());
+    let admitted = {
+        let mut conns = app.connections.lock().unwrap();
+        let total: usize = conns.values().sum();
+        let per_device: usize = conns
+            .iter()
+            .filter(|((id, _), _)| id == &device.id)
+            .map(|(_, n)| *n)
+            .sum();
+        if total >= MAX_TOTAL_CONNECTIONS || per_device >= MAX_PER_DEVICE_CONNECTIONS {
+            false
+        } else {
+            *conns.entry(conn_key.clone()).or_insert(0) += 1;
+            true
+        }
+    };
+    if !admitted {
+        let _ = ws_tx
+            .send(json(&ServerMsg::Error {
+                code: "too_many_connections",
+                message: "connection limit reached",
+            }))
+            .await;
+        let _ = ws_tx.send(Message::Close(None)).await;
+        return Ok(());
+    }
+    let _conn_guard = ConnGuard {
+        app: app.clone(),
+        key: conn_key,
+    };
+
+    // Record last-seen for device management.
     tokio::task::spawn_blocking({
         let app = app.clone();
         let id = device.id.clone();
         move || app.auth.touch(&id)
     });
-    let conn_key = (device.id.clone(), session.clone());
-    *app.connections
-        .lock()
-        .unwrap()
-        .entry(conn_key.clone())
-        .or_insert(0) += 1;
-    let _conn_guard = ConnGuard {
-        app: app.clone(),
-        key: conn_key,
-    };
 
     clamp_size(&mut cols, &mut rows);
     let pair = native_pty_system().openpty(PtySize {
@@ -310,6 +337,12 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
         match msg {
             Message::Binary(bytes) => {
+                // Synchronous revocation check: closes the window where frames
+                // buffered before the async revoke broadcast could still reach
+                // the PTY. `is_active` reflects the committed device list.
+                if !app.auth.is_active(&device.id) {
+                    break;
+                }
                 // Observers may scroll (mouse-wheel reports drive tmux
                 // copy-mode and cannot type or execute anything); all other
                 // input still requires control.

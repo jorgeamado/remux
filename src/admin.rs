@@ -33,6 +33,16 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("admin.sock")
 }
 
+/// Peer credential check: only the uid that owns the socket (the daemon's
+/// own user) may drive admin commands. Defence in depth beyond 0600 — a
+/// leaked/inherited fd from another user is still rejected.
+fn peer_allowed(stream: &UnixStream, owner_uid: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == owner_uid,
+        Err(_) => false,
+    }
+}
+
 pub fn spawn(app: Arc<App>, state_dir: &Path) -> Result<()> {
     let path = socket_path(state_dir);
     // Never unlink a *live* socket: a second `remux serve` would silently
@@ -49,15 +59,20 @@ pub fn spawn(app: Arc<App>, state_dir: &Path) -> Result<()> {
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind admin socket {}", path.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
+    let owner_uid = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+        std::fs::metadata(&path)?.uid()
+    };
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            if !peer_allowed(&stream, owner_uid) {
+                tracing::warn!("admin socket: rejected connection from another uid");
+                continue;
+            }
             let app = app.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle(stream, app).await {

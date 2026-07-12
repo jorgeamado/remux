@@ -38,6 +38,8 @@ base64 = "0.22"
 bytes = "1"
 p256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+subtle = "2"
+url = "2"
 rustls = "0.23"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"

@@ -82,24 +82,25 @@ impl Auth {
         token
     }
 
-    /// Exchange a pairing token for a device token. Rate limited.
+    /// Exchange a pairing token for a device token. A *valid* token always
+    /// pairs; only failed attempts consume the rate-limit bucket, so an
+    /// attacker spraying bad tokens cannot starve the owner's real pairing.
     pub fn pair(&self, pairing_token: &str, device_name: &str) -> Result<String, PairError> {
         let mut inner = self.inner.lock().unwrap();
 
         let now = Instant::now();
-        inner
-            .attempts
-            .retain(|t| now.duration_since(*t).as_secs() < 60);
-        if inner.attempts.len() as u32 >= PAIR_ATTEMPTS_PER_MIN {
-            return Err(PairError::RateLimited);
-        }
-        inner.attempts.push(now);
-
         // Tokens stay valid until their TTL (not single-use): the iOS flow
         // needs to pair twice — once in the Safari tab and once inside the
         // installed PWA, whose storage is partitioned from the tab.
         inner.pairing.retain(|_, expiry| *expiry > now);
         if !inner.pairing.contains_key(pairing_token) {
+            inner
+                .attempts
+                .retain(|t| now.duration_since(*t).as_secs() < 60);
+            if inner.attempts.len() as u32 >= PAIR_ATTEMPTS_PER_MIN {
+                return Err(PairError::RateLimited);
+            }
+            inner.attempts.push(now);
             return Err(PairError::InvalidToken);
         }
 
@@ -125,14 +126,18 @@ impl Auth {
         Ok(device_token)
     }
 
-    /// Validate a device token; returns the device record.
+    /// Validate a device token; returns the device record. The hash compare
+    /// is constant-time (defense in depth — the value compared is already a
+    /// SHA-256, so a timing leak would only reveal hash prefixes, but token
+    /// checks should not leak timing regardless).
     pub fn authenticate(&self, device_token: &str) -> Option<Device> {
+        use subtle::ConstantTimeEq;
         let hash = sha256_hex(device_token);
         let inner = self.inner.lock().unwrap();
         inner
             .devices
             .iter()
-            .find(|d| d.token_sha256 == hash)
+            .find(|d| d.token_sha256.as_bytes().ct_eq(hash.as_bytes()).into())
             .cloned()
     }
 
@@ -170,6 +175,18 @@ impl Auth {
             tracing::error!("failed to persist rename: {e:#}");
         }
         true
+    }
+
+    /// Is this device id still paired? Checked synchronously on each input
+    /// frame so a revocation takes effect immediately, without waiting for
+    /// the async revocation broadcast to close the socket.
+    pub fn is_active(&self, device_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .any(|d| d.id == device_id)
     }
 
     /// Record websocket auth time for a device (best effort).

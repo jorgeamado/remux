@@ -361,9 +361,22 @@ async fn full_terminal_flow_over_tmux() {
         .id
         .clone();
     assert!(app.auth.revoke(&dev_id).is_ok());
+    // Input sent after revoke commits but before the broadcast lands must not
+    // reach the shell (synchronous is_active gate). Marker only ever appears
+    // in output if it ran.
+    ws.send(WsMsg::binary(b"echo REVOKED_MARKER$((7+7))\r".to_vec()))
+        .await
+        .unwrap();
     let _ = app.revoked.send(dev_id);
     let err = next_json(&mut ws).await;
     assert_eq!(err["code"], "revoked", "unexpected: {err}");
+    // The pane must not contain the executed marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pane = tmux_sock(&sock, &["capture-pane", "-t", session, "-p"]);
+    assert!(
+        !pane.contains("REVOKED_MARKER14"),
+        "revoked device input reached the shell: {pane:?}"
+    );
     let mut closed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

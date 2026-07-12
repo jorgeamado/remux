@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use remux::{auth, host_of_url, server, tmux, App, Args};
+use remux::{auth, host_of_url, server, tmux, App, Cli, Cmd};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let Cmd::Serve(args) = Cli::parse().cmd;
 
     let state_dir = dirs::data_dir().context("no data dir")?.join("remux");
     std::fs::create_dir_all(&state_dir)?;

@@ -31,9 +31,30 @@ Phone  → PWA (xterm.js) → remux → tmux client (PTY)
 ## Install
 
 Requirements on the host: `tmux` ≥ 3.2 (3.3a tested), Linux or macOS.
+(Windows: run it inside WSL2 — the daemon needs tmux, which has no native
+Windows build.)
+
+**Debian/Ubuntu** — grab the `.deb` from the
+[releases page](https://github.com/jorgeamado/remux/releases) (a systemd
+user unit ships with it, see below):
 
 ```sh
-cargo install --path .      # or grab a release binary
+sudo apt install ./remux_*.deb
+```
+
+**macOS (Homebrew)**:
+
+```sh
+brew tap jorgeamado/remux
+brew install remux
+```
+
+**Prebuilt tarballs** for Linux (x86_64/arm64) and macOS (arm64/x86_64) are
+on the releases page with SHA256SUMS. **From source**:
+
+```sh
+(cd web && npm ci && npm run build)   # PWA, embedded into the binary
+cargo install --path .
 ```
 
 ## Run
@@ -77,25 +98,18 @@ expire after 10 minutes) or run a second `remux serve` session.
 
 ### Run as a service (Linux)
 
-`~/.config/systemd/user/remux.service`:
-
-```ini
-[Unit]
-Description=remux terminal daemon
-After=network-online.target
-
-[Service]
-ExecStart=%h/.cargo/bin/remux serve --listen 100.x.y.z:7777 --no-pair
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
+The `.deb` installs a systemd user unit
+([packaging/remux.service](packaging/remux.service)); configure it via
+`~/.config/remux/env`:
 
 ```sh
+mkdir -p ~/.config/remux
+echo 'REMUX_ARGS=--listen 100.x.y.z:7777 --no-pair' > ~/.config/remux/env
 systemctl --user enable --now remux
 loginctl enable-linger $USER   # keep it running while logged out
 ```
+
+Installed another way? Copy the unit to `~/.config/systemd/user/` first.
 
 ## Security model
 

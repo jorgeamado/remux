@@ -11,6 +11,19 @@ use std::path::PathBuf;
 /// remux — your persistent tmux session, on your phone.
 #[derive(Parser, Debug)]
 #[command(version, about)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub cmd: Cmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum Cmd {
+    /// Run the daemon.
+    Serve(Args),
+}
+
+/// Options for `remux serve`.
+#[derive(Parser, Debug)]
 pub struct Args {
     /// Address to listen on. Bind to your Tailscale IP in production.
     #[arg(long, default_value = "127.0.0.1:7777")]

@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 const PORT = 7955;
 const SOCK = `remux-shot-${process.pid}`;
-const daemon = spawn("../target/debug/remux", ["--listen", `127.0.0.1:${PORT}`, "--session", "Dev"], {
+const daemon = spawn("../target/debug/remux", ["serve", "--listen", `127.0.0.1:${PORT}`, "--session", "Dev"], {
   env: { ...process.env, XDG_DATA_HOME: mkdtempSync(join(tmpdir(), "remux-shot-")), REMUX_TMUX_SOCKET: SOCK },
   stdio: ["ignore", "pipe", "inherit"],
 });

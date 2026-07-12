@@ -1,0 +1,24 @@
+# systemd user unit for the remux daemon.
+#
+#   mkdir -p ~/.config/remux
+#   echo 'REMUX_ARGS=--listen 100.x.y.z:7777 --no-pair \
+#     --tls-cert /path/host.ts.net.crt --tls-key /path/host.ts.net.key \
+#     --allowed-host host.tailnet.ts.net' > ~/.config/remux/env
+#   systemctl --user enable --now remux
+#   loginctl enable-linger $USER   # keep it running while logged out
+#
+# To pair a device, run `remux serve` in a terminal once (it prints the QR),
+# or restart without --no-pair and read the journal.
+
+[Unit]
+Description=remux — your persistent tmux session, on your phone
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/remux/env
+ExecStart=/usr/bin/remux serve $REMUX_ARGS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

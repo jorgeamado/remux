@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Build web client
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Rust tests (unit + integration, isolated tmux socket)
+        run: cargo test
+
+      - name: Browser e2e
+        working-directory: web
+        run: |
+          npx playwright install --with-deps chromium
+          npm run e2e
+
+      - name: rustfmt
+        run: cargo fmt --check

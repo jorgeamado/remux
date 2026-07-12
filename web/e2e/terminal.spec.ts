@@ -20,7 +20,7 @@ test.beforeAll(async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "remux-e2e-"));
   daemon = spawn(
     BIN,
-    ["--listen", `127.0.0.1:${PORT}`, "--session", "e2emain"],
+    ["serve", "--listen", `127.0.0.1:${PORT}`, "--session", "e2emain"],
     {
       env: {
         ...process.env,

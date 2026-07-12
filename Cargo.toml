@@ -4,6 +4,29 @@ version = "0.1.0"
 edition = "2021"
 description = "Your persistent tmux session, on your phone."
 license = "MIT"
+repository = "https://github.com/jorgeamado/remux"
+homepage = "https://github.com/jorgeamado/remux"
+readme = "README.md"
+
+# `cargo deb` (https://github.com/kornelski/cargo-deb) builds the .deb that
+# release CI attaches to GitHub releases.
+[package.metadata.deb]
+maintainer = "George Lemeshko <george.lemeshko@gmail.com>"
+copyright = "2026, George Lemeshko"
+license-file = ["LICENSE", "0"]
+depends = "tmux (>= 3.2)"
+section = "utils"
+priority = "optional"
+extended-description = """
+remux is a small self-hosted daemon that exposes your tmux session to your
+own devices as a mobile-friendly web terminal (PWA), with observer/controller
+device handoff, QR pairing, and attention notifications. Designed to run on
+your tailnet, never on the public internet."""
+assets = [
+    ["target/release/remux", "usr/bin/", "755"],
+    ["packaging/remux.service", "usr/lib/systemd/user/", "644"],
+    ["README.md", "usr/share/doc/remux/README.md", "644"],
+]
 
 [dependencies]
 anyhow = "1"

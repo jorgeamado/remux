@@ -52,6 +52,10 @@ enum ServerMsg<'a> {
         state: &'a str,
         session: &'a str,
         device: &'a str,
+        /// Current tmux window size — lets an observer fit the desktop-sized
+        /// grid on screen (font-size math only, never a resize).
+        window_cols: Option<u16>,
+        window_rows: Option<u16>,
     },
     Error {
         code: &'a str,
@@ -242,14 +246,28 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     }
 
     let mut controller = false;
-    let status = |state: &str| {
-        json(&ServerMsg::Status {
-            state,
-            session: &session,
-            device: &device.name,
-        })
+    let status = |state: &'static str| {
+        let session = session.clone();
+        let device_name = device.name.clone();
+        async move {
+            let dims = tokio::task::spawn_blocking({
+                let session = session.clone();
+                move || tmux::window_dims(&session)
+            })
+            .await
+            .ok()
+            .flatten();
+            json(&ServerMsg::Status {
+                state,
+                session: &session,
+                device: &device_name,
+                window_cols: dims.map(|d| d.0),
+                window_rows: dims.map(|d| d.1),
+            })
+        }
     };
-    let _ = out_tx.send(status("observer")).await;
+    let msg = status("observer").await;
+    let _ = out_tx.send(msg).await;
 
     // ---- Main receive loop. ----
     while let Some(Ok(msg)) = ws_rx.next().await {
@@ -301,7 +319,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                     pixel_width: 0,
                                     pixel_height: 0,
                                 });
-                                let _ = out_tx.send(status("controller")).await;
+                                let msg = status("controller").await;
+                                let _ = out_tx.send(msg).await;
                             }
                             Err(e) => {
                                 tracing::warn!("promote failed: {e:#}");
@@ -330,7 +349,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             tokio::task::spawn_blocking(move || tmux::demote_client(&name)).await?;
                     }
                     controller = false;
-                    let _ = out_tx.send(status("observer")).await;
+                    let msg = status("observer").await;
+                    let _ = out_tx.send(msg).await;
                 }
                 Ok(ClientMsg::WindowAction { action, index }) => {
                     if !controller {

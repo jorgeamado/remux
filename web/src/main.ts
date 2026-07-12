@@ -10,6 +10,7 @@ const SESSION_KEY = "remux.session";
 const STATUS_KEY = "remux.statusbar";
 const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
+const FIT_KEY = "remux.fitwidth";
 const FONT_MIN = 6; // small enough to view a desktop-sized grid while observing
 const FONT_MAX = 28;
 
@@ -121,6 +122,7 @@ function setRole(controller: boolean): void {
   isController = controller;
   renderBanner();
   menuBtn.hidden = false;
+  renderFitBtn();
 }
 
 /// The control row: a role chip on the left, the takeover button on the right.
@@ -269,6 +271,8 @@ interface ControlMsg {
   session?: string;
   code?: string;
   message?: string;
+  window_cols?: number;
+  window_rows?: number;
 }
 
 function handleControl(msg: ControlMsg): void {
@@ -276,10 +280,12 @@ function handleControl(msg: ControlMsg): void {
     case "status": {
       reconnectDelay = 500;
       sessionTitle = msg.session ?? "";
+      windowCols = msg.window_cols ?? 0;
       setStatus(sessionTitle, "connected");
       if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
       setRole(nowController);
+      applyFitWidth();
       if (nowController) {
         hint.hidden = true;
         controlRequested = false;
@@ -402,6 +408,50 @@ sessionName.addEventListener("click", (ev) => {
     void openSessionMenu();
   } else {
     sessionMenu.hidden = true;
+  }
+});
+
+// ---------- observer fit-width ----------
+
+/// The observer's terminal is a viewport onto a (usually wider) desktop-sized
+/// window. "Fit" shrinks the font just enough that the full window width fits
+/// on screen — pure font-size math on this client; tmux is never resized.
+let windowCols = 0;
+let fitWidth = localStorage.getItem(FIT_KEY) === "on";
+const fitBtn = $<HTMLButtonElement>("fit-btn");
+
+function renderFitBtn(): void {
+  fitBtn.hidden = isController;
+  fitBtn.classList.toggle("on", fitWidth);
+}
+
+function applyFitWidth(): void {
+  if (isController || !fitWidth || windowCols <= 0) {
+    handle.setFontSize(fontSize); // back to the user's preference
+    return;
+  }
+  const screen = document.querySelector(".xterm-screen");
+  if (!screen) return;
+  const { cols } = handle.size();
+  const cellW = screen.getBoundingClientRect().width / cols;
+  if (!isFinite(cellW) || cellW <= 0) return;
+  const currentFont = handle.term.options.fontSize ?? fontSize;
+  const target = Math.min(
+    FONT_MAX,
+    Math.max(FONT_MIN, Math.floor((currentFont * cols) / windowCols))
+  );
+  if (target !== currentFont) {
+    handle.setFontSize(target); // triggers a refit; converges (cols → windowCols)
+  }
+}
+
+fitBtn.addEventListener("click", () => {
+  fitWidth = !fitWidth;
+  localStorage.setItem(FIT_KEY, fitWidth ? "on" : "off");
+  renderFitBtn();
+  applyFitWidth();
+  if (fitWidth && windowCols > 0) {
+    showHint(`Fitting ${windowCols} columns`);
   }
 });
 
@@ -741,6 +791,9 @@ handle.term.onData((data) => {
 handle.onResize((cols, rows) => {
   sendJson({ type: "resize", cols, rows });
   if (isController) renderBanner();
+  // Rotation/keyboard changes refit xterm at the old font; recompute the
+  // fitted size against the tmux window (no-ops once converged).
+  applyFitWidth();
 });
 
 controlBtn.addEventListener("click", () => {

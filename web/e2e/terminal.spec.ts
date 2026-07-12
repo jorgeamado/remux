@@ -77,6 +77,13 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect(page.locator("#session-name")).toHaveText("e2emain");
   await expect(page.locator("#setup")).toBeHidden();
 
+  // Observer fit-width toggle is offered (and remembered).
+  await expect(page.locator("#fit-btn")).toBeVisible();
+  await page.locator("#fit-btn").click();
+  await expect(page.locator("#fit-btn")).toHaveClass(/on/);
+  await page.locator("#fit-btn").click();
+  await expect(page.locator("#fit-btn")).not.toHaveClass(/on/);
+
   // The tmux repaint (shell prompt) reaches the terminal.
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
@@ -146,6 +153,7 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#composer-input").fill("echo e2e$((1+1))marker");
   await page.locator("#composer-input").press("Enter");
   await expect(roleChip).toContainText("Controller");
+  await expect(page.locator("#fit-btn")).toBeHidden(); // controller: real grid
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");

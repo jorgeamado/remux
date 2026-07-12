@@ -1,8 +1,17 @@
 # remux — development plan (v2, 2026-07-12)
 
-> Progress: M0 shipped (CI + v0.1.0 release shakedown, onboarding fixes,
-> `remux pair`, cert renewal, repo public). M1 daemon/PWA stack implemented
-> — awaiting the real-device spike on an iPhone before M1 is called done.
+> Progress: **M0 done** — CI green from the first run; v0.1.0 draft release
+> built natively for 4 platforms (tarballs, .debs, SHA256SUMS, filled-in
+> brew formula, attestations); clean-Debian `apt install` verified (tmux
+> dependency, service units, serve smoke); onboarding fixes + `remux pair`
+> + cert renewal shipped; repo public. Remaining M0 user actions: publish
+> the draft release, create the `homebrew-remux` tap with the generated
+> `remux.rb`. **M1 code complete** (push stack + dispatcher + deep-link,
+> reviewed) — awaiting the real-device spike on an iPhone. Shakedown
+> findings fixed along the way: attestations are public-repo-only, the
+> macos-13 runner pool is starved (cross-target from macos-14), and a
+> second rustls crypto provider panicked the TLS listener (now a smoke-
+> tested class).
 
 Where we are: V1 + V1.x are built and deployed (daemon + PWA, pairing/TLS,
 observer/controller handoff, session picker, windows/panes menu, attention

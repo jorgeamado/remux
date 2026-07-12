@@ -1,0 +1,15 @@
+# Renews the Tailscale TLS certificate and restarts remux. Enable with the
+# matching timer:
+#
+#   echo 'REMUX_CERT_HOST=yourhost.your-tailnet.ts.net
+#   REMUX_TLS_CERT=%h/.config/remux/cert.crt
+#   REMUX_TLS_KEY=%h/.config/remux/cert.key' >> ~/.config/remux/env
+#   systemctl --user enable --now remux-cert-renew.timer
+
+[Unit]
+Description=Renew the Tailscale TLS certificate for remux
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/remux/env
+ExecStart=/bin/sh -c 'tailscale cert --cert-file "$REMUX_TLS_CERT" --key-file "$REMUX_TLS_KEY" "$REMUX_CERT_HOST" && systemctl --user try-restart remux'

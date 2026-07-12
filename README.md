@@ -50,7 +50,14 @@ brew install remux
 ```
 
 **Prebuilt tarballs** for Linux (x86_64/arm64) and macOS (arm64/x86_64) are
-on the releases page with SHA256SUMS. **From source**:
+on the releases page with SHA256SUMS. Every artifact carries sigstore build
+provenance — verify what you downloaded was built by this repo's CI:
+
+```sh
+gh attestation verify remux-*.tar.gz --repo jorgeamado/remux
+```
+
+**From source**:
 
 ```sh
 (cd web && npm ci && npm run build)   # PWA, embedded into the binary
@@ -63,9 +70,21 @@ cargo install --path .
 remux serve --listen <tailscale-ip>:7777
 ```
 
-On startup remux prints a single-use pairing link and QR code. Open it on your
-phone (over your tailnet), and the device pairs and connects. Add the page to
-your home screen for the PWA experience.
+On startup remux prints a pairing link and QR code (valid 10 minutes,
+reusable within that window). Open it on your phone over your tailnet and
+the device pairs and connects.
+
+**iOS, for the full-screen app**: after pairing in Safari, tap Share → Add
+to Home Screen, open remux from the Home Screen, and paste the same pairing
+link there (the installed app has separate storage — the page offers a
+"Copy link" button for exactly this).
+
+When the daemon runs as a service (QR buried in logs), mint a fresh link
+any time with:
+
+```sh
+remux pair
+```
 
 ### TLS (recommended, required for PWA install on iOS)
 
@@ -93,8 +112,21 @@ remux serve \
 | `--url` | derived | Public URL used in the pairing QR. |
 | `--no-pair` | — | Don't print a pairing token at startup. |
 
-To pair another device later, restart the daemon (tokens are single-use and
-expire after 10 minutes) or run a second `remux serve` session.
+To pair another device later, run `remux pair` — it asks the running daemon
+for a fresh link over a local admin socket (0600, in the state dir; it never
+listens on the network).
+
+### Certificate renewal
+
+`tailscale cert` certificates expire after ~90 days; the daemon warns when
+the cert file looks stale. The `.deb` ships a weekly renewal timer:
+
+```sh
+systemctl --user enable --now remux-cert-renew.timer   # uses ~/.config/remux/env
+```
+
+Elsewhere, re-run `tailscale cert …` and restart the daemon (for the Docker
+setup: re-run it on the host, then `docker restart remux-mobile`).
 
 ### Run as a service (Linux)
 

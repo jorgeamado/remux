@@ -744,12 +744,36 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
+// iOS partitions storage between the Safari tab and the installed PWA, so a
+// tab that just paired offers the (TTL-reusable) link for pasting inside the
+// installed app.
+function offerInstallTip(pairUrl: string): void {
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const standalone =
+    matchMedia("(display-mode: standalone)").matches ||
+    (navigator as { standalone?: boolean }).standalone === true;
+  if (!isIOS || standalone) return;
+  const tip = $("install-tip");
+  tip.hidden = false;
+  $("copy-pair").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(pairUrl);
+      showHint("Link copied — paste it in the installed app");
+    } catch {
+      window.prompt("Copy this pairing link:", pairUrl);
+    }
+  });
+  $("tip-close").addEventListener("click", () => (tip.hidden = true));
+}
+
 (async () => {
   const hashToken = extractPairToken(location.hash);
   if (hashToken) {
+    const pairUrl = `${location.origin}/#pair=${hashToken}`;
     history.replaceState(null, "", location.pathname);
     try {
       await pairWith(hashToken);
+      offerInstallTip(pairUrl);
     } catch (e) {
       showSetup(`Pairing failed: ${e instanceof Error ? e.message : e}`);
       return;

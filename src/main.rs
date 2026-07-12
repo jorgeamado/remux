@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use remux::{auth, host_of_url, server, tmux, App, Cli, Cmd};
+use remux::{admin, attention, auth, host_of_url, server, tmux, App, Cli, Cmd};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -12,11 +12,18 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let Cmd::Serve(args) = Cli::parse().cmd;
-
     let state_dir = dirs::data_dir().context("no data dir")?.join("remux");
-    std::fs::create_dir_all(&state_dir)?;
 
+    let args = match Cli::parse().cmd {
+        Cmd::Serve(args) => args,
+        Cmd::Pair => {
+            let url = admin::request_pairing(&state_dir)?;
+            print_pairing(&url);
+            return Ok(());
+        }
+    };
+
+    std::fs::create_dir_all(&state_dir)?;
     let auth = auth::Auth::load(state_dir.join("devices.json"))?;
 
     let mut allowed_hosts = vec![
@@ -46,32 +53,56 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("{scheme}://{}", args.listen));
 
-    if !args.no_pair {
-        let token = auth.new_pairing_token();
-        print_pairing(&public_url, &token);
-    }
-
     if args.tls_cert.is_none() && !args.listen.ip().is_loopback() {
         tracing::warn!(
             "listening on a non-loopback address WITHOUT TLS — use `tailscale cert` \
              and pass --tls-cert/--tls-key (see README)"
         );
     }
+    warn_if_cert_stale(args.tls_cert.as_deref());
 
     let app = Arc::new(App {
         allowed_hosts,
         auth,
         args,
         attention: tokio::sync::broadcast::channel(16).0,
+        public_url,
     });
 
-    remux::attention::spawn(app.clone());
+    if !app.args.no_pair {
+        let token = app.auth.new_pairing_token();
+        print_pairing(&format!("{}/#pair={token}", app.public_url));
+    }
+
+    admin::spawn(app.clone(), &state_dir)?;
+    attention::spawn(app.clone());
     server::run(app).await
 }
 
-fn print_pairing(public_url: &str, token: &str) {
-    let pair_url = format!("{public_url}/#pair={token}");
-    println!("\nPair a device (token valid 10 minutes, single use):\n");
+/// Let's Encrypt certificates live ~90 days; nudge before it bites. (The
+/// file mtime is a proxy — good enough for a warning.)
+fn warn_if_cert_stale(cert: Option<&std::path::Path>) {
+    let Some(cert) = cert else { return };
+    let Ok(meta) = std::fs::metadata(cert) else {
+        tracing::warn!(cert = %cert.display(), "TLS certificate file is not readable");
+        return;
+    };
+    if let Ok(modified) = meta.modified() {
+        if let Ok(age) = modified.elapsed() {
+            let days = age.as_secs() / 86_400;
+            if days > 75 {
+                tracing::warn!(
+                    days,
+                    "TLS certificate file is {days} days old — Let's Encrypt certs \
+                     expire after ~90; renew with `tailscale cert` (see README)"
+                );
+            }
+        }
+    }
+}
+
+fn print_pairing(pair_url: &str) {
+    println!("\nPair a device (link valid 10 minutes, reusable within that window):\n");
     println!("  {pair_url}\n");
     if let Ok(code) = qrcode::QrCode::new(pair_url.as_bytes()) {
         let s = code

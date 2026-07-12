@@ -25,6 +25,8 @@ your tailnet, never on the public internet."""
 assets = [
     ["target/release/remux", "usr/bin/", "755"],
     ["packaging/remux.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/remux-cert-renew.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/remux-cert-renew.timer", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/remux/README.md", "644"],
 ]
 

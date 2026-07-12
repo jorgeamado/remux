@@ -85,14 +85,15 @@ async fn pairing_flow() {
         Some("test phone".to_string())
     );
 
-    // token is single use -> 401 on reuse
+    // Tokens are reusable within their TTL (iOS pairs twice: Safari tab +
+    // installed PWA with partitioned storage).
     let resp = client
         .post(format!("http://{addr}/api/pair"))
-        .json(&serde_json::json!({"token": pairing, "device_name": "again"}))
+        .json(&serde_json::json!({"token": pairing, "device_name": "installed pwa"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

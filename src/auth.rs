@@ -92,11 +92,13 @@ impl Auth {
         }
         inner.attempts.push(now);
 
-        match inner.pairing.get(pairing_token) {
-            Some(expiry) if *expiry > now => {}
-            _ => return Err(PairError::InvalidToken),
+        // Tokens stay valid until their TTL (not single-use): the iOS flow
+        // needs to pair twice — once in the Safari tab and once inside the
+        // installed PWA, whose storage is partitioned from the tab.
+        inner.pairing.retain(|_, expiry| *expiry > now);
+        if !inner.pairing.contains_key(pairing_token) {
+            return Err(PairError::InvalidToken);
         }
-        inner.pairing.remove(pairing_token);
 
         let device_token = random_token();
         let device = Device {
@@ -161,12 +163,29 @@ mod tests {
     }
 
     #[test]
-    fn pairing_token_is_single_use() {
+    fn pairing_token_reusable_within_ttl() {
+        // Both the Safari tab and the installed PWA must be able to pair
+        // with the same token (iOS partitions their storage).
         let auth = temp_auth();
         let pairing = auth.new_pairing_token();
-        auth.pair(&pairing, "one").unwrap();
+        let t1 = auth.pair(&pairing, "safari tab").unwrap();
+        let t2 = auth.pair(&pairing, "installed pwa").unwrap();
+        assert_ne!(t1, t2);
+        assert!(auth.authenticate(&t1).is_some());
+        assert!(auth.authenticate(&t2).is_some());
+    }
+
+    #[test]
+    fn expired_pairing_token_rejected() {
+        let auth = temp_auth();
+        let pairing = auth.new_pairing_token();
+        auth.inner
+            .lock()
+            .unwrap()
+            .pairing
+            .insert(pairing.clone(), Instant::now() - Duration::from_secs(1));
         assert!(matches!(
-            auth.pair(&pairing, "two"),
+            auth.pair(&pairing, "late"),
             Err(PairError::InvalidToken)
         ));
     }

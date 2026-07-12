@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod attention;
 pub mod auth;
 pub mod server;
@@ -20,6 +21,8 @@ pub struct Cli {
 pub enum Cmd {
     /// Run the daemon.
     Serve(Args),
+    /// Print a fresh pairing link + QR from the running daemon.
+    Pair,
 }
 
 /// Options for `remux serve`.
@@ -63,6 +66,8 @@ pub struct App {
     /// Attention events (payload = session name), fanned out to websockets
     /// attached to that session.
     pub attention: tokio::sync::broadcast::Sender<String>,
+    /// URL clients use to reach the daemon (goes into pairing links).
+    pub public_url: String,
 }
 
 pub fn host_of_url(url: &str) -> Option<String> {

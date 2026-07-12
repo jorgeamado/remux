@@ -22,6 +22,7 @@ async fn admin_socket_mints_usable_pairing_tokens() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 
@@ -66,6 +67,7 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
     // A second spawn on the same state dir must refuse — and must NOT have
@@ -96,6 +98,7 @@ async fn stale_socket_file_is_replaced() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app, &dir).unwrap();
 }
@@ -115,6 +118,7 @@ async fn admin_socket_rejects_garbage() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 
@@ -131,4 +135,72 @@ async fn admin_socket_rejects_garbage() {
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(reply.trim()).unwrap();
     assert_eq!(v["ok"], false);
+}
+
+#[tokio::test]
+async fn revoke_cascades_and_cancels_pairing() {
+    let dir = std::env::temp_dir().join(format!("remux-admin-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = Auth::load(dir.join("devices.json")).unwrap();
+    let args = Args::parse_from(["remux", "--session", "adm5", "--no-pair"]);
+    let app = Arc::new(App {
+        allowed_hosts: vec![],
+        auth,
+        args,
+        attention: tokio::sync::broadcast::channel(4).0,
+        public_url: "http://x".into(),
+        push: remux::push::Push::load(&dir).unwrap(),
+        connections: Default::default(),
+        pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
+    });
+    remux::admin::spawn(app.clone(), &dir).unwrap();
+
+    // Pair a device and give it a push subscription.
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "victim phone").unwrap();
+    let id = app.auth.devices()[0].id.clone();
+    app.push
+        .subscribe(remux::push::Subscription {
+            device_id: id.clone(),
+            endpoint: "https://web.push.apple.com/x".into(),
+            p256dh: String::new(),
+            auth: String::new(),
+        })
+        .unwrap();
+    // A second, unused pairing token is outstanding when the incident hits.
+    let outstanding = app.auth.new_pairing_token();
+
+    let mut revoked_rx = app.revoked.subscribe();
+    let v = {
+        let dir = dir.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            remux::admin::request(&dir, serde_json::json!({"cmd": "revoke", "id": id}))
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(v["ok"], true);
+
+    // Cascade: token dead, subscriptions gone, live sockets signalled,
+    // outstanding pairing tokens cancelled.
+    assert!(app.auth.authenticate(&token).is_none());
+    assert!(app.auth.devices().is_empty());
+    assert_eq!(revoked_rx.try_recv().unwrap(), id);
+    assert!(std::fs::read_to_string(dir.join("push.json"))
+        .unwrap_or_default()
+        .trim_start()
+        .starts_with("[]"));
+    assert!(app.auth.pair(&outstanding, "attacker").is_err());
+
+    // devices list over the admin socket reflects it.
+    let v = tokio::task::spawn_blocking(move || {
+        remux::admin::request(&dir, serde_json::json!({"cmd": "devices"}))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(v["devices"], serde_json::json!([]));
 }

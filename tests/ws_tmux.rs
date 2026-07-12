@@ -351,9 +351,32 @@ async fn full_terminal_flow_over_tmux() {
         }
     }
 
-    // Disconnect: the attach client must disappear (this is what gives the
-    // Mac its dimensions back instantly).
-    ws.close(None).await.unwrap();
+    // --- Revocation cascade: the live socket is told and then dropped. ---
+    let dev_id = app
+        .auth
+        .devices()
+        .iter()
+        .find(|d| d.name == "it-device")
+        .unwrap()
+        .id
+        .clone();
+    assert!(app.auth.revoke(&dev_id).is_ok());
+    let _ = app.revoked.send(dev_id);
+    let err = next_json(&mut ws).await;
+    assert_eq!(err["code"], "revoked", "unexpected: {err}");
+    let mut closed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(None) | Ok(Some(Ok(WsMsg::Close(_)))) | Ok(Some(Err(_))) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(closed, "socket did not close after revocation");
     drop(ws);
     let mut gone = false;
     for _ in 0..50 {

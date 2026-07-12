@@ -16,6 +16,17 @@ use tokio::net::{UnixListener, UnixStream};
 enum Request {
     /// Mint a pairing token; responds with the full pairing URL.
     Pair,
+    /// List paired devices.
+    Devices,
+    /// Revoke a device: token invalid + sockets closed + push subscriptions
+    /// deleted + all outstanding pairing tokens cancelled.
+    Revoke {
+        id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
 }
 
 pub fn socket_path(state_dir: &Path) -> PathBuf {
@@ -71,14 +82,34 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
                 "url": format!("{}/#pair={token}", app.public_url),
             })
         }
+        Ok(Request::Devices) => serde_json::json!({
+            "ok": true,
+            "devices": app.auth.devices(),
+        }),
+        Ok(Request::Revoke { id }) => match app.auth.revoke(&id) {
+            Ok(()) => {
+                app.push.remove_device(&id);
+                let _ = app.revoked.send(id.clone());
+                tracing::info!(device = %id, "device revoked via admin socket");
+                serde_json::json!({ "ok": true })
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        },
+        Ok(Request::Rename { id, name }) => {
+            if app.auth.rename(&id, &name) {
+                serde_json::json!({ "ok": true })
+            } else {
+                serde_json::json!({ "ok": false, "error": "no such device" })
+            }
+        }
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
     };
     write.write_all(format!("{response}\n").as_bytes()).await?;
     Ok(())
 }
 
-/// CLI side (`remux pair`): ask the running daemon for a pairing URL.
-pub fn request_pairing(state_dir: &Path) -> Result<String> {
+/// CLI side: one line-JSON request, one response.
+pub fn request(state_dir: &Path, body: serde_json::Value) -> Result<serde_json::Value> {
     use std::io::{BufRead, BufReader, Write};
     let path = socket_path(state_dir);
     let mut stream = std::os::unix::net::UnixStream::connect(&path).with_context(|| {
@@ -87,13 +118,19 @@ pub fn request_pairing(state_dir: &Path) -> Result<String> {
             path.display()
         )
     })?;
-    stream.write_all(b"{\"cmd\":\"pair\"}\n")?;
+    stream.write_all(format!("{body}\n").as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).context("bad admin response")?;
     if v["ok"] != serde_json::json!(true) {
         bail!("daemon refused: {}", v["error"]);
     }
+    Ok(v)
+}
+
+/// CLI side (`remux pair`): ask the running daemon for a pairing URL.
+pub fn request_pairing(state_dir: &Path) -> Result<String> {
+    let v = request(state_dir, serde_json::json!({"cmd": "pair"}))?;
     v["url"]
         .as_str()
         .map(str::to_string)

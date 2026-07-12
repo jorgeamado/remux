@@ -26,6 +26,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/attention", get(attention_pending))
+        .route("/api/devices", get(devices))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -119,6 +120,29 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
     let mut sessions: Vec<&String> = pending.keys().collect();
     sessions.sort();
     Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// Read-only device list for the PWA sheet. Management (revoke/rename) is
+/// deliberately host-CLI-only until per-device capabilities exist.
+async fn devices(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let Some(me) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    let list: Vec<serde_json::Value> = app
+        .auth
+        .devices()
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "created_unix": d.created_unix,
+                "last_seen_unix": d.last_seen_unix,
+                "this_device": d.id == me.id,
+            })
+        })
+        .collect();
+    Json(list).into_response()
 }
 
 #[derive(Deserialize)]

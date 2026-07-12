@@ -50,6 +50,7 @@ async fn https_listener_serves_health() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     tokio::spawn(async move {
         if let Err(e) = remux::server::run(app).await {

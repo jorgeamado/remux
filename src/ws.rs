@@ -219,6 +219,40 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Close this socket when its device is revoked (management cascade).
+    let revoked_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revoke_task = tokio::spawn({
+        let mut rx = app.revoked.subscribe();
+        let out = out_tx.clone();
+        let my_id = device.id.clone();
+        let flag = revoked_flag.clone();
+        let app = app.clone();
+        async move {
+            loop {
+                let mine = match rx.recv().await {
+                    Ok(id) => id == my_id,
+                    // A lagged receiver may have skipped its own revocation:
+                    // fail safe by re-checking the device registry.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        !app.auth.devices().iter().any(|d| d.id == my_id)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if mine {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = out
+                        .send(json(&ServerMsg::Error {
+                            code: "revoked",
+                            message: "this device was revoked",
+                        }))
+                        .await;
+                    let _ = out.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+        }
+    });
+
     // Fan attention events for *this connection's session* into the socket.
     let attention_task = tokio::spawn({
         let mut rx = app.attention.subscribe();
@@ -271,6 +305,9 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
 
     // ---- Main receive loop. ----
     while let Some(Ok(msg)) = ws_rx.next().await {
+        if revoked_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break; // no input is accepted after revocation
+        }
         match msg {
             Message::Binary(bytes) => {
                 // Observers may scroll (mouse-wheel reports drive tmux
@@ -394,6 +431,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // remaining clients (e.g. the Mac) immediately get their dimensions back.
     let _ = child.kill();
     attention_task.abort();
+    revoke_task.abort();
     sender.abort();
     tracing::info!(device = %device.name, "client disconnected");
     Ok(())

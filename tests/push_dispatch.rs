@@ -58,6 +58,7 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     app.push
         .subscribe(Subscription {

@@ -24,6 +24,7 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         push: remux::push::Push::load(&dir).unwrap(),
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
     remux::attention::spawn(app.clone());
 

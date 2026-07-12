@@ -24,6 +24,22 @@ pub enum Cmd {
     Serve(Args),
     /// Print a fresh pairing link + QR from the running daemon.
     Pair,
+    /// Manage paired devices (list, revoke, rename).
+    Devices {
+        #[command(subcommand)]
+        cmd: DevicesCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum DevicesCmd {
+    /// List paired devices.
+    List,
+    /// Revoke a device: its token stops working, live connections drop,
+    /// push subscriptions are deleted, pending pairing links are cancelled.
+    Revoke { id: String },
+    /// Rename a device.
+    Rename { id: String, name: String },
 }
 
 /// Options for `remux serve`.
@@ -76,6 +92,8 @@ pub struct App {
     pub connections: std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
     /// Sessions with recent attention (session -> when), for /api/attention.
     pub pending_attention: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Revocations (payload = device id): live sockets of that device close.
+    pub revoked: tokio::sync::broadcast::Sender<String>,
 }
 
 /// Select the process-wide rustls crypto provider. Both axum-server and

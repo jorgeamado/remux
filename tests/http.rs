@@ -234,6 +234,37 @@ async fn push_endpoints_auth_and_validation() {
 }
 
 #[tokio::test]
+async fn devices_endpoint_read_only_list() {
+    let (addr, app) = start_server("it-devices").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/devices"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "sheet phone").unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/devices"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "sheet phone");
+    assert_eq!(list[0]["this_device"], true);
+    assert!(
+        list[0].get("token_sha256").is_none(),
+        "no secrets in the sheet"
+    );
+}
+
+#[tokio::test]
 async fn serves_embedded_index() {
     let (addr, _app) = start_server("it-static").await;
     let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();

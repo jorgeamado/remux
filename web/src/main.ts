@@ -317,6 +317,11 @@ function handleControl(msg: ControlMsg): void {
         intentionalClose = true;
         ws?.close();
         showSetup("This device is no longer paired. Pair it again.");
+      } else if (msg.code === "revoked") {
+        localStorage.removeItem(TOKEN_KEY);
+        intentionalClose = true;
+        ws?.close();
+        showSetup("This device was revoked. Pair it again if that was a mistake.");
       } else if (msg.code === "invalid_session") {
         // Fall back to the server default; onclose will reconnect.
         localStorage.removeItem(SESSION_KEY);
@@ -716,6 +721,9 @@ document.addEventListener("click", (ev) => {
   if (!tmuxMenu.hidden && !tmuxMenu.contains(ev.target as Node)) {
     tmuxMenu.hidden = true;
   }
+  if (!devicesMenu.hidden && !devicesMenu.contains(ev.target as Node)) {
+    devicesMenu.hidden = true;
+  }
 });
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
 $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
@@ -820,6 +828,49 @@ composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>
   sendInput(data, { takeControl: false, silent: true, allowObserver: true })
 );
+
+// ---------- devices sheet (read-only; manage via the host CLI) ----------
+
+const devicesMenu = $("devices-menu");
+
+function agoText(ts: number): string {
+  if (!ts) return "never";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+$("devices-btn").addEventListener("click", async (ev) => {
+  ev.stopPropagation();
+  menu.hidden = true;
+  let list: { name: string; last_seen_unix: number; this_device: boolean }[];
+  try {
+    const resp = await fetch("/api/devices", { headers: authHeader() });
+    if (!resp.ok) throw new Error(String(resp.status));
+    list = await resp.json();
+  } catch {
+    showHint("Couldn't list devices");
+    return;
+  }
+  devicesMenu.textContent = "";
+  const label = document.createElement("div");
+  label.className = "menu-label";
+  label.textContent = "Paired devices";
+  devicesMenu.appendChild(label);
+  for (const d of list) {
+    const row = document.createElement("div");
+    row.className = "menu-row";
+    row.textContent = `${d.this_device ? "● " : ""}${d.name} · ${agoText(d.last_seen_unix)}`;
+    devicesMenu.appendChild(row);
+  }
+  const foot = document.createElement("div");
+  foot.className = "menu-label";
+  foot.textContent = "revoke/rename: remux devices (host CLI)";
+  devicesMenu.appendChild(foot);
+  devicesMenu.hidden = false;
+});
 
 // ---------- tmux status bar toggle ----------
 

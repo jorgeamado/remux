@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use remux::{admin, attention, auth, host_of_url, push, server, tmux, App, Cli, Cmd};
+use remux::{admin, attention, auth, host_of_url, push, server, tmux, App, Cli, Cmd, DevicesCmd};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -20,6 +20,39 @@ async fn main() -> Result<()> {
         Cmd::Pair => {
             let url = admin::request_pairing(&state_dir)?;
             print_pairing(&url);
+            return Ok(());
+        }
+        Cmd::Devices { cmd } => {
+            match cmd {
+                DevicesCmd::List => {
+                    let v = admin::request(&state_dir, serde_json::json!({"cmd": "devices"}))?;
+                    let empty = vec![];
+                    let devices = v["devices"].as_array().unwrap_or(&empty);
+                    if devices.is_empty() {
+                        println!("no paired devices");
+                    }
+                    for d in devices {
+                        println!(
+                            "{}  {:<24} paired {}  last seen {}",
+                            d["id"].as_str().unwrap_or("?"),
+                            d["name"].as_str().unwrap_or("?"),
+                            fmt_unix(d["created_unix"].as_u64()),
+                            fmt_unix(d["last_seen_unix"].as_u64()),
+                        );
+                    }
+                }
+                DevicesCmd::Revoke { id } => {
+                    admin::request(&state_dir, serde_json::json!({"cmd": "revoke", "id": id}))?;
+                    println!("revoked");
+                }
+                DevicesCmd::Rename { id, name } => {
+                    admin::request(
+                        &state_dir,
+                        serde_json::json!({"cmd": "rename", "id": id, "name": name}),
+                    )?;
+                    println!("renamed");
+                }
+            }
             return Ok(());
         }
     };
@@ -71,6 +104,7 @@ async fn main() -> Result<()> {
         push: push::Push::load(&state_dir)?,
         connections: Default::default(),
         pending_attention: Default::default(),
+        revoked: tokio::sync::broadcast::channel(16).0,
     });
 
     if !app.args.no_pair {
@@ -101,6 +135,25 @@ fn warn_if_cert_stale(cert: Option<&std::path::Path>) {
                     "TLS certificate file is {days} days old — Let's Encrypt certs \
                      expire after ~90; renew with `tailscale cert` (see README)"
                 );
+            }
+        }
+    }
+}
+
+fn fmt_unix(ts: Option<u64>) -> String {
+    match ts {
+        None | Some(0) => "never".into(),
+        Some(ts) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let ago = now.saturating_sub(ts);
+            match ago {
+                0..=59 => format!("{ago}s ago"),
+                60..=3599 => format!("{}m ago", ago / 60),
+                3600..=86399 => format!("{}h ago", ago / 3600),
+                _ => format!("{}d ago", ago / 86400),
             }
         }
     }

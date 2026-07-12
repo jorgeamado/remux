@@ -136,6 +136,42 @@ impl Auth {
             .cloned()
     }
 
+    /// All paired devices (for `remux devices` and the read-only PWA sheet).
+    pub fn devices(&self) -> Vec<Device> {
+        self.inner.lock().unwrap().devices.clone()
+    }
+
+    /// Remove a device. Also cancels every outstanding pairing token: a
+    /// revocation mid-incident must not leave a live enrollment window open.
+    /// A revocation that cannot be persisted is rolled back and reported as
+    /// an error — the token must not silently come back after a restart.
+    pub fn revoke(&self, device_id: &str) -> Result<()> {
+        let inner = &mut *self.inner.lock().unwrap();
+        let Some(pos) = inner.devices.iter().position(|d| d.id == device_id) else {
+            anyhow::bail!("no such device");
+        };
+        let removed = inner.devices.remove(pos);
+        if let Err(e) = self.persist(&inner.devices) {
+            inner.devices.insert(pos, removed);
+            tracing::error!("failed to persist revocation: {e:#}");
+            anyhow::bail!("could not persist the revocation; device NOT revoked");
+        }
+        inner.pairing.clear();
+        Ok(())
+    }
+
+    pub fn rename(&self, device_id: &str, name: &str) -> bool {
+        let inner = &mut *self.inner.lock().unwrap();
+        let Some(d) = inner.devices.iter_mut().find(|d| d.id == device_id) else {
+            return false;
+        };
+        d.name = name.trim().chars().take(64).collect();
+        if let Err(e) = self.persist(&inner.devices) {
+            tracing::error!("failed to persist rename: {e:#}");
+        }
+        true
+    }
+
     /// Record websocket auth time for a device (best effort).
     pub fn touch(&self, device_id: &str) {
         let now = SystemTime::now()

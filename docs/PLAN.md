@@ -133,6 +133,16 @@ a second and its pushes stop; the PWA sheet shows live last-seen times.
 
 ## M3a — control-mode metadata client (large)
 
+> **Spike done (2026-07-12, tmux 3.3a in the devcontainer)** — the design
+> holds: with `read-only,no-output,ignore-size` the window size is untouched
+> (120×40 stays 120×40 through create/split/kill), zero `%output` lines leak
+> even with pane output flowing, every structural change emits at least one
+> notification (non-attached sessions only via `%unlinked-window-*` /
+> `%sessions-changed` — confirming dirty-bits + re-list as the model, not
+> incremental parsing), and server death delivers a clean `%exit` for the
+> supervision loop. Implementation detail: control mode exits on stdin EOF —
+> the adapter must hold the client's stdin open.
+
 The V2 foundation: topology (sessions/windows/panes, names, active flags)
 streamed to clients. **Additive and metadata-only** — the per-connection PTY
 attach remains the byte path, and losing the control client only degrades

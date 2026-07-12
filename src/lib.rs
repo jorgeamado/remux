@@ -78,6 +78,14 @@ pub struct App {
     pub pending_attention: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
+/// Select the process-wide rustls crypto provider. Both axum-server and
+/// reqwest pull rustls, and with two providers in the dependency graph
+/// rustls refuses to guess — the TLS listener would panic at startup.
+/// Call before any TLS use; safe to call repeatedly.
+pub fn init_crypto() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub fn host_of_url(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let host_port = rest.split('/').next()?;

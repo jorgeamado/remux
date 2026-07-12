@@ -21,6 +21,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/pair", post(pair))
         .route("/api/sessions", get(sessions))
+        .route("/api/windows", get(windows))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -38,6 +39,28 @@ async fn sessions(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         return (StatusCode::UNAUTHORIZED, "device token required").into_response();
     }
     match tokio::task::spawn_blocking(crate::tmux::list_sessions).await {
+        Ok(Ok(list)) => Json(list).into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "tmux error").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WindowsQuery {
+    session: String,
+}
+
+async fn windows(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<WindowsQuery>,
+) -> Response {
+    if bearer_device(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    }
+    if !crate::tmux::valid_session_name(&q.session) {
+        return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
+    }
+    match tokio::task::spawn_blocking(move || crate::tmux::list_windows(&q.session)).await {
         Ok(Ok(list)) => Json(list).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "tmux error").into_response(),
     }

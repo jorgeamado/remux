@@ -175,7 +175,8 @@ button {
 /* ---------- menus ---------- */
 
 #menu,
-#session-menu {
+#session-menu,
+#tmux-menu {
   position: absolute;
   top: 84px;
   right: 12px;
@@ -199,8 +200,22 @@ button {
   overflow-y: auto;
 }
 
+#tmux-menu {
+  max-height: 60dvh;
+  overflow-y: auto;
+}
+
+#tmux-menu .menu-label {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
 #menu .btn,
-#session-menu .btn {
+#session-menu .btn,
+#tmux-menu .btn {
   text-align: left;
   white-space: nowrap;
   overflow: hidden;

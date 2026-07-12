@@ -141,6 +141,15 @@ async fn full_terminal_flow_over_tmux() {
     }
     assert!(out_of_mode, "observer wheel-down did not exit copy-mode");
 
+    // Window actions are also gated on control.
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "new_window"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = next_json(&mut ws).await;
+    assert_eq!(err["code"], "observer");
+
     // Take control.
     ws.send(WsMsg::text(
         serde_json::json!({"type": "take_control"}).to_string(),
@@ -211,6 +220,65 @@ async fn full_terminal_flow_over_tmux() {
         !clients.contains("read-only"),
         "controller should not be read-only: {clients:?}"
     );
+
+    // --- Window actions: new window, split, select. ---
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "new_window"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut created = false;
+    for _ in 0..50 {
+        if tmux_sock(&sock, &["list-windows", "-t", session, "-F", "x"])
+            .lines()
+            .count()
+            == 2
+        {
+            created = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(created, "new_window did not create a second window");
+
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "split_v"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut split = false;
+    for _ in 0..50 {
+        let panes = tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{window_panes}"],
+        );
+        if panes == "2" {
+            split = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(split, "split_v did not create a second pane");
+
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "select_window", "index": 0})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut selected = false;
+    for _ in 0..50 {
+        let idx = tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{window_index}"],
+        );
+        if idx == "0" {
+            selected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(selected, "select_window did not switch back to window 0");
 
     // --- Session picker: an auth carrying a session name attaches (and
     // creates) that session; invalid names are rejected before any tmux call. ---

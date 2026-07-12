@@ -185,6 +185,72 @@ fn parse_window_activity_line(line: &str) -> Option<(String, u64)> {
     Some((f.next()?.to_string(), activity))
 }
 
+#[derive(serde::Serialize, Debug, PartialEq)]
+pub struct WindowInfo {
+    pub index: u32,
+    pub active: bool,
+    pub panes: u32,
+    pub name: String,
+}
+
+/// Windows of one session ("tabs" in the mobile UI).
+pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "list-windows",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{window_index} #{window_active} #{window_panes} #{window_name}",
+    ]);
+    let Ok(out) = run(cmd) else {
+        return Ok(Vec::new());
+    };
+    Ok(out.lines().filter_map(parse_window_line).collect())
+}
+
+/// `<index> <active> <panes> <name (may contain spaces)>` — numerics first,
+/// so the name is simply the remainder.
+fn parse_window_line(line: &str) -> Option<WindowInfo> {
+    let mut f = line.splitn(4, ' ');
+    Some(WindowInfo {
+        index: f.next()?.parse().ok()?,
+        active: f.next()? == "1",
+        panes: f.next()?.parse().ok()?,
+        name: f.next().unwrap_or("").to_string(),
+    })
+}
+
+/// Controller-initiated window/pane operations, whitelisted by name.
+pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<()> {
+    let target = format!("={session}");
+    let mut cmd = tmux();
+    match action {
+        "new_window" => {
+            cmd.args(["new-window", "-t", &target]);
+        }
+        // NB: split-window needs a pane-shaped target — "=session" alone is
+        // "can't find pane" on tmux 3.3a; the trailing ":" (current window's
+        // active pane) resolves.
+        "split_h" => {
+            cmd.args(["split-window", "-h", "-t", &format!("{target}:")]);
+        }
+        "split_v" => {
+            cmd.args(["split-window", "-v", "-t", &format!("{target}:")]);
+        }
+        "next_pane" => {
+            cmd.args(["select-pane", "-t", &format!("{target}:.+")]);
+        }
+        "select_window" => {
+            let i = index.context("select_window requires an index")?;
+            cmd.args(["select-window", "-t", &format!("{target}:{i}")]);
+        }
+        other => bail!("unknown window action {other:?}"),
+    }
+    run(cmd)?;
+    Ok(())
+}
+
 /// Promote our attach client to controller (drives window size).
 pub fn promote_client(client: &str) -> Result<()> {
     let mut cmd = tmux();
@@ -236,6 +302,27 @@ mod tests {
             Some(("my session".into(), 99))
         );
         assert_eq!(parse_window_activity_line("garbage"), None);
+    }
+
+    #[test]
+    fn window_line_parsing() {
+        assert_eq!(
+            parse_window_line("2 1 3 my window"),
+            Some(WindowInfo {
+                index: 2,
+                active: true,
+                panes: 3,
+                name: "my window".into(),
+            })
+        );
+        assert_eq!(parse_window_line("0 0 1 bash").unwrap().active, false);
+        assert_eq!(parse_window_line("garbage"), None);
+    }
+
+    #[test]
+    fn unknown_window_action_rejected() {
+        assert!(window_action("s", "kill_server", None).is_err());
+        assert!(window_action("s", "select_window", None).is_err()); // no index
     }
 
     #[test]

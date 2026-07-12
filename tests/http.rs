@@ -130,6 +130,40 @@ async fn sessions_require_device_token() {
 }
 
 #[tokio::test]
+async fn windows_endpoint_auth_and_validation() {
+    let (addr, app) = start_server("it-windows").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/api/windows?session=it-windows"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "t").unwrap();
+
+    let resp = client
+        .get(format!("http://{addr}/api/windows?session=bad:name"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = client
+        .get(format!("http://{addr}/api/windows?session=it-windows"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.is_array(), "expected array, got {body}");
+}
+
+#[tokio::test]
 async fn serves_embedded_index() {
     let (addr, _app) = start_server("it-static").await;
     let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();

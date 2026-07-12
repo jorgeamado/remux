@@ -36,6 +36,12 @@ enum ClientMsg {
     },
     TakeControl,
     ReleaseControl,
+    /// Window/pane operations (new window, splits, switching) — controller only.
+    WindowAction {
+        action: String,
+        #[serde(default)]
+        index: Option<u32>,
+    },
     Ping,
 }
 
@@ -307,6 +313,31 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     }
                     controller = false;
                     let _ = out_tx.send(status("observer")).await;
+                }
+                Ok(ClientMsg::WindowAction { action, index }) => {
+                    if !controller {
+                        let _ = out_tx
+                            .send(json(&ServerMsg::Error {
+                                code: "observer",
+                                message: "take control before changing windows",
+                            }))
+                            .await;
+                    } else {
+                        let session = session.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            tmux::window_action(&session, &action, index)
+                        })
+                        .await?;
+                        if let Err(e) = res {
+                            tracing::warn!("window action failed: {e:#}");
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "window_action_failed",
+                                    message: "could not perform window action",
+                                }))
+                                .await;
+                        }
+                    }
                 }
                 Ok(ClientMsg::Ping) => {
                     let _ = out_tx.send(json(&ServerMsg::Pong)).await;

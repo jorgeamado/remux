@@ -10,8 +10,8 @@ const SESSION_KEY = "remux.session";
 const STATUS_KEY = "remux.statusbar";
 const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
-const FONT_MIN = 10;
-const FONT_MAX = 22;
+const FONT_MIN = 6; // small enough to view a desktop-sized grid while observing
+const FONT_MAX = 28;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -403,6 +403,80 @@ sessionName.addEventListener("click", (ev) => {
   }
 });
 
+// ---------- windows & panes (tmux "tabs") ----------
+
+interface WindowInfo {
+  index: number;
+  active: boolean;
+  panes: number;
+  name: string;
+}
+
+const tmuxBtn = $<HTMLButtonElement>("tmux-btn");
+const tmuxMenu = $("tmux-menu");
+
+function windowAction(action: string, index?: number): void {
+  tmuxMenu.hidden = true;
+  if (!isController) {
+    showHint("Take control first");
+    return;
+  }
+  sendJson({ type: "window_action", action, index });
+}
+
+async function openTmuxMenu(): Promise<void> {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token || !sessionTitle) return;
+  let windows: WindowInfo[] = [];
+  try {
+    const resp = await fetch(
+      `/api/windows?session=${encodeURIComponent(sessionTitle)}`,
+      { headers: { authorization: `Bearer ${token}` } }
+    );
+    if (resp.ok) windows = (await resp.json()) as WindowInfo[];
+  } catch {
+    /* menu still offers the actions */
+  }
+  tmuxMenu.textContent = "";
+  if (windows.length > 0) {
+    const label = document.createElement("div");
+    label.className = "menu-label";
+    label.textContent = "Windows";
+    tmuxMenu.appendChild(label);
+    for (const w of windows) {
+      const marker = w.active ? "● " : "";
+      const panes = w.panes > 1 ? ` · ${w.panes} panes` : "";
+      tmuxMenu.appendChild(
+        menuItem(`${marker}${w.index}: ${w.name}${panes}`, () =>
+          windowAction("select_window", w.index)
+        )
+      );
+    }
+  }
+  const label = document.createElement("div");
+  label.className = "menu-label";
+  label.textContent = "Create";
+  tmuxMenu.appendChild(label);
+  tmuxMenu.appendChild(menuItem("New window", () => windowAction("new_window")));
+  tmuxMenu.appendChild(
+    menuItem("Split │ side by side", () => windowAction("split_h"))
+  );
+  tmuxMenu.appendChild(menuItem("Split ─ stacked", () => windowAction("split_v")));
+  tmuxMenu.appendChild(menuItem("Next pane", () => windowAction("next_pane")));
+  tmuxMenu.hidden = false;
+}
+
+tmuxBtn.addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  menu.hidden = true;
+  sessionMenu.hidden = true;
+  if (tmuxMenu.hidden) {
+    void openTmuxMenu();
+  } else {
+    tmuxMenu.hidden = true;
+  }
+});
+
 // ---------- attention notifications ----------
 
 /// The daemon says the session was busy and went quiet (job finished, or a
@@ -498,6 +572,9 @@ document.addEventListener("click", (ev) => {
   }
   if (!sessionMenu.hidden && !sessionMenu.contains(ev.target as Node)) {
     sessionMenu.hidden = true;
+  }
+  if (!tmuxMenu.hidden && !tmuxMenu.contains(ev.target as Node)) {
+    tmuxMenu.hidden = true;
   }
 });
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));

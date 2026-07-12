@@ -25,7 +25,8 @@ Phone  → PWA (xterm.js) → remux → tmux client (PTY)
 - Locking the phone or losing signal just detaches that tmux client — your
   desktop immediately gets its dimensions back.
 - Tap the session name in the top bar to switch to another tmux session or
-  create a new one.
+  create a new one. The **+** button lists the session's windows (switch with
+  a tap) and creates windows, splits, or cycles panes — controller only.
 
 ## Install
 

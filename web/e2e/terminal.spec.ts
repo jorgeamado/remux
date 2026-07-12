@@ -168,6 +168,21 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
 
+  // --- Windows: create a second window via the + menu, then switch back. ---
+  await page.locator("#tmux-btn").click();
+  await expect(page.locator("#tmux-menu")).toBeVisible();
+  await page.locator("#tmux-menu .btn", { hasText: "New window" }).click();
+  // The fresh window's shell replaces the old screen content.
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .not.toContain("direct4typing");
+  await page.locator("#tmux-btn").click();
+  await expect(page.locator("#tmux-menu")).toContainText("Windows");
+  await page.locator("#tmux-menu .btn", { hasText: "0:" }).click();
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("direct4typing");
+
   // --- Key row: ^C lives in the "…" overflow row. ---
   await page.locator("#more-key").click();
   await expect(page.locator("#keyrow-more")).toBeVisible();

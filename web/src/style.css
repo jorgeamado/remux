@@ -30,6 +30,7 @@ body {
 }
 
 #app {
+  position: relative; /* containing block for the #setup overlay */
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -376,7 +377,10 @@ button {
   z-index: 30;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  /* `safe` keeps the top reachable when the keyboard shrinks the viewport
+     and the content would otherwise overflow past the top edge. */
+  justify-content: safe center;
+  overflow-y: auto;
   gap: 14px;
   padding: 28px;
   background: var(--bg);

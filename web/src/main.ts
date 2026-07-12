@@ -900,6 +900,14 @@ termkbBtn.addEventListener("click", () => {
 });
 renderTermkbBtn();
 
+// When the on-screen keyboard opens, make sure the focused pairing field is
+// scrolled into the (now smaller) visual viewport rather than hidden behind it.
+$<HTMLInputElement>("pair-input").addEventListener("focus", () => {
+  setTimeout(() => {
+    $("pair-input").scrollIntoView({ block: "center", behavior: "smooth" });
+  }, 300);
+});
+
 $("pair-btn").addEventListener("click", async () => {
   const input = $<HTMLInputElement>("pair-input").value.trim();
   const token = extractPairToken(input);

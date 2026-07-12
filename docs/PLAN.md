@@ -193,6 +193,11 @@ from M3a so the risky plumbing and the UI each land shippable.
 - Per-device permission tiers (observer/controller/admin) — prerequisite
   for invite-from-device and shared use.
 - Hosted apt repo (GPG-signed), cloud relay, collaboration.
+- Built-in ACME (`rustls-acme`, e.g. `--acme-domain` + DNS-01 credentials):
+  the daemon issues and renews its own publicly-trusted certificate, making
+  remux fully VPN-agnostic (today Tailscale is only "special" because
+  `tailscale cert` is the zero-config way to satisfy iOS's trusted-TLS
+  requirement — there is no code dependency on it).
 
 ## Sequencing rationale
 

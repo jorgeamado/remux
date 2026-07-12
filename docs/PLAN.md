@@ -7,7 +7,11 @@
 > + cert renewal shipped; repo public. Remaining M0 user actions: publish
 > the draft release, create the `homebrew-remux` tap with the generated
 > `remux.rb`. **M1 code complete** (push stack + dispatcher + deep-link,
-> reviewed) — awaiting the real-device spike on an iPhone. Shakedown
+> reviewed) — awaiting the real-device spike on an iPhone. **M1.5 done**
+> (observer Fit toggle; window dims ride the status frame). **M2 done**
+> (revocation cascade incl. persist-rollback and lagged-broadcast fail-safe,
+> `remux devices` CLI over the admin socket, read-only PWA Devices sheet).
+> Next: M3a, starting with the control-mode compatibility spike. Shakedown
 > findings fixed along the way: attestations are public-repo-only, the
 > macos-13 runner pool is starved (cross-target from macos-14), and a
 > second rustls crypto provider panicked the TLS listener (now a smoke-

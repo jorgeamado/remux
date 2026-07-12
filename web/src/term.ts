@@ -1,5 +1,6 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 
 export interface TermHandle {
@@ -44,6 +45,19 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
   box.id = "termbox"; // CSS: absolute inset:8px — fills the content box exactly
   container.appendChild(box);
   term.open(box);
+
+  // The default DOM renderer positions per-character spans and, at small font
+  // sizes with fractional cell widths, adjacent glyphs (especially htop/vim
+  // box-drawing) visually overlap. The WebGL renderer draws each cell in a
+  // fixed grid — no overlap, sharp at any size. Fall back silently to DOM if
+  // the GL context is unavailable (e.g. headless CI) or lost.
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => webgl.dispose());
+    term.loadAddon(webgl);
+  } catch {
+    /* keep the DOM renderer */
+  }
 
   // The grid xterm renders is exactly the grid we report to the daemon (and
   // thus tmux): no phantom rows, no clipping. A single source of truth for

@@ -832,6 +832,20 @@ debugBtn.addEventListener("click", () => {
 });
 applyDebug();
 
+// Renderer-independent view of the terminal buffer (the WebGL renderer draws
+// to a canvas, leaving the DOM rows empty). Used by e2e; harmless in prod.
+(window as unknown as { __termText?: () => string }).__termText = () => {
+  const b = handle.term.buffer.active;
+  const start = Math.max(0, b.length - 400);
+  let out = "";
+  for (let i = start; i < b.length; i++) {
+    out += (b.getLine(i)?.translateToString(true) ?? "") + "\n";
+  }
+  return out;
+};
+(window as unknown as { __termCols?: () => number }).__termCols = () =>
+  handle.size().cols;
+
 setupKeyRow(sendInput);
 composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>

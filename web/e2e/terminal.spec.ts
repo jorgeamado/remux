@@ -64,7 +64,10 @@ test.afterAll(() => {
 });
 
 async function terminalText(page: Page): Promise<string> {
-  return (await page.locator(".xterm-rows").textContent()) ?? "";
+  // Renderer-independent: the WebGL renderer leaves .xterm-rows empty.
+  return await page.evaluate(
+    () => (window as unknown as { __termText?: () => string }).__termText?.() ?? ""
+  );
 }
 
 test("pair, observe, take control, run a command, reconnect", async ({ page }) => {
@@ -141,32 +144,16 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
 
-  // --- Font size (A- / A+) actually changes the rendered glyph size, not
-  // just line spacing. Measure a real cell's width. ---
-  const fontSignals = () =>
-    page.evaluate(() => {
-      const xt = document.querySelector(".xterm") as HTMLElement | null;
-      const measure = document.querySelector(
-        ".xterm-char-measure-element"
-      ) as HTMLElement | null;
-      const screen = document.querySelector(".xterm-screen") as HTMLElement | null;
-      return {
-        xtermFont: xt ? parseFloat(getComputedStyle(xt).fontSize) : 0,
-        measureW: measure ? measure.getBoundingClientRect().width : 0,
-        screenW: screen ? screen.getBoundingClientRect().width : 0,
-      };
-    });
+  // --- Font size (A- / A+) is the tmux resolution: a smaller font must fit
+  // MORE columns in the same width (renderer-independent check). ---
+  const cols = () =>
+    page.evaluate(
+      () => (window as unknown as { __termCols: () => number }).__termCols()
+    );
   await page.locator("#menu-btn").click();
-  const before = await fontSignals();
+  const beforeCols = await cols();
   await page.locator("#font-dec").click();
-  await page.waitForTimeout(500);
-  const after = await fontSignals();
-  // Glyphs must actually shrink. The char-measure element (measureW) is
-  // xterm's own authoritative per-cell width.
-  expect(
-    after.measureW,
-    `A- must shrink glyphs. before=${JSON.stringify(before)} after=${JSON.stringify(after)}`
-  ).toBeLessThan(before.measureW);
+  await expect.poll(cols, { timeout: 3_000 }).toBeGreaterThan(beforeCols);
   await page.locator("#font-inc").click(); // restore
   await page.locator("#menu-btn").click(); // close menu
 

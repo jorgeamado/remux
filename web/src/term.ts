@@ -10,6 +10,10 @@ export interface TermHandle {
   setFontSize: (px: number) => void;
   /// Clip the bottom terminal row (the tmux status line) out of view.
   setHideStatusRow: (hide: boolean) => void;
+  /// Allow/forbid typing straight into the terminal. When off, taps never
+  /// focus xterm's hidden textarea (no on-screen keyboard); the composer and
+  /// key row remain the input surfaces. Mouse/touch reports are unaffected.
+  setDirectInput: (enabled: boolean) => void;
 }
 
 export function createTerminal(
@@ -111,6 +115,16 @@ export function createTerminal(
     setHideStatusRow: (hide) => {
       hideStatusRow = hide;
       fit();
+    },
+    setDirectInput: (enabled) => {
+      const ta = term.textarea;
+      if (!ta) return;
+      if (enabled) {
+        ta.removeAttribute("inert");
+      } else {
+        ta.setAttribute("inert", ""); // focus() becomes a no-op
+        ta.blur();
+      }
     },
   };
 }

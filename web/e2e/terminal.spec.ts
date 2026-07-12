@@ -140,14 +140,33 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .not.toMatch(/\[\d+\/\d+\]/);
   await expect(roleChip).toHaveText("Observer");
 
-  // --- Type-to-take-control: typing as observer requests control, buffers
-  // the keystrokes, and flushes them once granted. ---
-  await page.locator(".xterm").click();
-  await page.keyboard.type("echo e2e$((1+1))marker\n");
+  // --- Composer takeover: submitting as an observer requests control,
+  // buffers the line, and flushes it once granted. On touch devices the
+  // composer is the input surface. ---
+  await page.locator("#composer-input").fill("echo e2e$((1+1))marker");
+  await page.locator("#composer-input").press("Enter");
   await expect(roleChip).toContainText("Controller");
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
+
+  // Touch default: direct typing is off — terminal taps never focus xterm's
+  // textarea (no on-screen keyboard).
+  await page.locator(".xterm").click();
+  expect(
+    await page.evaluate(() => document.activeElement?.className ?? "")
+  ).not.toContain("xterm-helper-textarea");
+  // Enable direct typing for the raw-keyboard steps below.
+  await page.locator("#menu-btn").click();
+  await expect(page.locator("#termkb-btn")).toHaveText("Direct typing: off");
+  await page.locator("#termkb-btn").click();
+  await expect(page.locator("#termkb-btn")).toHaveText("Direct typing: on");
+  await page.locator("#conn-status").click(); // close the menu
+  await page.locator(".xterm").click();
+  await page.keyboard.type("echo direct$((2+2))typing\n");
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("direct4typing");
 
   // --- Key row: ^C lives in the "…" overflow row. ---
   await page.locator("#more-key").click();
@@ -257,6 +276,7 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#font-inc").click();
   expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("15");
   await expect(page.locator("#notify-btn")).toHaveText("Notifications: off");
+  await expect(page.locator("#termkb-btn")).toHaveText("Direct typing: on");
   await page.locator("#conn-status").click();
   await expect(page.locator("#menu")).toBeHidden();
 

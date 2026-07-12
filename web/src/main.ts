@@ -9,6 +9,7 @@ const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
 const STATUS_KEY = "remux.statusbar";
 const HISTORY_KEY = "remux.history";
+const TERMKB_KEY = "remux.termkb";
 const FONT_MIN = 10;
 const FONT_MAX = 22;
 
@@ -47,7 +48,13 @@ let controlRequested = false;
 
 let fontSize = parseInt(localStorage.getItem(FONT_KEY) ?? "14", 10) || 14;
 let hideStatusBar = localStorage.getItem(STATUS_KEY) !== "show";
+// Touch devices: the composer is the input surface; tapping the terminal
+// must not open the on-screen keyboard. Desktop keeps direct typing.
+let directInput =
+  (localStorage.getItem(TERMKB_KEY) ??
+    (matchMedia("(pointer: coarse)").matches ? "off" : "on")) === "on";
 const handle = createTerminal($("terminal"), fontSize, hideStatusBar);
+handle.setDirectInput(directInput);
 
 // ---------- pairing ----------
 
@@ -592,6 +599,20 @@ statusBtn.addEventListener("click", () => {
   renderStatusBtn();
 });
 renderStatusBtn();
+
+// ---------- direct terminal typing toggle ----------
+
+const termkbBtn = $<HTMLButtonElement>("termkb-btn");
+function renderTermkbBtn(): void {
+  termkbBtn.textContent = `Direct typing: ${directInput ? "on" : "off"}`;
+}
+termkbBtn.addEventListener("click", () => {
+  directInput = !directInput;
+  localStorage.setItem(TERMKB_KEY, directInput ? "on" : "off");
+  handle.setDirectInput(directInput);
+  renderTermkbBtn();
+});
+renderTermkbBtn();
 
 $("pair-btn").addEventListener("click", async () => {
   const input = $<HTMLInputElement>("pair-input").value.trim();

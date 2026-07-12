@@ -147,14 +147,14 @@ function requestControl(): void {
 }
 
 /// Send terminal input. Typing as an observer implicitly requests control
-/// and buffers the keystrokes; scrolling as an observer only hints (a glance
-/// shouldn't resize the session under the desktop user); automatic terminal
-/// protocol replies never take control and never hint.
+/// and buffers the keystrokes; wheel reports are sent even as an observer
+/// (the daemon whitelists them — scrollback without taking over); automatic
+/// terminal protocol replies never take control and never hint.
 function sendInput(
   data: string,
-  opts: { takeControl?: boolean; silent?: boolean } = {}
+  opts: { takeControl?: boolean; silent?: boolean; allowObserver?: boolean } = {}
 ): void {
-  if (!isController) {
+  if (!isController && !opts.allowObserver) {
     if (opts.takeControl === false) {
       if (!opts.silent) {
         showHint("Observing — tap here to take control");
@@ -542,9 +542,15 @@ keysToggle.addEventListener("pointerdown", (ev) => {
 
 // ---------- wire up ----------
 
+/// Wheel reports (desktop trackpad/mouse over the terminal) scroll history —
+/// they must never trigger take-control and they work while observing.
+const WHEEL_RE = /^(?:\x1b\[<6[45];\d+;\d+M)+$/;
+
 handle.term.onData((data) => {
   if (RESPONSE_RE.test(data)) {
     sendInput(data, { takeControl: false, silent: true });
+  } else if (WHEEL_RE.test(data)) {
+    sendInput(data, { takeControl: false, silent: true, allowObserver: true });
   } else {
     sendInput(applyCtrl(data));
   }
@@ -570,7 +576,7 @@ hint.addEventListener("click", () => {
 setupKeyRow(sendInput);
 composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>
-  sendInput(data, { takeControl: false })
+  sendInput(data, { takeControl: false, silent: true, allowObserver: true })
 );
 
 // ---------- tmux status bar toggle ----------

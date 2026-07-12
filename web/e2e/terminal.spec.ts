@@ -91,7 +91,7 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   });
   expect(clipped).toBeGreaterThan(0);
 
-  // Observer swipe: shows the take-control hint but does NOT take control
+  // Observer swipe: scrolls tmux history (copy-mode) WITHOUT taking control
   // (glancing at a session must not resize it under the desktop user).
   await page.evaluate(() => {
     const el = document.getElementById("terminal")!;
@@ -111,8 +111,33 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     }
     el.dispatchEvent(new TouchEvent("touchend", opts(y0 + 160)));
   });
-  await expect(page.locator("#hint")).toBeVisible();
-  await expect(page.locator("#hint")).toContainText("Observing");
+  // tmux copy-mode indicator appears; still an observer.
+  await expect
+    .poll(async () => terminalText(page), { timeout: 5_000 })
+    .toMatch(/\[\d+\/\d+\]/);
+  await expect(roleChip).toHaveText("Observer");
+  // Swipe back down (finger up) far enough to exit copy-mode before typing.
+  await page.evaluate(() => {
+    const el = document.getElementById("terminal")!;
+    const rect = el.getBoundingClientRect();
+    const mk = (y: number) =>
+      new Touch({ identifier: 8, target: el, clientX: rect.left + 100, clientY: y });
+    const opts = (y: number): TouchEventInit => ({
+      touches: [mk(y)],
+      changedTouches: [mk(y)],
+      bubbles: true,
+      cancelable: true,
+    });
+    const y0 = rect.top + 600;
+    el.dispatchEvent(new TouchEvent("touchstart", opts(y0)));
+    for (let i = 1; i <= 14; i++) {
+      el.dispatchEvent(new TouchEvent("touchmove", opts(y0 - i * 40)));
+    }
+    el.dispatchEvent(new TouchEvent("touchend", opts(y0 - 560)));
+  });
+  await expect
+    .poll(async () => terminalText(page), { timeout: 5_000 })
+    .not.toMatch(/\[\d+\/\d+\]/);
   await expect(roleChip).toHaveText("Observer");
 
   // --- Type-to-take-control: typing as observer requests control, buffers

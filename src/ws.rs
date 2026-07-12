@@ -230,7 +230,10 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(bytes) => {
-                if controller {
+                // Observers may scroll (mouse-wheel reports drive tmux
+                // copy-mode and cannot type or execute anything); all other
+                // input still requires control.
+                if controller || wheel_reports_only(&bytes) {
                     if in_tx.send(bytes.to_vec()).await.is_err() {
                         break;
                     }
@@ -329,6 +332,54 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
 fn clamp_size(cols: &mut u16, rows: &mut u16) {
     *cols = (*cols).clamp(20, 500);
     *rows = (*rows).clamp(5, 300);
+}
+
+/// True when the payload is nothing but SGR mouse *wheel* press reports
+/// (`ESC [ < 64|65 ; col ; row M`) — the only input observers may send.
+fn wheel_reports_only(bytes: &[u8]) -> bool {
+    fn digits(rest: &[u8], stop: u8) -> Option<&[u8]> {
+        let end = rest.iter().position(|&b| b == stop)?;
+        if end == 0 || end > 4 || !rest[..end].iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(&rest[end + 1..])
+    }
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        rest = match rest
+            .strip_prefix(b"\x1b[<64;".as_slice())
+            .or_else(|| rest.strip_prefix(b"\x1b[<65;".as_slice()))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+        let Some(r) = digits(rest, b';').and_then(|r| digits(r, b'M')) else {
+            return false;
+        };
+        rest = r;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_report_whitelist() {
+        assert!(wheel_reports_only(b"\x1b[<64;12;5M"));
+        assert!(wheel_reports_only(b"\x1b[<65;1;1M\x1b[<65;1;2M"));
+        assert!(!wheel_reports_only(b""));
+        assert!(!wheel_reports_only(b"ls\r"));
+        assert!(!wheel_reports_only(b"\x1b[<0;12;5M")); // click, not wheel
+        assert!(!wheel_reports_only(b"\x1b[<64;12;5m")); // release marker
+        assert!(!wheel_reports_only(b"\x1b[<64;12;5Mq")); // trailing key
+        assert!(!wheel_reports_only(b"\x1b[<64;12345;5M")); // oversized field
+        assert!(!wheel_reports_only(b"\x1b[<64;;5M")); // empty field
+    }
 }
 
 async fn resolve_client_name(pid: Option<u32>) -> Option<String> {

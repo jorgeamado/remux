@@ -105,6 +105,42 @@ async fn full_terminal_flow_over_tmux() {
     let err = next_json(&mut ws).await;
     assert_eq!(err["code"], "observer");
 
+    // ...but observers CAN scroll: wheel reports are whitelisted and drive
+    // tmux copy-mode.
+    ws.send(WsMsg::binary(b"\x1b[<64;10;10M".repeat(5)))
+        .await
+        .unwrap();
+    let mut in_mode = false;
+    for _ in 0..50 {
+        if tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{pane_in_mode}"],
+        ) == "1"
+        {
+            in_mode = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(in_mode, "observer wheel-up did not enter copy-mode");
+    // Wheel back down to the bottom exits copy-mode (live view resumes).
+    ws.send(WsMsg::binary(b"\x1b[<65;10;10M".repeat(30)))
+        .await
+        .unwrap();
+    let mut out_of_mode = false;
+    for _ in 0..50 {
+        if tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{pane_in_mode}"],
+        ) == "0"
+        {
+            out_of_mode = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(out_of_mode, "observer wheel-down did not exit copy-mode");
+
     // Take control.
     ws.send(WsMsg::text(
         serde_json::json!({"type": "take_control"}).to_string(),

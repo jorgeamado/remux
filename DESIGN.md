@@ -72,6 +72,10 @@ The daemon never emulates a terminal. tmux renders; xterm.js in the browser pars
   *is* the "snapshot on attach", for free, with perfect fidelity.
 - Take control: `tmux refresh-client -t <client> -f '!read-only,!ignore-size'` +
   set PTY winsize. With `window-size latest` the pane resizes to the phone.
+- Observer input: the daemon forwards SGR mouse *wheel* reports only (they
+  drive tmux copy-mode scrollback and cannot type or execute anything — note
+  copy-mode is pane-global, so other clients see the scroll); every other
+  byte requires control.
 - Release / phone locks / network dies: the WebSocket dies → daemon kills the attach
   client → the Mac is the remaining sizing client → its dimensions restore instantly.
   Release logic is zero lines of code.

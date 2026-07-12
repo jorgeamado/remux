@@ -1,3 +1,4 @@
+#![allow(dead_code)] // shared across test binaries; not all use every helper
 use clap::Parser;
 use remux::{auth::Auth, server, App, Args};
 use std::net::SocketAddr;

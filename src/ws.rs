@@ -490,6 +490,22 @@ fn wheel_reports_only(bytes: &[u8]) -> bool {
     true
 }
 
+async fn resolve_client_name(pid: Option<u32>) -> Option<String> {
+    let pid = pid?;
+    for _ in 0..20 {
+        let found = tokio::task::spawn_blocking(move || tmux::client_name_for_pid(pid))
+            .await
+            .ok()?
+            .ok()
+            .flatten();
+        if found.is_some() {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,20 +522,4 @@ mod tests {
         assert!(!wheel_reports_only(b"\x1b[<64;12345;5M")); // oversized field
         assert!(!wheel_reports_only(b"\x1b[<64;;5M")); // empty field
     }
-}
-
-async fn resolve_client_name(pid: Option<u32>) -> Option<String> {
-    let pid = pid?;
-    for _ in 0..20 {
-        let found = tokio::task::spawn_blocking(move || tmux::client_name_for_pid(pid))
-            .await
-            .ok()?
-            .ok()
-            .flatten();
-        if found.is_some() {
-            return found;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
 }

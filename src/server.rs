@@ -221,7 +221,17 @@ async fn guard(
         }
     }
 
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    Ok(response)
 }
 
 fn header_host(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {

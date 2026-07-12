@@ -15,6 +15,10 @@ Description=remux — your persistent tmux session, on your phone
 After=network-online.target
 
 [Service]
+# NB: do NOT set NoNewPrivileges/ProtectHome/PrivateTmp here. remux spawns
+# the tmux server, so sandbox flags are inherited by every shell inside the
+# session — NoNewPrivileges would silently break `sudo` in your terminal,
+# and PrivateTmp would hide the tmux socket.
 EnvironmentFile=-%h/.config/remux/env
 ExecStart=/usr/bin/remux serve $REMUX_ARGS
 Restart=on-failure

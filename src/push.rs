@@ -154,15 +154,15 @@ impl Push {
             recent.retain(|_, t| now.duration_since(*t) < THROTTLE);
             subs.iter()
                 .filter(|s| !skip.contains(&s.device_id))
-                .filter(|s| {
-                    let key = (s.endpoint.clone(), session.to_string());
-                    if recent.contains_key(&key) {
-                        false
-                    } else {
-                        recent.insert(key, now);
-                        true
-                    }
-                })
+                .filter(
+                    |s| match recent.entry((s.endpoint.clone(), session.to_string())) {
+                        std::collections::hash_map::Entry::Occupied(_) => false,
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(now);
+                            true
+                        }
+                    },
+                )
                 .cloned()
                 .collect()
         };

@@ -350,7 +350,7 @@ mod tests {
                 name: "my window".into(),
             })
         );
-        assert_eq!(parse_window_line("0 0 1 bash").unwrap().active, false);
+        assert!(!parse_window_line("0 0 1 bash").unwrap().active);
         assert_eq!(parse_window_line("garbage"), None);
     }
 

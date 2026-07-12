@@ -74,6 +74,8 @@ jobs:
           cp target/debian/*.deb .
 
       - name: Attest build provenance
+        # Attestations are only available on public repositories.
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |

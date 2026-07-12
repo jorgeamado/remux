@@ -89,14 +89,16 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("$");
 
-  // The tmux status row is clipped out of view by default: the terminal box
-  // extends past its container's bottom edge by one cell row.
-  const clipped = await page.evaluate(() => {
-    const t = document.getElementById("terminal")!.getBoundingClientRect();
-    const b = document.getElementById("termbox")!.getBoundingClientRect();
-    return b.bottom - t.bottom;
-  });
-  expect(clipped).toBeGreaterThan(0);
+  const boxOverflow = () =>
+    page.evaluate(() => {
+      const t = document.getElementById("terminal")!.getBoundingClientRect();
+      const b = document.getElementById("termbox")!.getBoundingClientRect();
+      return b.bottom - t.bottom;
+    });
+  // As an observer we do NOT clip the status row: tmux's window is a
+  // different size (ignore-size), so its status line isn't on our bottom
+  // row and clipping would misfire. The box fits the container.
+  expect(await boxOverflow()).toBeLessThanOrEqual(1);
 
   // Observer swipe: scrolls tmux history (copy-mode) WITHOUT taking control
   // (glancing at a session must not resize it under the desktop user).
@@ -157,6 +159,39 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
+
+  // As controller we DO drive the tmux window size, so the status row is on
+  // our bottom row and gets clipped: the box overflows the container by ~1 row.
+  await expect.poll(async () => boxOverflow(), { timeout: 5_000 }).toBeGreaterThan(2);
+
+  // --- Font size (A- / A+) actually changes the rendered glyph size, not
+  // just line spacing. Measure a real cell's width. ---
+  const fontSignals = () =>
+    page.evaluate(() => {
+      const xt = document.querySelector(".xterm") as HTMLElement | null;
+      const measure = document.querySelector(
+        ".xterm-char-measure-element"
+      ) as HTMLElement | null;
+      const screen = document.querySelector(".xterm-screen") as HTMLElement | null;
+      return {
+        xtermFont: xt ? parseFloat(getComputedStyle(xt).fontSize) : 0,
+        measureW: measure ? measure.getBoundingClientRect().width : 0,
+        screenW: screen ? screen.getBoundingClientRect().width : 0,
+      };
+    });
+  await page.locator("#menu-btn").click();
+  const before = await fontSignals();
+  await page.locator("#font-dec").click();
+  await page.waitForTimeout(500);
+  const after = await fontSignals();
+  // Glyphs must actually shrink. The char-measure element (measureW) is
+  // xterm's own authoritative per-cell width.
+  expect(
+    after.measureW,
+    `A- must shrink glyphs. before=${JSON.stringify(before)} after=${JSON.stringify(after)}`
+  ).toBeLessThan(before.measureW);
+  await page.locator("#font-inc").click(); // restore
+  await page.locator("#menu-btn").click(); // close menu
 
   // Touch default: direct typing is off — terminal taps never focus xterm's
   // textarea (no on-screen keyboard).

@@ -129,6 +129,13 @@ impl Push {
         let _ = self.persist(&subs);
     }
 
+    /// Forget the throttle for a session so the next distinct busy→quiet
+    /// notifies promptly. Called when a client attaches to the session
+    /// (the user is now looking; past attention is acknowledged).
+    pub fn clear_session_throttle(&self, session: &str) {
+        self.recent.lock().unwrap().retain(|(_, s), _| s != session);
+    }
+
     /// Drop everything belonging to a device (revocation cascade, M2).
     pub fn remove_device(&self, device_id: &str) {
         let mut subs = self.subs.lock().unwrap();

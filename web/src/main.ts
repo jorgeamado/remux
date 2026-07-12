@@ -123,6 +123,17 @@ function setRole(controller: boolean): void {
   renderBanner();
   menuBtn.hidden = false;
   renderFitBtn();
+  applyStatusClip();
+}
+
+/// The tmux status line can only be reliably clipped when this client drives
+/// the window size (controller) — then tmux renders it on our bottom row. As
+/// an observer we use `ignore-size`, so tmux's window is a different size and
+/// its status line lands mid-screen; clipping our bottom row would miss it and
+/// leave the status visible (often doubled after a resize). So: clip only when
+/// controlling.
+function applyStatusClip(): void {
+  handle.setHideStatusRow(hideStatusBar && isController);
 }
 
 /// The control row: a role chip on the left, the takeover button on the right.
@@ -881,7 +892,7 @@ function renderStatusBtn(): void {
 statusBtn.addEventListener("click", () => {
   hideStatusBar = !hideStatusBar;
   localStorage.setItem(STATUS_KEY, hideStatusBar ? "hide" : "show");
-  handle.setHideStatusRow(hideStatusBar);
+  applyStatusClip();
   renderStatusBtn();
 });
 renderStatusBtn();

@@ -179,6 +179,14 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         move || tmux::ensure_session(&session)
     })
     .await??;
+
+    // Attaching resets this session's push throttle so a genuinely new
+    // busy→quiet notifies promptly rather than being suppressed by a lingering
+    // throttle. The pending-attention marker is deliberately NOT cleared here:
+    // it is the deep-link hint another device's notification tap resolves via
+    // /api/attention, and it self-expires. The client already ignores the
+    // session it is currently viewing.
+    app.push.clear_session_throttle(&session);
     tokio::task::spawn_blocking({
         let app = app.clone();
         let id = device.id.clone();

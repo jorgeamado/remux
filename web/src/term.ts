@@ -83,11 +83,11 @@ export function createTerminal(
     }
   };
 
-  // Refit whenever the terminal area changes: window resizes, the iOS
-  // software keyboard opens (visualViewport), rotation, container changes.
+  // Refit when the terminal area actually changes size: window resize, the
+  // iOS keyboard opening (visualViewport resize), rotation, container change.
   const app = document.getElementById("app")!;
   const vv = window.visualViewport;
-  const onViewport = () => {
+  const onResize = () => {
     if (vv) {
       // iOS Safari: keyboard overlays the page; shrink the app to the
       // visible viewport so the terminal stays fully on screen.
@@ -96,9 +96,12 @@ export function createTerminal(
     }
     fit();
   };
-  vv?.addEventListener("resize", onViewport);
-  vv?.addEventListener("scroll", onViewport);
-  window.addEventListener("orientationchange", () => setTimeout(onViewport, 50));
+  vv?.addEventListener("resize", onResize);
+  // On scroll, only pin the page — do NOT refit. iOS fires a stream of
+  // visualViewport scroll events during momentum/rubber-band scrolling, and
+  // refitting on each one makes the terminal flicker ("blinking").
+  vv?.addEventListener("scroll", () => window.scrollTo(0, 0));
+  window.addEventListener("orientationchange", () => setTimeout(onResize, 50));
   new ResizeObserver(fit).observe(container);
 
   fit();

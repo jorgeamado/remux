@@ -47,8 +47,9 @@ pub struct App {
     pub args: Args,
     pub auth: auth::Auth,
     pub allowed_hosts: Vec<String>,
-    /// Attention events fanned out to every connected websocket.
-    pub attention: tokio::sync::broadcast::Sender<()>,
+    /// Attention events (payload = session name), fanned out to websockets
+    /// attached to that session.
+    pub attention: tokio::sync::broadcast::Sender<String>,
 }
 
 pub fn host_of_url(url: &str) -> Option<String> {

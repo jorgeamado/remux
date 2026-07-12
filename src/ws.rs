@@ -191,15 +191,16 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
-    // Fan attention events from the monitor into this connection.
+    // Fan attention events for *this connection's session* into the socket.
     let attention_task = tokio::spawn({
         let mut rx = app.attention.subscribe();
         let out = out_tx.clone();
+        let session = session.clone();
         async move {
             loop {
                 match rx.recv().await {
-                    Ok(()) => {
-                        if out.send(json(&ServerMsg::Attention)).await.is_err() {
+                    Ok(name) => {
+                        if name == session && out.send(json(&ServerMsg::Attention)).await.is_err() {
                             break;
                         }
                     }

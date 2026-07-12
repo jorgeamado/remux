@@ -217,7 +217,13 @@ wake lock while visible.
   rejected all HTTP/2 requests (h2 has no Host header, only `:authority`) —
   the guard now falls back to the request URI authority.
   Still open: launchd/systemd unit files, device management UI.
-  NB: the attention monitor watches the daemon's default `--session` only.
+- **Codex review (2026-07-12) findings fixed**: attention events are now
+  per-session (the monitor watches every session; each websocket receives
+  only its own session's events); a leaked `intentionalClose` could leave
+  the client permanently disconnected after an `invalid_session` fallback
+  (close handling is per-socket now); session-name validation relaxed to
+  tmux's own rules (`:` `.` control chars) so listed sessions with spaces
+  are attachable.
 - **V2**: control-mode metadata client (panes as cards/tabs), snapshot/delta sync +
   custom renderer, server-paged scrollback, paste confirmation UX.
 - **V3**: shell integration (OSC 133 / hooks), semantic feed ("chat mode"),

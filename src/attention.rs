@@ -86,23 +86,32 @@ pub fn spawn(app: Arc<App>) {
     tokio::spawn(monitor(app, Config::from_env()));
 }
 
+/// Watches every session on the tmux server (one `list-windows -a` per poll;
+/// window activity tracks content output, unlike `session_activity` which
+/// tracks client input). Events carry the session name; each websocket
+/// forwards only events for the session it is attached to.
 async fn monitor(app: Arc<App>, cfg: Config) {
-    let session = app.args.session.clone();
-    let mut detector = Detector::new(&cfg);
+    let mut detectors: std::collections::HashMap<String, Detector> =
+        std::collections::HashMap::new();
     loop {
         tokio::time::sleep(cfg.poll).await;
-        let s = session.clone();
-        let activity = tokio::task::spawn_blocking(move || tmux::last_activity(&s)).await;
-        let Ok(Ok(Some(ts))) = activity else {
-            continue; // session not created yet, or tmux briefly unavailable
+        let sessions = tokio::task::spawn_blocking(tmux::sessions_activity).await;
+        let Ok(Ok(sessions)) = sessions else {
+            continue; // tmux briefly unavailable
         };
+        detectors.retain(|name, _| sessions.iter().any(|(n, _)| n == name));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        if detector.observe(ts as f64, now) {
-            tracing::debug!(session = %session, "attention raised");
-            let _ = app.attention.send(());
+        for (name, activity) in sessions {
+            let detector = detectors
+                .entry(name.clone())
+                .or_insert_with(|| Detector::new(&cfg));
+            if detector.observe(activity as f64, now) {
+                tracing::debug!(session = %name, "attention raised");
+                let _ = app.attention.send(name);
+            }
         }
     }
 }

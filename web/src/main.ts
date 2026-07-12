@@ -191,14 +191,16 @@ function connect(): void {
     showSetup();
     return;
   }
+  clearTimeout(reconnectTimer); // a pending retry must not race this connect
   setup.hidden = true;
   setStatus("connecting…", "connecting");
 
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${scheme}://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
+  const sock = new WebSocket(`${scheme}://${location.host}/ws`);
+  sock.binaryType = "arraybuffer";
+  ws = sock;
 
-  ws.onopen = () => {
+  sock.onopen = () => {
     const { cols, rows } = handle.size();
     sendJson({
       type: "auth",
@@ -209,7 +211,11 @@ function connect(): void {
     });
   };
 
-  ws.onmessage = (ev) => {
+  // Events from a socket that has been superseded by a newer connect() (e.g.
+  // a session switch) are ignored: they must not write stale output or
+  // suppress/schedule reconnects for the current socket.
+  sock.onmessage = (ev) => {
+    if (ws !== sock) return;
     if (typeof ev.data === "string") {
       handleControl(JSON.parse(ev.data));
     } else {
@@ -217,7 +223,8 @@ function connect(): void {
     }
   };
 
-  ws.onclose = () => {
+  sock.onclose = () => {
+    if (ws !== sock) return;
     controlRequested = false;
     pendingInput = "";
     isController = false;
@@ -378,7 +385,9 @@ function switchSession(name: string): void {
   sessionMenu.hidden = true;
   if (name === sessionTitle) return;
   localStorage.setItem(SESSION_KEY, name);
-  intentionalClose = true;
+  // connect() supersedes the old socket; its close event is then ignored,
+  // so no intentionalClose flag is needed (which could leak and suppress
+  // the reconnect after an invalid_session rejection).
   ws?.close();
   handle.term.reset(); // fresh grid; the new attach repaints everything
   connect();

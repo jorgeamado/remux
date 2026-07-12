@@ -107,14 +107,13 @@ pub fn client_name_for_pid(pid: u32) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Only names tmux itself accepts everywhere and that are inert inside a
-/// target spec (no `:` `.` whitespace, which delimit tmux targets).
+/// tmux itself forbids `:` and `.` in session names (they delimit targets);
+/// we additionally reject control characters and unreasonable lengths. Any
+/// real session listed by tmux therefore passes and can be attached.
 pub fn valid_session_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        && !name.chars().any(|c| c == ':' || c == '.' || c.is_control())
 }
 
 #[derive(serde::Serialize, Debug, PartialEq)]
@@ -155,22 +154,35 @@ fn parse_session_line(line: &str) -> Option<SessionInfo> {
     })
 }
 
-/// Unix timestamp (seconds) of the most recent content change in any window
-/// of the session, from tmux's own activity tracking. None when the session
-/// does not exist (yet).
-pub fn last_activity(session: &str) -> Result<Option<u64>> {
+/// Latest content-activity timestamp per session, from one `list-windows -a`
+/// call. NB: `session_activity` tracks *client* activity (input/attach), so
+/// window activity is the right signal for "output happened".
+pub fn sessions_activity() -> Result<Vec<(String, u64)>> {
     let mut cmd = tmux();
     cmd.args([
         "list-windows",
-        "-t",
-        &format!("={session}"),
+        "-a",
         "-F",
-        "#{window_activity}",
+        "#{session_name} #{window_activity}",
     ]);
-    match run(cmd) {
-        Ok(out) => Ok(out.lines().filter_map(|l| l.trim().parse().ok()).max()),
-        Err(_) => Ok(None),
+    let Ok(out) = run(cmd) else {
+        return Ok(Vec::new()); // no tmux server running
+    };
+    let mut latest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for line in out.lines() {
+        if let Some((name, activity)) = parse_window_activity_line(line) {
+            let entry = latest.entry(name).or_default();
+            *entry = (*entry).max(activity);
+        }
     }
+    Ok(latest.into_iter().collect())
+}
+
+/// `<session name (may contain spaces)> <activity unix ts>`
+fn parse_window_activity_line(line: &str) -> Option<(String, u64)> {
+    let mut f = line.rsplitn(2, ' ');
+    let activity = f.next()?.parse().ok()?;
+    Some((f.next()?.to_string(), activity))
 }
 
 /// Promote our attach client to controller (drives window size).
@@ -214,13 +226,27 @@ mod tests {
     }
 
     #[test]
+    fn window_activity_line_parsing() {
+        assert_eq!(
+            parse_window_activity_line("main 1783793484"),
+            Some(("main".into(), 1783793484))
+        );
+        assert_eq!(
+            parse_window_activity_line("my session 99"),
+            Some(("my session".into(), 99))
+        );
+        assert_eq!(parse_window_activity_line("garbage"), None);
+    }
+
+    #[test]
     fn session_name_validation() {
         assert!(valid_session_name("main"));
         assert!(valid_session_name("work-2_a"));
+        assert!(valid_session_name("my session")); // spaces are legal in tmux
         assert!(!valid_session_name(""));
         assert!(!valid_session_name("a:b")); // target separator
         assert!(!valid_session_name("a.b")); // target separator
-        assert!(!valid_session_name("a b"));
+        assert!(!valid_session_name("a\x1bb")); // control chars
         assert!(!valid_session_name("../etc"));
         assert!(!valid_session_name(&"x".repeat(65)));
     }

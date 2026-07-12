@@ -135,7 +135,8 @@ session has been busy and then goes quiet — a build finished, Claude Code is
 waiting for your answer — remux notifies you, but only while the app isn't
 visible on screen. Note: if the OS suspends the page (locked iPhone), delivery
 resumes when the socket does; real push is on the roadmap (V2, Web Push).
-Attention is tracked for the daemon's default session (`--session`).
+Every tmux session is tracked; you're only notified for the session you're
+attached to.
 
 ## Roadmap
 

@@ -774,10 +774,52 @@ hint.addEventListener("click", () => {
 
 // Tap the connection status to see terminal sizing diagnostics (helps debug
 // device-specific grid problems). Shown as a long-lived hint.
-$("conn-status").addEventListener("click", () => {
-  // Tap again to refresh; kept up ~6s via the action variant.
-  showHint(handle.debug(), () => showHint(handle.debug(), () => {}));
+// ---------- debug overlay ----------
+
+const DEBUG_KEY = "remux.debug";
+const debugBtn = $<HTMLButtonElement>("debug-btn");
+const debugOverlay = $("debug-overlay");
+let debugOn = localStorage.getItem(DEBUG_KEY) === "on";
+let debugTimer: number | undefined;
+
+function standaloneMode(): string {
+  const s =
+    matchMedia("(display-mode: standalone)").matches ||
+    (navigator as { standalone?: boolean }).standalone === true;
+  return s ? "PWA" : "browser-tab";
+}
+
+function updateDebug(): void {
+  if (!debugOn) return;
+  const role = isController ? "controller" : "observer";
+  debugOverlay.textContent = [
+    `remux debug · ${standaloneMode()} · ${role}`,
+    `session ${sessionTitle || "?"}`,
+    handle.debug(),
+    `ua ${navigator.userAgent.slice(0, 60)}`,
+  ].join("\n");
+}
+
+function renderDebugBtn(): void {
+  debugBtn.textContent = `Debug: ${debugOn ? "on" : "off"}`;
+}
+
+function applyDebug(): void {
+  debugOverlay.hidden = !debugOn;
+  clearInterval(debugTimer);
+  if (debugOn) {
+    updateDebug();
+    debugTimer = window.setInterval(updateDebug, 500);
+  }
+  renderDebugBtn();
+}
+
+debugBtn.addEventListener("click", () => {
+  debugOn = !debugOn;
+  localStorage.setItem(DEBUG_KEY, debugOn ? "on" : "off");
+  applyDebug();
 });
+applyDebug();
 
 setupKeyRow(sendInput);
 composer.hidden = false;

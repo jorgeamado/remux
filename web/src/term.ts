@@ -115,18 +115,22 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
     size: () => ({ cols: term.cols, rows: term.rows }),
     debug: () => {
       const b = box.getBoundingClientRect();
-      const cell =
-        (document.querySelector(".xterm-char-measure-element") as HTMLElement | null)
-          ?.getBoundingClientRect().width ?? 0;
-      const xtFont = (() => {
-        const xt = document.querySelector(".xterm") as HTMLElement | null;
-        return xt ? getComputedStyle(xt).fontSize : "?";
-      })();
-      return (
-        `${term.cols}×${term.rows} · box ${Math.round(b.width)}×${Math.round(b.height)}px · ` +
-        `cell ${cell.toFixed(1)}px · font ${xtFont} · dpr ${window.devicePixelRatio} · ` +
-        `vv ${window.visualViewport?.scale ?? "?"}`
-      );
+      const measure = document.querySelector(
+        ".xterm-char-measure-element"
+      ) as HTMLElement | null;
+      const cellR = measure?.getBoundingClientRect();
+      const xt = document.querySelector(".xterm") as HTMLElement | null;
+      const xtFont = xt ? getComputedStyle(xt).fontSize : "?";
+      const vv = window.visualViewport;
+      return [
+        `grid    ${term.cols}×${term.rows}  (fontSize opt ${term.options.fontSize})`,
+        `box     ${b.width.toFixed(1)}×${b.height.toFixed(1)}px`,
+        `cellmeas ${cellR ? `${cellR.width.toFixed(2)}×${cellR.height.toFixed(2)}` : "?"}px`,
+        `.xterm  font ${xtFont}`,
+        `dpr ${window.devicePixelRatio}  vv.scale ${vv?.scale ?? "?"}`,
+        `vv ${vv ? `${vv.width.toFixed(0)}×${vv.height.toFixed(0)}` : "?"}  win ${window.innerWidth}×${window.innerHeight}`,
+        `screen ${screen.width}×${screen.height}`,
+      ].join("\n");
     },
     setFontSize: (px) => {
       term.options.fontSize = px;

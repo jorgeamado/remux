@@ -251,6 +251,26 @@ button {
   flex: 1;
 }
 
+#debug-overlay {
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 4px);
+  left: 4px;
+  right: 4px;
+  z-index: 40;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid var(--accent);
+  color: #7ee787;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-all;
+  pointer-events: none;
+}
+
 /* ---------- hint toast ---------- */
 
 #hint {

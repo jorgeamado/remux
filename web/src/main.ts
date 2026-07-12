@@ -9,8 +9,9 @@ const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
 const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
-const FONT_MIN = 6; // small enough to view a desktop-sized grid while observing
+const FONT_MIN = 11; // readable floor on a phone; below this text is unusable
 const FONT_MAX = 28;
+const FONT_DEFAULT = 15;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -45,7 +46,15 @@ let intentionalClose = false;
 let pendingInput = "";
 let controlRequested = false;
 
-let fontSize = parseInt(localStorage.getItem(FONT_KEY) ?? "14", 10) || 14;
+// Clamp the stored font to the readable range. Earlier builds (auto-fit-width,
+// a too-low FONT_MIN) could persist a tiny value like 6px; treat anything
+// below the floor as stale and reset to the default.
+let fontSize = (() => {
+  const stored = parseInt(localStorage.getItem(FONT_KEY) ?? "", 10);
+  if (!stored || stored < FONT_MIN || stored > FONT_MAX) return FONT_DEFAULT;
+  return stored;
+})();
+localStorage.setItem(FONT_KEY, String(fontSize));
 // Touch devices: the composer is the input surface; tapping the terminal
 // must not open the on-screen keyboard. Desktop keeps direct typing.
 let directInput =

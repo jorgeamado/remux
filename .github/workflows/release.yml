@@ -40,12 +40,16 @@ jobs:
             deb: arm64
           - target: aarch64-apple-darwin
             os: macos-14
+          # macos-13 (the last x86_64 image) is being retired and its queue
+          # starves; cross-target from the arm64 image instead.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -56,13 +60,13 @@ jobs:
         run: npm ci && npm run build
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package tarball
         run: |
           name="remux-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/remux README.md LICENSE packaging/remux.service "$name/"
+          cp "target/${{ matrix.target }}/release/remux" README.md LICENSE packaging/remux.service "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
@@ -70,8 +74,8 @@ jobs:
         if: matrix.deb != ''
         run: |
           cargo install cargo-deb --locked
-          cargo deb --no-build
-          cp target/debian/*.deb .
+          cargo deb --no-build --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/debian/"*.deb .
 
       - name: Attest build provenance
         # Attestations are only available on public repositories.

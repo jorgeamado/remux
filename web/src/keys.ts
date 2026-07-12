@@ -8,14 +8,20 @@ let ctrlArmed = false;
 const KEY_BYTES: Record<string, string> = {
   esc: "\x1b",
   tab: "\t",
+  enter: "\r",
   "ctrl-c": "\x03",
   up: "\x1b[A",
   down: "\x1b[B",
   left: "\x1b[D",
   right: "\x1b[C",
+  home: "\x1b[H",
+  end: "\x1b[F",
+  pgup: "\x1b[5~",
+  pgdn: "\x1b[6~",
   dash: "-",
   pipe: "|",
   slash: "/",
+  tilde: "~",
 };
 
 const REPEATABLE = new Set(["up", "down", "left", "right"]);
@@ -28,9 +34,21 @@ function haptic(): void {
 
 export function setupKeyRow(sendInput: (data: string) => void): void {
   const row = document.getElementById("keyrow")!;
+  const more = document.getElementById("keyrow-more")!;
   row.hidden = false;
 
-  row.querySelectorAll<HTMLButtonElement>(".key[data-key]").forEach((btn) => {
+  // "…" toggles the second, less-common key row.
+  const moreBtn = document.getElementById("more-key")!;
+  moreBtn.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    haptic();
+    more.hidden = !more.hidden;
+    moreBtn.classList.toggle("armed", !more.hidden);
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(
+    "#keyrow .key[data-key], #keyrow-more .key[data-key]"
+  ).forEach((btn) => {
     const key = btn.dataset.key!;
     let delayTimer: number | undefined;
     let repeatTimer: number | undefined;

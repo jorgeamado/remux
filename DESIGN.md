@@ -205,7 +205,14 @@ wake lock while visible.
 - **V1.x**: ~~attention notification (pane quiet + waiting heuristic)~~ done;
   ~~session picker~~ done (tap the session name: list/switch/create; any paired
   device may attach to any session, per the original design's decision #7);
-  launchd/systemd unit files, device management UI.
+  ~~main-screen redesign~~ done (2026-07-12, from the user's design mock):
+  card layout with violet accent, role chip + contextual take-control row,
+  command composer with history, two-tier key row, latency readout, tmux
+  status row clipped client-side (toggle in menu — per-client, so the desktop
+  keeps its status bar). Found in TLS deployment: the Host/Origin guard
+  rejected all HTTP/2 requests (h2 has no Host header, only `:authority`) —
+  the guard now falls back to the request URI authority.
+  Still open: launchd/systemd unit files, device management UI.
   NB: the attention monitor watches the daemon's default `--session` only.
 - **V2**: control-mode metadata client (panes as cards/tabs), snapshot/delta sync +
   custom renderer, server-paged scrollback, paste confirmation UX.

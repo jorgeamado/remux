@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
     />
-    <meta name="theme-color" content="#0d1117" />
+    <meta name="theme-color" content="#0a0d13" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="remux" />
@@ -19,18 +19,28 @@
   <body>
     <div id="app">
       <header id="topbar">
-        <span id="conn-dot" class="dot"></span>
+        <span id="term-icon">&gt;_</span>
         <button id="session-name">remux</button>
-        <span id="role-pill" class="pill" hidden>observer</span>
-        <button id="control-btn" class="btn" hidden>Take control</button>
-        <button id="menu-btn" class="btn" hidden>aA</button>
+        <span id="conn-status">
+          <span id="conn-dot" class="dot"></span>
+          <span id="conn-label">connecting…</span>
+          <span id="conn-info" hidden></span>
+        </span>
       </header>
+
+      <div id="control-banner" hidden>
+        <span id="control-text" class="chip">Observer</span>
+        <span class="flex-spacer"></span>
+        <button id="control-btn" class="btn primary">Take control</button>
+        <button id="menu-btn" class="btn" hidden>aA</button>
+      </div>
 
       <div id="menu" hidden>
         <button id="font-dec" class="btn">A&minus; smaller</button>
         <button id="font-inc" class="btn">A+ larger</button>
         <button id="paste-btn" class="btn">Paste</button>
         <button id="notify-btn" class="btn">Notifications: off</button>
+        <button id="status-btn" class="btn">tmux bar: hidden</button>
       </div>
 
       <div id="session-menu" hidden></div>
@@ -39,18 +49,38 @@
 
       <button id="hint" hidden></button>
 
-      <footer id="keyrow" hidden>
-        <button class="key" data-key="esc">esc</button>
-        <button class="key" data-key="tab">tab</button>
-        <button class="key" id="ctrl-key">ctrl</button>
-        <button class="key" data-key="ctrl-c">^c</button>
-        <button class="key" data-key="up">&#x2191;</button>
-        <button class="key" data-key="down">&#x2193;</button>
-        <button class="key" data-key="left">&#x2190;</button>
-        <button class="key" data-key="right">&#x2192;</button>
-        <button class="key" data-key="dash">-</button>
-        <button class="key" data-key="pipe">|</button>
-        <button class="key" data-key="slash">/</button>
+      <div id="composer" hidden>
+        <span id="composer-ico">&gt;_</span>
+        <input id="composer-input" type="text" enterkeyhint="send"
+               autocomplete="off" autocapitalize="off" autocorrect="off"
+               spellcheck="false" placeholder="Type a command…" />
+        <button id="composer-send" class="btn primary">&#x27A4;</button>
+        <button id="keys-toggle" class="btn">&#x2304;</button>
+      </div>
+
+      <footer id="keypanel">
+        <div id="keyrow-more" hidden>
+          <button class="key" data-key="ctrl-c">^c</button>
+          <button class="key" data-key="home">home</button>
+          <button class="key" data-key="end">end</button>
+          <button class="key" data-key="pgup">pgup</button>
+          <button class="key" data-key="pgdn">pgdn</button>
+          <button class="key" data-key="dash">-</button>
+          <button class="key" data-key="pipe">|</button>
+          <button class="key" data-key="slash">/</button>
+          <button class="key" data-key="tilde">~</button>
+        </div>
+        <div id="keyrow" hidden>
+          <button class="key" data-key="esc">esc</button>
+          <button class="key" id="ctrl-key">ctrl</button>
+          <button class="key" data-key="tab">tab</button>
+          <button class="key" data-key="up">&#x2191;</button>
+          <button class="key" data-key="down">&#x2193;</button>
+          <button class="key" data-key="left">&#x2190;</button>
+          <button class="key" data-key="right">&#x2192;</button>
+          <button class="key" data-key="enter">&#x21B5;</button>
+          <button class="key" id="more-key">&#x2026;</button>
+        </div>
       </footer>
 
       <div id="setup" hidden>

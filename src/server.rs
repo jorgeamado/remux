@@ -75,11 +75,13 @@ async fn guard(
 ) -> Result<Response, StatusCode> {
     let headers = request.headers();
 
-    let host_ok = header_host(headers, header::HOST)
-        .map(|h| allowed(&app, &h))
-        .unwrap_or(false);
+    // HTTP/2 carries the host in the :authority pseudo-header (surfaced via
+    // the request URI), not in a Host header.
+    let host = header_host(headers, header::HOST)
+        .or_else(|| request.uri().host().map(|h| strip_port(h).to_string()));
+    let host_ok = host.map(|h| allowed(&app, &h)).unwrap_or(false);
     if !host_ok {
-        tracing::warn!("rejected request: bad Host header");
+        tracing::warn!("rejected request: bad or missing Host/authority");
         return Err(StatusCode::FORBIDDEN);
     }
 

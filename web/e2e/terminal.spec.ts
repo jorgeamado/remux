@@ -72,8 +72,8 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.goto(`${BASE}/#pair=${pairToken}`);
 
   // Connects and lands in observer mode.
-  const pill = page.locator("#role-pill");
-  await expect(pill).toHaveText("observer", { timeout: 10_000 });
+  const roleChip = page.locator("#control-text");
+  await expect(roleChip).toHaveText("Observer", { timeout: 10_000 });
   await expect(page.locator("#session-name")).toHaveText("e2emain");
   await expect(page.locator("#setup")).toBeHidden();
 
@@ -81,6 +81,15 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("$");
+
+  // The tmux status row is clipped out of view by default: the terminal box
+  // extends past its container's bottom edge by one cell row.
+  const clipped = await page.evaluate(() => {
+    const t = document.getElementById("terminal")!.getBoundingClientRect();
+    const b = document.getElementById("termbox")!.getBoundingClientRect();
+    return b.bottom - t.bottom;
+  });
+  expect(clipped).toBeGreaterThan(0);
 
   // Observer swipe: shows the take-control hint but does NOT take control
   // (glancing at a session must not resize it under the desktop user).
@@ -104,22 +113,40 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   });
   await expect(page.locator("#hint")).toBeVisible();
   await expect(page.locator("#hint")).toContainText("Observing");
-  await expect(pill).toHaveText("observer");
+  await expect(roleChip).toHaveText("Observer");
 
   // --- Type-to-take-control: typing as observer requests control, buffers
   // the keystrokes, and flushes them once granted. ---
   await page.locator(".xterm").click();
   await page.keyboard.type("echo e2e$((1+1))marker\n");
-  await expect(pill).toHaveText("controller");
+  await expect(roleChip).toContainText("Controller");
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
 
-  // --- Key row: Esc button exists and ctrl-C doesn't crash the stream. ---
+  // --- Key row: ^C lives in the "…" overflow row. ---
+  await page.locator("#more-key").click();
+  await expect(page.locator("#keyrow-more")).toBeVisible();
   await page.locator('.key[data-key="ctrl-c"]').click();
+  await page.locator("#more-key").click();
+  await expect(page.locator("#keyrow-more")).toBeHidden();
   await expect
     .poll(async () => terminalText(page), { timeout: 5_000 })
     .toContain("$");
+
+  // --- Command composer: sends a full line, records history. ---
+  await page.locator("#composer-input").fill("echo composed$((3+3))ok");
+  await page.locator("#composer-input").press("Enter");
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("composed6ok");
+  expect(await page.locator("#composer-input").inputValue()).toBe("");
+
+  // --- The composer chevron collapses and restores the key panel. ---
+  await page.locator("#keys-toggle").click();
+  await expect(page.locator("#keypanel")).toBeHidden();
+  await page.locator("#keys-toggle").click();
+  await expect(page.locator("#keypanel")).toBeVisible();
 
   // --- Scrollback: generate history, then scroll up into tmux copy-mode. ---
   await page.locator(".xterm").click(); // regain focus after the button press
@@ -205,12 +232,12 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#font-inc").click();
   expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("15");
   await expect(page.locator("#notify-btn")).toHaveText("Notifications: off");
-  await page.locator("#topbar").click();
+  await page.locator("#conn-status").click();
   await expect(page.locator("#menu")).toBeHidden();
 
   // --- Reload: device token persists, auto-reconnects, session survives. ---
   await page.reload();
-  await expect(pill).toHaveText("observer", { timeout: 10_000 });
+  await expect(roleChip).toHaveText("Observer", { timeout: 10_000 });
   await expect(page.locator("#setup")).toBeHidden();
   // The tmux screen (tail of the seq output) survives the reattach.
   await expect

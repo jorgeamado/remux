@@ -8,9 +8,15 @@ export interface TermHandle {
   onResize: (cb: (cols: number, rows: number) => void) => void;
   size: () => { cols: number; rows: number };
   setFontSize: (px: number) => void;
+  /// Clip the bottom terminal row (the tmux status line) out of view.
+  setHideStatusRow: (hide: boolean) => void;
 }
 
-export function createTerminal(container: HTMLElement, fontSize = 14): TermHandle {
+export function createTerminal(
+  container: HTMLElement,
+  fontSize = 14,
+  hideStatusRow = true
+): TermHandle {
   const term = new Terminal({
     cursorBlink: true,
     fontSize,
@@ -25,16 +31,51 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
   });
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
-  term.open(container);
+
+  // xterm opens inside an inner box; when the tmux status row is hidden the
+  // box is exactly one cell-row taller than the container, and the container
+  // (overflow: hidden) clips that last row. tmux always renders its status
+  // line on the client's bottom row, so the clip only ever removes it.
+  const box = document.createElement("div");
+  box.id = "termbox";
+  container.appendChild(box);
+  term.open(box);
 
   let resizeCb: ((cols: number, rows: number) => void) | null = null;
   term.onResize(({ cols, rows }) => resizeCb?.(cols, rows));
 
+  const cellHeight = (): number => {
+    const rowsEl = box.querySelector<HTMLElement>(".xterm-rows");
+    return rowsEl && term.rows > 0 ? rowsEl.clientHeight / term.rows : 0;
+  };
+
+  const innerHeight = (): number => {
+    const cs = getComputedStyle(container);
+    return (
+      container.clientHeight -
+      parseFloat(cs.paddingTop) -
+      parseFloat(cs.paddingBottom)
+    );
+  };
+
   const fit = () => {
+    const inner = innerHeight();
+    box.style.height = `${inner}px`;
     try {
       fitAddon.fit();
     } catch {
-      /* container not laid out yet */
+      return; /* container not laid out yet */
+    }
+    if (hideStatusRow) {
+      const ch = cellHeight();
+      if (ch > 0) {
+        box.style.height = `${inner + ch}px`;
+        try {
+          fitAddon.fit();
+        } catch {
+          /* ignore */
+        }
+      }
     }
   };
 
@@ -65,6 +106,10 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
     size: () => ({ cols: term.cols, rows: term.rows }),
     setFontSize: (px) => {
       term.options.fontSize = px;
+      fit();
+    },
+    setHideStatusRow: (hide) => {
+      hideStatusRow = hide;
       fit();
     },
   };

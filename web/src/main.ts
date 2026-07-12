@@ -7,6 +7,8 @@ const TOKEN_KEY = "remux.device_token";
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
+const STATUS_KEY = "remux.statusbar";
+const HISTORY_KEY = "remux.history";
 const FONT_MIN = 10;
 const FONT_MAX = 22;
 
@@ -14,15 +16,20 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 
 const connDot = $("conn-dot");
+const connLabel = $("conn-label");
 const sessionName = $<HTMLButtonElement>("session-name");
 const sessionMenu = $("session-menu");
-const rolePill = $("role-pill");
+const connInfo = $("conn-info");
+const controlBanner = $("control-banner");
+const controlText = $("control-text");
 const controlBtn = $<HTMLButtonElement>("control-btn");
 const menuBtn = $<HTMLButtonElement>("menu-btn");
 const menu = $("menu");
 const hint = $<HTMLButtonElement>("hint");
 const setup = $("setup");
 const setupError = $("setup-error");
+const composer = $("composer");
+const composerInput = $<HTMLInputElement>("composer-input");
 
 const encoder = new TextEncoder();
 
@@ -39,7 +46,8 @@ let pendingInput = "";
 let controlRequested = false;
 
 let fontSize = parseInt(localStorage.getItem(FONT_KEY) ?? "14", 10) || 14;
-const handle = createTerminal($("terminal"), fontSize);
+let hideStatusBar = localStorage.getItem(STATUS_KEY) !== "show";
+const handle = createTerminal($("terminal"), fontSize, hideStatusBar);
 
 // ---------- pairing ----------
 
@@ -78,8 +86,16 @@ function showSetup(message?: string): void {
 
 // ---------- status & hints ----------
 
+/// Session identity lives on the left (breadcrumb button); connection state
+/// lives on the right ("Connected · 12 ms").
 function setStatus(text: string, state: "connected" | "connecting" | "offline"): void {
-  sessionName.textContent = text;
+  if (state === "connected") {
+    sessionName.textContent = text || "remux";
+    connLabel.textContent = "Connected";
+  } else {
+    connLabel.textContent = text;
+  }
+  connLabel.classList.toggle("ok", state === "connected");
   connDot.classList.toggle("connected", state === "connected");
   connDot.classList.toggle("connecting", state === "connecting");
 }
@@ -94,12 +110,24 @@ function showHint(text: string): void {
 
 function setRole(controller: boolean): void {
   isController = controller;
-  rolePill.hidden = false;
-  rolePill.textContent = controller ? "controller" : "observer";
-  rolePill.classList.toggle("controller", controller);
-  controlBtn.hidden = false;
-  controlBtn.textContent = controller ? "Release" : "Take control";
+  renderBanner();
   menuBtn.hidden = false;
+}
+
+/// The control row: a role chip on the left, the takeover button on the right.
+function renderBanner(): void {
+  controlBanner.hidden = false;
+  controlText.classList.toggle("controller", isController);
+  if (isController) {
+    const { cols, rows } = handle.size();
+    controlText.textContent = `Controller · ${cols}×${rows}`;
+    controlBtn.textContent = "Release";
+    controlBtn.classList.remove("primary");
+  } else {
+    controlText.textContent = "Observer";
+    controlBtn.textContent = "Take control";
+    controlBtn.classList.add("primary");
+  }
 }
 
 // ---------- connection ----------
@@ -185,13 +213,38 @@ function connect(): void {
   ws.onclose = () => {
     controlRequested = false;
     pendingInput = "";
-    setRole(false);
+    isController = false;
+    controlBanner.hidden = true;
+    stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
       scheduleReconnect();
     }
     intentionalClose = false;
   };
+}
+
+// ---------- latency ----------
+
+let pingTimer: number | undefined;
+let pingSentAt = 0;
+
+function startPing(): void {
+  stopPing();
+  pingTimer = window.setInterval(() => {
+    if (ws?.readyState === WebSocket.OPEN && document.visibilityState === "visible") {
+      pingSentAt = performance.now();
+      sendJson({ type: "ping" });
+    }
+  }, 20_000);
+  pingSentAt = performance.now();
+  sendJson({ type: "ping" });
+}
+
+function stopPing(): void {
+  clearInterval(pingTimer);
+  pingTimer = undefined;
+  connInfo.hidden = true;
 }
 
 interface ControlMsg {
@@ -208,6 +261,7 @@ function handleControl(msg: ControlMsg): void {
       reconnectDelay = 500;
       sessionTitle = msg.session ?? "";
       setStatus(sessionTitle, "connected");
+      if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
       setRole(nowController);
       if (nowController) {
@@ -227,6 +281,14 @@ function handleControl(msg: ControlMsg): void {
     case "attention":
       onAttention();
       break;
+    case "pong": {
+      const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
+      if (rtt < 10_000) {
+        connInfo.textContent = `${rtt} ms`;
+        connInfo.hidden = false;
+      }
+      break;
+    }
     case "error":
       if (msg.code === "auth_failed") {
         localStorage.removeItem(TOKEN_KEY);
@@ -428,6 +490,56 @@ $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
 notifyBtn.addEventListener("click", () => void toggleNotify());
 renderNotifyBtn();
 
+// ---------- command composer ----------
+
+/// Mobile-friendly alternative to typing straight into the terminal: a text
+/// field that sends a full line. Submitting as an observer requests control
+/// (the line is buffered and flushed by the existing take-control path).
+const HISTORY_MAX = 50;
+let cmdHistory: string[] = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+let historyIdx: number | null = null;
+
+function composerSubmit(): void {
+  const text = composerInput.value;
+  if (!text) return;
+  sendInput(text + "\r");
+  if (cmdHistory[cmdHistory.length - 1] !== text) {
+    cmdHistory = [...cmdHistory, text].slice(-HISTORY_MAX);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(cmdHistory));
+  }
+  historyIdx = null;
+  composerInput.value = "";
+}
+
+composerInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    composerSubmit();
+  } else if (ev.key === "ArrowUp" && cmdHistory.length > 0) {
+    ev.preventDefault();
+    historyIdx = historyIdx === null ? cmdHistory.length - 1 : Math.max(0, historyIdx - 1);
+    composerInput.value = cmdHistory[historyIdx];
+  } else if (ev.key === "ArrowDown" && historyIdx !== null) {
+    ev.preventDefault();
+    historyIdx = historyIdx >= cmdHistory.length - 1 ? null : historyIdx + 1;
+    composerInput.value = historyIdx === null ? "" : cmdHistory[historyIdx];
+  }
+});
+
+// pointerdown + preventDefault keeps focus (and the keyboard) in the input.
+$("composer-send").addEventListener("pointerdown", (ev) => {
+  ev.preventDefault();
+  composerSubmit();
+});
+
+const keysToggle = $<HTMLButtonElement>("keys-toggle");
+const keypanel = $("keypanel");
+keysToggle.addEventListener("pointerdown", (ev) => {
+  ev.preventDefault();
+  keypanel.hidden = !keypanel.hidden;
+  keysToggle.textContent = keypanel.hidden ? "⌃" : "⌄";
+});
+
 // ---------- wire up ----------
 
 handle.term.onData((data) => {
@@ -437,7 +549,10 @@ handle.term.onData((data) => {
     sendInput(applyCtrl(data));
   }
 });
-handle.onResize((cols, rows) => sendJson({ type: "resize", cols, rows }));
+handle.onResize((cols, rows) => {
+  sendJson({ type: "resize", cols, rows });
+  if (isController) renderBanner();
+});
 
 controlBtn.addEventListener("click", () => {
   if (isController) {
@@ -453,9 +568,24 @@ hint.addEventListener("click", () => {
 });
 
 setupKeyRow(sendInput);
+composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>
   sendInput(data, { takeControl: false })
 );
+
+// ---------- tmux status bar toggle ----------
+
+const statusBtn = $<HTMLButtonElement>("status-btn");
+function renderStatusBtn(): void {
+  statusBtn.textContent = `tmux bar: ${hideStatusBar ? "hidden" : "shown"}`;
+}
+statusBtn.addEventListener("click", () => {
+  hideStatusBar = !hideStatusBar;
+  localStorage.setItem(STATUS_KEY, hideStatusBar ? "hide" : "show");
+  handle.setHideStatusRow(hideStatusBar);
+  renderStatusBtn();
+});
+renderStatusBtn();
 
 $("pair-btn").addEventListener("click", async () => {
   const input = $<HTMLInputElement>("pair-input").value.trim();

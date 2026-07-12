@@ -1,10 +1,16 @@
 :root {
-  --bg: #0d1117;
+  --bg: #0a0d13;
+  --card: #12161f;
+  --card-border: #232a36;
+  --input: #0d1017;
   --fg: #e6edf3;
-  --muted: #8b949e;
-  --accent: #2ea043;
+  --muted: #7d8590;
+  --accent: #8b5cf6;
+  --accent-soft: #2a2440;
+  --accent-fg: #c4b5fd;
+  --ok: #3fb950;
   --danger: #f85149;
-  --bar: #161b22;
+  --bar: #12161f;
 }
 
 * {
@@ -26,40 +32,42 @@ body {
 #app {
   display: flex;
   flex-direction: column;
+  gap: 8px;
   height: 100dvh;
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
+  padding: 8px;
+  padding-top: calc(env(safe-area-inset-top) + 8px);
+  padding-bottom: calc(env(safe-area-inset-bottom) + 8px);
 }
+
+/* ---------- header card ---------- */
 
 #topbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  background: var(--bar);
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
   font-size: 13px;
   user-select: none;
   -webkit-user-select: none;
 }
 
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--danger);
+#term-icon {
   flex: none;
-}
-
-.dot.connected {
-  background: var(--accent);
-}
-
-.dot.connecting {
-  background: #d29922;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 #session-name {
-  color: var(--muted);
+  color: var(--accent-fg);
+  font-weight: 600;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -71,55 +79,121 @@ body {
   text-align: left;
 }
 
-.pill {
-  padding: 1px 8px;
-  border-radius: 10px;
-  background: #30363d;
+#conn-status {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#conn-info {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  flex: none;
+}
+
+.dot.connected {
+  background: var(--ok);
+}
+
+.dot.connecting {
+  background: #d29922;
+}
+
+#conn-label.ok {
+  color: var(--ok);
+}
+
+/* ---------- control row ---------- */
+
+#control-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+  font-size: 12px;
+}
+
+.chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
   color: var(--muted);
   font-size: 12px;
 }
 
-.pill.controller {
-  background: var(--accent);
-  color: #fff;
+.chip.controller {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-fg);
 }
 
+.flex-spacer {
+  flex: 1;
+}
+
+/* ---------- buttons ---------- */
+
 .btn {
-  padding: 4px 10px;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  background: #21262d;
+  padding: 5px 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: var(--card);
   color: var(--fg);
   font-size: 13px;
 }
 
 .btn:active {
-  background: #30363d;
+  background: #1c2230;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn.primary:active {
+  background: #7c4ee8;
 }
 
 button {
   touch-action: manipulation; /* no double-tap zoom on controls */
 }
 
+/* ---------- menus ---------- */
+
 #menu,
 #session-menu {
   position: absolute;
-  top: 40px;
-  right: 8px;
+  top: 84px;
+  right: 12px;
   z-index: 20;
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 8px;
-  border: 1px solid #30363d;
-  border-radius: 8px;
-  background: var(--bar);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  background: var(--card);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
 #session-menu {
-  left: 8px;
+  left: 12px;
   right: auto;
+  top: 48px;
   max-width: 85%;
   max-height: 60dvh;
   overflow-y: auto;
@@ -131,19 +205,22 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  border-radius: 8px;
 }
+
+/* ---------- hint toast ---------- */
 
 #hint {
   position: absolute;
   left: 50%;
-  bottom: 84px;
+  bottom: 140px;
   transform: translateX(-50%);
   z-index: 20;
   max-width: 85%;
   padding: 10px 16px;
   border: 1px solid var(--accent);
   border-radius: 20px;
-  background: rgba(22, 27, 34, 0.95);
+  background: rgba(18, 22, 31, 0.95);
   color: var(--fg);
   font-size: 13px;
   white-space: nowrap;
@@ -152,32 +229,83 @@ button {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
+/* ---------- terminal card ---------- */
+
 #terminal {
   flex: 1;
   min-height: 0;
-  padding: 2px;
+  /* no bottom padding: overflow clips at the padding edge, and the clipped
+     tmux status row must not show through the padding area */
+  padding: 8px 8px 0;
+  background: #0d1117;
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  /* #termbox inside may be one cell-row taller than this container: the
+     overflowing row is the tmux status line, deliberately clipped. */
+  overflow: hidden;
 }
 
-/* xterm fills its container */
-#terminal .xterm {
-  height: 100%;
-}
+/* ---------- composer ---------- */
 
-#keyrow {
+#composer {
   display: flex;
-  gap: 4px;
-  padding: 4px 6px;
-  background: var(--bar);
+  align-items: center;
+  gap: 6px;
+}
+
+#composer-ico {
+  position: absolute;
+  margin-left: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+#composer input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px 9px 34px;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: var(--input);
+  color: var(--fg);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+
+#composer input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+#composer .btn {
+  flex: none;
+  min-width: 40px;
+  min-height: 36px;
+}
+
+/* ---------- key panel ---------- */
+
+#keyrow,
+#keyrow-more {
+  display: flex;
+  gap: 5px;
   overflow-x: auto;
+}
+
+#keyrow-more {
+  margin-bottom: 6px;
 }
 
 .key {
   flex: 1;
   min-width: 34px;
+  min-height: 42px;
   padding: 8px 4px;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  background: #21262d;
+  border: 1px solid var(--card-border);
+  border-radius: 9px;
+  background: var(--card);
   color: var(--fg);
   font-family: ui-monospace, monospace;
   font-size: 13px;
@@ -188,12 +316,16 @@ button {
 .key:active,
 .key.armed {
   background: var(--accent);
+  border-color: var(--accent);
   color: #fff;
 }
+
+/* ---------- setup ---------- */
 
 #setup {
   position: absolute;
   inset: 0;
+  z-index: 30;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -226,9 +358,9 @@ button {
 #setup input {
   flex: 1;
   padding: 8px 10px;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  background: #010409;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--input);
   color: var(--fg);
   font-family: ui-monospace, monospace;
   font-size: 13px;

@@ -251,23 +251,6 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
     Ok(())
 }
 
-/// Current window size (cols, rows) of the session's active window.
-pub fn window_dims(session: &str) -> Option<(u16, u16)> {
-    let mut cmd = tmux();
-    // -t is a *pane* target here: "=session" alone fails like split-window
-    // (tmux 3.3a); "=session:" (current window's active pane) resolves.
-    cmd.args([
-        "display-message",
-        "-t",
-        &format!("={session}:"),
-        "-p",
-        "#{window_width} #{window_height}",
-    ]);
-    let out = run(cmd).ok()?;
-    let mut f = out.split_whitespace();
-    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
-}
-
 /// True when any attached tmux client sent input within `within_secs` —
 /// i.e. someone is sitting at a keyboard and does not need a push.
 pub fn any_client_active_within(within_secs: u64) -> Result<bool> {

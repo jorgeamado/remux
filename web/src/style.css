@@ -143,12 +143,6 @@ body {
   flex: 1;
 }
 
-#fit-btn.on {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-fg);
-}
-
 /* ---------- buttons ---------- */
 
 .btn {
@@ -283,14 +277,10 @@ button {
 #terminal {
   flex: 1;
   min-height: 0;
-  /* no bottom padding: overflow clips at the padding edge, and the clipped
-     tmux status row must not show through the padding area */
-  padding: 8px 8px 0;
+  padding: 8px;
   background: #0d1117;
   border: 1px solid var(--card-border);
   border-radius: 12px;
-  /* #termbox inside may be one cell-row taller than this container: the
-     overflowing row is the tmux status line, deliberately clipped. */
   overflow: hidden;
 }
 

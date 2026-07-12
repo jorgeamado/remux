@@ -77,28 +77,10 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect(page.locator("#session-name")).toHaveText("e2emain");
   await expect(page.locator("#setup")).toBeHidden();
 
-  // Observer fit-width toggle is offered (and remembered).
-  await expect(page.locator("#fit-btn")).toBeVisible();
-  await page.locator("#fit-btn").click();
-  await expect(page.locator("#fit-btn")).toHaveClass(/on/);
-  await page.locator("#fit-btn").click();
-  await expect(page.locator("#fit-btn")).not.toHaveClass(/on/);
-
   // The tmux repaint (shell prompt) reaches the terminal.
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("$");
-
-  const boxOverflow = () =>
-    page.evaluate(() => {
-      const t = document.getElementById("terminal")!.getBoundingClientRect();
-      const b = document.getElementById("termbox")!.getBoundingClientRect();
-      return b.bottom - t.bottom;
-    });
-  // As an observer we do NOT clip the status row: tmux's window is a
-  // different size (ignore-size), so its status line isn't on our bottom
-  // row and clipping would misfire. The box fits the container.
-  expect(await boxOverflow()).toBeLessThanOrEqual(1);
 
   // Observer swipe: scrolls tmux history (copy-mode) WITHOUT taking control
   // (glancing at a session must not resize it under the desktop user).
@@ -155,14 +137,9 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#composer-input").fill("echo e2e$((1+1))marker");
   await page.locator("#composer-input").press("Enter");
   await expect(roleChip).toContainText("Controller");
-  await expect(page.locator("#fit-btn")).toBeHidden(); // controller: real grid
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
-
-  // As controller we DO drive the tmux window size, so the status row is on
-  // our bottom row and gets clipped: the box overflows the container by ~1 row.
-  await expect.poll(async () => boxOverflow(), { timeout: 5_000 }).toBeGreaterThan(2);
 
   // --- Font size (A- / A+) actually changes the rendered glyph size, not
   // just line spacing. Measure a real cell's width. ---

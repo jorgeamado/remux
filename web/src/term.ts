@@ -5,22 +5,17 @@ import "@xterm/xterm/css/xterm.css";
 export interface TermHandle {
   term: Terminal;
   fit: () => void;
+  /// Fires (debounced) with the settled grid size after layout changes.
   onResize: (cb: (cols: number, rows: number) => void) => void;
   size: () => { cols: number; rows: number };
   setFontSize: (px: number) => void;
-  /// Clip the bottom terminal row (the tmux status line) out of view.
-  setHideStatusRow: (hide: boolean) => void;
   /// Allow/forbid typing straight into the terminal. When off, taps never
   /// focus xterm's hidden textarea (no on-screen keyboard); the composer and
   /// key row remain the input surfaces. Mouse/touch reports are unaffected.
   setDirectInput: (enabled: boolean) => void;
 }
 
-export function createTerminal(
-  container: HTMLElement,
-  fontSize = 14,
-  hideStatusRow = true
-): TermHandle {
+export function createTerminal(container: HTMLElement, fontSize = 14): TermHandle {
   const term = new Terminal({
     cursorBlink: true,
     fontSize,
@@ -36,73 +31,66 @@ export function createTerminal(
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
-  // xterm opens inside an inner box; when the tmux status row is hidden the
-  // box is exactly one cell-row taller than the container, and the container
-  // (overflow: hidden) clips that last row. tmux always renders its status
-  // line on the client's bottom row, so the clip only ever removes it.
+  // Open xterm in an inner wrapper that fills the container's *content* box
+  // (100%/100%), NOT the padded card itself. FitAddon measures its parent, so
+  // fitting against the padded #terminal would overestimate the grid by the
+  // padding/border — tmux would then be told a larger size than is visible,
+  // re-creating the very sizing mismatch we're eliminating.
   const box = document.createElement("div");
   box.id = "termbox";
+  box.style.width = "100%";
+  box.style.height = "100%";
   container.appendChild(box);
   term.open(box);
 
+  // The grid xterm renders is exactly the grid we report to the daemon (and
+  // thus tmux): no phantom rows, no clipping. A single source of truth for
+  // the size is what keeps full-screen apps (htop/vim/Claude Code) from
+  // redrawing against a stale geometry.
   let resizeCb: ((cols: number, rows: number) => void) | null = null;
-  term.onResize(({ cols, rows }) => resizeCb?.(cols, rows));
-
-  const cellHeight = (): number => {
-    const rowsEl = box.querySelector<HTMLElement>(".xterm-rows");
-    return rowsEl && term.rows > 0 ? rowsEl.clientHeight / term.rows : 0;
-  };
-
-  const innerHeight = (): number => {
-    const cs = getComputedStyle(container);
-    return (
-      container.clientHeight -
-      parseFloat(cs.paddingTop) -
-      parseFloat(cs.paddingBottom)
-    );
-  };
+  let notifyTimer: number | undefined;
+  term.onResize(({ cols, rows }) => {
+    // Debounce: a layout settle (keyboard, rotation, font change, container
+    // resize) can emit several intermediate sizes in a burst. Sending each to
+    // tmux hammers full-screen apps with redraws; only the final size matters.
+    clearTimeout(notifyTimer);
+    notifyTimer = window.setTimeout(() => resizeCb?.(cols, rows), 120);
+  });
 
   const fit = () => {
-    const inner = innerHeight();
-    box.style.height = `${inner}px`;
     try {
       fitAddon.fit();
     } catch {
-      return; /* container not laid out yet */
-    }
-    if (hideStatusRow) {
-      const ch = cellHeight();
-      if (ch > 0) {
-        box.style.height = `${inner + ch}px`;
-        try {
-          fitAddon.fit();
-        } catch {
-          /* ignore */
-        }
-      }
+      /* container not laid out yet */
     }
   };
 
-  // Refit when the terminal area actually changes size: window resize, the
-  // iOS keyboard opening (visualViewport resize), rotation, container change.
+  // Coalesce rapid fit triggers (ResizeObserver can fire many times per
+  // frame during a settle).
+  let fitTimer: number | undefined;
+  const scheduleFit = () => {
+    clearTimeout(fitTimer);
+    fitTimer = window.setTimeout(fit, 60);
+  };
+
   const app = document.getElementById("app")!;
   const vv = window.visualViewport;
-  const onResize = () => {
+  const onViewportResize = () => {
     if (vv) {
-      // iOS Safari: keyboard overlays the page; shrink the app to the
+      // iOS Safari: the keyboard overlays the page; shrink the app to the
       // visible viewport so the terminal stays fully on screen.
       app.style.height = `${vv.height}px`;
       window.scrollTo(0, 0);
     }
-    fit();
+    scheduleFit();
   };
-  vv?.addEventListener("resize", onResize);
-  // On scroll, only pin the page — do NOT refit. iOS fires a stream of
+  vv?.addEventListener("resize", onViewportResize);
+  // On scroll, only pin the page — never refit. iOS emits a stream of
   // visualViewport scroll events during momentum/rubber-band scrolling, and
-  // refitting on each one makes the terminal flicker ("blinking").
+  // refitting on each one makes the terminal flicker.
   vv?.addEventListener("scroll", () => window.scrollTo(0, 0));
-  window.addEventListener("orientationchange", () => setTimeout(onResize, 50));
-  new ResizeObserver(fit).observe(container);
+  window.addEventListener("orientationchange", () => setTimeout(onViewportResize, 80));
+  new ResizeObserver(scheduleFit).observe(container);
 
   fit();
 
@@ -113,10 +101,6 @@ export function createTerminal(
     size: () => ({ cols: term.cols, rows: term.rows }),
     setFontSize: (px) => {
       term.options.fontSize = px;
-      fit();
-    },
-    setHideStatusRow: (hide) => {
-      hideStatusRow = hide;
       fit();
     },
     setDirectInput: (enabled) => {

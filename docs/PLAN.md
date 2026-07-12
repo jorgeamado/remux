@@ -131,6 +131,30 @@ Security hygiene before more surface is added.
 Acceptance: `remux devices revoke <id>` → that phone's socket drops within
 a second and its pushes stop; the PWA sheet shows live last-seen times.
 
+## M3.0 — terminal sizing stabilization (do first) ⚑
+
+On-device testing exposed the real problem behind the "buggy" mobile
+terminal (garbled full-screen apps, status-bar artifacts, the observer
+"letterbox"): the phone and tmux disagree on the grid, and several
+client-side hacks churn the size. Full-screen apps (htop, vim, Claude Code)
+redraw with cursor-addressed output for size A while xterm has resized to
+size B — over 2s tailnet latency the redraws interleave and corrupt.
+
+Root causes to remove before building topology on top:
+- The status-bar clip renders xterm at `rows+1` and reports `rows+1` to tmux
+  (off-by-one vs the visible grid), with a two-pass fit that emits an extra
+  resize each time.
+- The M1.5 fit-width auto-font loop runs inside `onResize` and re-sets the
+  font on every resize → a resize/font feedback loop.
+- Resizes are sent to the daemon un-debounced, so a full-screen app is
+  hammered with size changes during any layout settle.
+
+Fix: one stable, debounced terminal size == the visible grid (no phantom
+row); drop the status-clip and the fit-width-in-resize loop; coalesce
+resizes. The status-line hiding and observer fit return properly in M3b via
+the topology model, not pixel hacks. This is the concrete first step of the
+M3 work and should make the terminal render correctly on the phone.
+
 ## M3a — control-mode metadata client (large)
 
 > **Spike done (2026-07-12, tmux 3.3a in the devcontainer)** — the design

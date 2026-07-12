@@ -7,10 +7,8 @@ const TOKEN_KEY = "remux.device_token";
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
-const STATUS_KEY = "remux.statusbar";
 const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
-const FIT_KEY = "remux.fitwidth";
 const FONT_MIN = 6; // small enough to view a desktop-sized grid while observing
 const FONT_MAX = 28;
 
@@ -48,13 +46,12 @@ let pendingInput = "";
 let controlRequested = false;
 
 let fontSize = parseInt(localStorage.getItem(FONT_KEY) ?? "14", 10) || 14;
-let hideStatusBar = localStorage.getItem(STATUS_KEY) !== "show";
 // Touch devices: the composer is the input surface; tapping the terminal
 // must not open the on-screen keyboard. Desktop keeps direct typing.
 let directInput =
   (localStorage.getItem(TERMKB_KEY) ??
     (matchMedia("(pointer: coarse)").matches ? "off" : "on")) === "on";
-const handle = createTerminal($("terminal"), fontSize, hideStatusBar);
+const handle = createTerminal($("terminal"), fontSize);
 handle.setDirectInput(directInput);
 
 // ---------- pairing ----------
@@ -122,18 +119,6 @@ function setRole(controller: boolean): void {
   isController = controller;
   renderBanner();
   menuBtn.hidden = false;
-  renderFitBtn();
-  applyStatusClip();
-}
-
-/// The tmux status line can only be reliably clipped when this client drives
-/// the window size (controller) — then tmux renders it on our bottom row. As
-/// an observer we use `ignore-size`, so tmux's window is a different size and
-/// its status line lands mid-screen; clipping our bottom row would miss it and
-/// leave the status visible (often doubled after a resize). So: clip only when
-/// controlling.
-function applyStatusClip(): void {
-  handle.setHideStatusRow(hideStatusBar && isController);
 }
 
 /// The control row: a role chip on the left, the takeover button on the right.
@@ -291,12 +276,10 @@ function handleControl(msg: ControlMsg): void {
     case "status": {
       reconnectDelay = 500;
       sessionTitle = msg.session ?? "";
-      windowCols = msg.window_cols ?? 0;
       setStatus(sessionTitle, "connected");
       if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
       setRole(nowController);
-      applyFitWidth();
       if (nowController) {
         hint.hidden = true;
         controlRequested = false;
@@ -424,50 +407,6 @@ sessionName.addEventListener("click", (ev) => {
     void openSessionMenu();
   } else {
     sessionMenu.hidden = true;
-  }
-});
-
-// ---------- observer fit-width ----------
-
-/// The observer's terminal is a viewport onto a (usually wider) desktop-sized
-/// window. "Fit" shrinks the font just enough that the full window width fits
-/// on screen — pure font-size math on this client; tmux is never resized.
-let windowCols = 0;
-let fitWidth = localStorage.getItem(FIT_KEY) === "on";
-const fitBtn = $<HTMLButtonElement>("fit-btn");
-
-function renderFitBtn(): void {
-  fitBtn.hidden = isController;
-  fitBtn.classList.toggle("on", fitWidth);
-}
-
-function applyFitWidth(): void {
-  if (isController || !fitWidth || windowCols <= 0) {
-    handle.setFontSize(fontSize); // back to the user's preference
-    return;
-  }
-  const screen = document.querySelector(".xterm-screen");
-  if (!screen) return;
-  const { cols } = handle.size();
-  const cellW = screen.getBoundingClientRect().width / cols;
-  if (!isFinite(cellW) || cellW <= 0) return;
-  const currentFont = handle.term.options.fontSize ?? fontSize;
-  const target = Math.min(
-    FONT_MAX,
-    Math.max(FONT_MIN, Math.floor((currentFont * cols) / windowCols))
-  );
-  if (target !== currentFont) {
-    handle.setFontSize(target); // triggers a refit; converges (cols → windowCols)
-  }
-}
-
-fitBtn.addEventListener("click", () => {
-  fitWidth = !fitWidth;
-  localStorage.setItem(FIT_KEY, fitWidth ? "on" : "off");
-  renderFitBtn();
-  applyFitWidth();
-  if (fitWidth && windowCols > 0) {
-    showHint(`Fitting ${windowCols} columns`);
   }
 });
 
@@ -808,11 +747,10 @@ handle.term.onData((data) => {
   }
 });
 handle.onResize((cols, rows) => {
+  // Debounced by term.ts: the settled grid we render is exactly what we
+  // report to tmux.
   sendJson({ type: "resize", cols, rows });
   if (isController) renderBanner();
-  // Rotation/keyboard changes refit xterm at the old font; recompute the
-  // fitted size against the tmux window (no-ops once converged).
-  applyFitWidth();
 });
 
 controlBtn.addEventListener("click", () => {
@@ -882,20 +820,6 @@ $("devices-btn").addEventListener("click", async (ev) => {
   devicesMenu.appendChild(foot);
   devicesMenu.hidden = false;
 });
-
-// ---------- tmux status bar toggle ----------
-
-const statusBtn = $<HTMLButtonElement>("status-btn");
-function renderStatusBtn(): void {
-  statusBtn.textContent = `tmux bar: ${hideStatusBar ? "hidden" : "shown"}`;
-}
-statusBtn.addEventListener("click", () => {
-  hideStatusBar = !hideStatusBar;
-  localStorage.setItem(STATUS_KEY, hideStatusBar ? "hide" : "show");
-  applyStatusClip();
-  renderStatusBtn();
-});
-renderStatusBtn();
 
 // ---------- direct terminal typing toggle ----------
 

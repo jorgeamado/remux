@@ -99,8 +99,6 @@ async fn full_terminal_flow_over_tmux() {
     assert_eq!(status["type"], "status", "unexpected: {status}");
     assert_eq!(status["state"], "observer");
     assert_eq!(status["session"], session);
-    // Window dims ride along for observer fit-width.
-    assert!(status["window_cols"].is_u64(), "unexpected: {status}");
 
     // Observers cannot type.
     ws.send(WsMsg::binary(b"ls\r".to_vec())).await.unwrap();

@@ -183,6 +183,22 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .not.toContain("direct4typing");
+
+  // M3a: the control-mode topology client reports the new window (2 windows
+  // in this session) to the client without any UI action.
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const t = (window as unknown as { __topology: () => unknown[] }).__topology();
+          const s = (t as { name: string; windows: unknown[] }[]).find(
+            (x) => x.name === "e2emain"
+          );
+          return s ? s.windows.length : 0;
+        }),
+      { timeout: 10_000 }
+    )
+    .toBeGreaterThanOrEqual(2);
   await page.locator("#tmux-btn").click();
   await expect(page.locator("#tmux-menu")).toContainText("Windows");
   await page.locator("#tmux-menu .btn", { hasText: "0:" }).click();

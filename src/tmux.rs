@@ -4,10 +4,19 @@ use anyhow::{bail, Context, Result};
 use std::process::Command;
 
 /// Socket name override so tests can run against an isolated tmux server.
-fn socket_name() -> Option<String> {
+/// Public so the async control-mode client (topology.rs) can target the same
+/// server without duplicating the env convention.
+pub fn socket_name() -> Option<String> {
     std::env::var("REMUX_TMUX_SOCKET")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// Strip control characters and cap length. Window/pane names are set from
+/// terminal output (OSC titles, automatic-rename) — hostile content must not
+/// reach clients as-is even though the client also renders them as text.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 fn tmux() -> Command {
@@ -42,7 +51,19 @@ pub fn ensure_session(session: &str) -> Result<()> {
     if !exists {
         let mut cmd = tmux();
         cmd.args(["new-session", "-d", "-s", session]);
-        run(cmd)?;
+        if run(cmd).is_err() {
+            // Race: another caller (e.g. the topology supervisor and a ws
+            // handler both starting up) may have created it between our
+            // has-session check and now. Tolerate if it exists now.
+            let now_exists = tmux()
+                .args(["has-session", "-t", &format!("={session}")])
+                .output()?
+                .status
+                .success();
+            if !now_exists {
+                bail!("failed to create tmux session {session:?}");
+            }
+        }
     }
     // Latest active client drives pane size: this is what makes Mac<->phone
     // handoff work with zero daemon logic. window-size is a *window* option;
@@ -124,6 +145,32 @@ pub struct SessionInfo {
     pub activity: u64,
 }
 
+/// Real (non-control-mode) attached client count per session. `session_attached`
+/// counts our own internal topology control client too, so "attached" (exposed
+/// to the UI) would wrongly show sessions as attached; count only regular
+/// clients here. Keyed by session name.
+fn real_attached_counts() -> std::collections::HashMap<String, u32> {
+    let mut cmd = tmux();
+    // control_mode is a single 0/1; session name (may contain spaces) is the
+    // remainder. (No tab separator — tmux 3.3a would sanitize it to `_`.)
+    cmd.args([
+        "list-clients",
+        "-F",
+        "#{client_control_mode} #{client_session}",
+    ]);
+    let mut m = std::collections::HashMap::new();
+    if let Ok(out) = run(cmd) {
+        for line in out.lines() {
+            if let Some((ctrl, sess)) = line.split_once(' ') {
+                if ctrl == "0" {
+                    *m.entry(sess.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    m
+}
+
 /// All sessions on the tmux server. Empty when no server is running yet.
 /// NB: tmux 3.3a replaces control characters (tabs included) in expanded
 /// formats with `_`, so fields are space-separated and parsed from the right
@@ -138,7 +185,16 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     let Ok(out) = run(cmd) else {
         return Ok(Vec::new()); // no tmux server running
     };
-    Ok(out.lines().filter_map(parse_session_line).collect())
+    let counts = real_attached_counts();
+    Ok(out
+        .lines()
+        .filter_map(parse_session_line)
+        .map(|mut s| {
+            // Override tmux's attached count with real (non-control) clients.
+            s.attached = counts.get(&s.name).copied().unwrap_or(0);
+            s
+        })
+        .collect())
 }
 
 fn parse_session_line(line: &str) -> Option<SessionInfo> {
@@ -185,7 +241,7 @@ fn parse_window_activity_line(line: &str) -> Option<(String, u64)> {
     Some((f.next()?.to_string(), activity))
 }
 
-#[derive(serde::Serialize, Debug, PartialEq)]
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
 pub struct WindowInfo {
     pub index: u32,
     pub active: bool,
@@ -217,8 +273,53 @@ fn parse_window_line(line: &str) -> Option<WindowInfo> {
         index: f.next()?.parse().ok()?,
         active: f.next()? == "1",
         panes: f.next()?.parse().ok()?,
-        name: f.next().unwrap_or("").to_string(),
+        name: sanitize(f.next().unwrap_or("")),
     })
+}
+
+/// One session with its windows — the topology unit streamed to clients.
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
+pub struct SessionWindows {
+    pub name: String,
+    pub attached: bool,
+    pub windows: Vec<WindowInfo>,
+}
+
+/// Full server topology: every session and its windows. Rebuilt from scratch
+/// on each control-mode dirty-bit (not parsed incrementally). Empty when no
+/// tmux server is running.
+pub fn capture_topology() -> Result<Vec<SessionWindows>> {
+    let sessions = list_sessions()?;
+    let mut out = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        out.push(SessionWindows {
+            windows: list_windows(&s.name)?,
+            name: sanitize(&s.name),
+            attached: s.attached > 0,
+        });
+    }
+    Ok(out)
+}
+
+/// Argument vector for the read-only control-mode client (topology.rs builds
+/// the async Command; kept here so all tmux flags live in one module).
+/// Verified on tmux 3.3a: these flags keep the client out of window sizing,
+/// suppress %output, and still deliver structural %notifications.
+pub fn control_attach_args(session: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(sock) = socket_name() {
+        args.push("-L".into());
+        args.push(sock);
+    }
+    args.extend([
+        "-C".into(),
+        "attach-session".into(),
+        "-t".into(),
+        format!("={session}"),
+        "-f".into(),
+        "read-only,no-output,ignore-size".into(),
+    ]);
+    args
 }
 
 /// Controller-initiated window/pane operations, whitelisted by name.

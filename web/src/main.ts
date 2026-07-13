@@ -272,15 +272,29 @@ function stopPing(): void {
   connInfo.hidden = true;
 }
 
+interface WindowTopo {
+  index: number;
+  active: boolean;
+  panes: number;
+  name: string;
+}
+interface SessionTopo {
+  name: string;
+  attached: boolean;
+  windows: WindowTopo[];
+}
 interface ControlMsg {
   type: string;
   state?: string;
   session?: string;
   code?: string;
   message?: string;
-  window_cols?: number;
-  window_rows?: number;
+  sessions?: SessionTopo[];
 }
+
+// Latest tmux topology (M3a). M3b renders it as tabs/breadcrumb; for now it's
+// stored and exposed for tests.
+let topology: SessionTopo[] = [];
 
 function handleControl(msg: ControlMsg): void {
   switch (msg.type) {
@@ -305,6 +319,9 @@ function handleControl(msg: ControlMsg): void {
       }
       break;
     }
+    case "topology":
+      topology = msg.sessions ?? [];
+      break;
     case "attention":
       onAttention();
       break;
@@ -845,6 +862,8 @@ applyDebug();
 };
 (window as unknown as { __termCols?: () => number }).__termCols = () =>
   handle.size().cols;
+(window as unknown as { __topology?: () => SessionTopo[] }).__topology = () =>
+  topology;
 
 setupKeyRow(sendInput);
 composer.hidden = false;

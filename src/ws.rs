@@ -251,6 +251,31 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Forward tmux topology (sessions → windows) to this client: the current
+    // snapshot now, then every update. Metadata only — never in the byte path.
+    let topology_task = tokio::spawn({
+        let mut rx = app.topology.subscribe();
+        let out = out_tx.clone();
+        async move {
+            loop {
+                let snap = rx.borrow_and_update().clone();
+                if !snap.is_empty() {
+                    let msg = Message::Text(
+                        serde_json::json!({ "type": "topology", "sessions": *snap })
+                            .to_string()
+                            .into(),
+                    );
+                    if out.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
     // Close this socket when its device is revoked (management cascade).
     let revoked_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let revoke_task = tokio::spawn({
@@ -453,6 +478,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     let _ = child.kill();
     attention_task.abort();
     revoke_task.abort();
+    topology_task.abort();
     sender.abort();
     tracing::info!(device = %device.name, "client disconnected");
     Ok(())

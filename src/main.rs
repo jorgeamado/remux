@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use remux::{admin, attention, auth, host_of_url, push, server, tmux, App, Cli, Cmd, DevicesCmd};
+use remux::{
+    admin, attention, auth, host_of_url, push, server, tmux, topology, App, Cli, Cmd, DevicesCmd,
+};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -105,6 +107,7 @@ async fn main() -> Result<()> {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
     });
 
     if !app.args.no_pair {
@@ -115,6 +118,7 @@ async fn main() -> Result<()> {
     admin::spawn(app.clone(), &state_dir)?;
     attention::spawn(app.clone());
     push::spawn_dispatcher(app.clone());
+    topology::spawn(app.clone());
     server::run(app).await
 }
 

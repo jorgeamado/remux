@@ -4,6 +4,7 @@ pub mod auth;
 pub mod push;
 pub mod server;
 pub mod tmux;
+pub mod topology;
 pub mod ws;
 
 use clap::Parser;
@@ -94,6 +95,8 @@ pub struct App {
     pub pending_attention: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Revocations (payload = device id): live sockets of that device close.
     pub revoked: tokio::sync::broadcast::Sender<String>,
+    /// Latest tmux topology (sessions → windows), streamed to every client.
+    pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
 }
 
 /// Select the process-wide rustls crypto provider. Both axum-server and

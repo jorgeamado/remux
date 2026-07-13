@@ -145,7 +145,8 @@ body {
 
 /* ---------- window tabs (M3b: live from topology) ---------- */
 
-#window-tabs {
+#window-tabs,
+#pane-tabs {
   display: flex;
   gap: 6px;
   overflow-x: auto;
@@ -153,8 +154,22 @@ body {
   scrollbar-width: none;
 }
 
-#window-tabs::-webkit-scrollbar {
+#window-tabs::-webkit-scrollbar,
+#pane-tabs::-webkit-scrollbar {
   display: none;
+}
+
+/* Pane tabs sit under the window tabs; a leading label marks the row. */
+#pane-tabs {
+  padding-top: 0;
+}
+
+.ptab-label {
+  flex: none;
+  align-self: center;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 2px;
 }
 
 .wtab {

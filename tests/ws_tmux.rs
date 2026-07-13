@@ -289,6 +289,28 @@ async fn full_terminal_flow_over_tmux() {
         assert!(zoomed, "zoom_pane did not zoom the split window");
     }
 
+    // select_pane switches the active pane (pane tabs on the phone). split-
+    // window left pane 1 active; select pane 0.
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "select_pane", "index": 0})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut on_pane0 = false;
+    for _ in 0..50 {
+        let active = tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{pane_index}"],
+        );
+        if active == "0" {
+            on_pane0 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(on_pane0, "select_pane did not switch to pane 0");
+
     ws.send(WsMsg::text(
         serde_json::json!({"type": "window_action", "action": "select_window", "index": 0})
             .to_string(),

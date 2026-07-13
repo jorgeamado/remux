@@ -246,6 +246,7 @@ function connect(): void {
     isController = false;
     controlBanner.hidden = true;
     windowTabs.hidden = true;
+    paneTabs.hidden = true;
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -278,12 +279,17 @@ function stopPing(): void {
   connInfo.hidden = true;
 }
 
+interface PaneTopo {
+  index: number;
+  active: boolean;
+  command: string;
+}
 interface WindowTopo {
   index: number;
   active: boolean;
-  panes: number;
   zoomed: boolean;
   name: string;
+  panes: PaneTopo[];
 }
 interface SessionTopo {
   name: string;
@@ -484,14 +490,19 @@ const windowTabs = $("window-tabs");
 // on coarse-pointer (touch) devices, and only while we drive the window.
 const smallScreen = matchMedia("(pointer: coarse)").matches;
 
+function activeWindow(): WindowTopo | undefined {
+  return topology.find((s) => s.name === sessionTitle)?.windows.find((w) => w.active);
+}
+
 function maybeAutoZoom(): void {
   if (!smallScreen || !isController) return;
-  const sess = topology.find((s) => s.name === sessionTitle);
-  const active = sess?.windows.find((w) => w.active);
-  if (active && active.panes > 1 && !active.zoomed) {
+  const active = activeWindow();
+  if (active && active.panes.length > 1 && !active.zoomed) {
     sendJson({ type: "window_action", action: "zoom_pane" });
   }
 }
+
+const paneTabs = $("pane-tabs");
 
 /// Render the current session's windows as tappable tabs, active highlighted.
 /// Driven purely by the topology stream — no polling.
@@ -499,22 +510,48 @@ function renderTabs(): void {
   const sess = topology.find((s) => s.name === sessionTitle);
   const windows = sess?.windows ?? [];
   windowTabs.textContent = "";
-  if (windows.length < 2) {
-    // A single window needs no tabs.
+  if (windows.length >= 2) {
+    for (const w of windows) {
+      const tab = document.createElement("button");
+      tab.className = `wtab${w.active ? " active" : ""}`;
+      const panes = w.panes.length > 1 ? ` ·${w.panes.length}` : "";
+      tab.textContent = `${w.index}: ${w.name}${panes}`;
+      tab.addEventListener("click", () => {
+        if (!w.active) windowAction("select_window", w.index);
+      });
+      windowTabs.appendChild(tab);
+    }
+    windowTabs.hidden = false;
+  } else {
     windowTabs.hidden = true;
+  }
+  renderPaneTabs();
+}
+
+/// When the active window is split, its panes become tabs — so a split can be
+/// navigated pane-by-pane (each shown zoomed full-screen) instead of rendered
+/// as split geometry on a small screen.
+function renderPaneTabs(): void {
+  const active = activeWindow();
+  paneTabs.textContent = "";
+  if (!active || active.panes.length < 2) {
+    paneTabs.hidden = true;
     return;
   }
-  for (const w of windows) {
+  const label = document.createElement("span");
+  label.className = "ptab-label";
+  label.textContent = "panes";
+  paneTabs.appendChild(label);
+  for (const p of active.panes) {
     const tab = document.createElement("button");
-    tab.className = `wtab${w.active ? " active" : ""}`;
-    const panes = w.panes > 1 ? ` ·${w.panes}` : "";
-    tab.textContent = `${w.index}: ${w.name}${panes}`;
+    tab.className = `wtab${p.active ? " active" : ""}`;
+    tab.textContent = `${p.index}: ${p.command || "sh"}`;
     tab.addEventListener("click", () => {
-      if (!w.active) windowAction("select_window", w.index);
+      if (!p.active) windowAction("select_pane", p.index);
     });
-    windowTabs.appendChild(tab);
+    paneTabs.appendChild(tab);
   }
-  windowTabs.hidden = false;
+  paneTabs.hidden = false;
 }
 
 // ---------- attention notifications ----------

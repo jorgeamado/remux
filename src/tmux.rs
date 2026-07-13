@@ -245,14 +245,23 @@ fn parse_window_activity_line(line: &str) -> Option<(String, u64)> {
 pub struct WindowInfo {
     pub index: u32,
     pub active: bool,
-    pub panes: u32,
     /// The active pane is zoomed (fills the window). On phones we auto-zoom
     /// split windows so no split geometry is rendered on a small screen.
     pub zoomed: bool,
     pub name: String,
+    /// Panes in this window — surfaced as sub-tabs on the phone so a split can
+    /// be navigated pane-by-pane rather than rendered as split geometry.
+    pub panes: Vec<PaneInfo>,
 }
 
-/// Windows of one session ("tabs" in the mobile UI).
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
+pub struct PaneInfo {
+    pub index: u32,
+    pub active: bool,
+    pub command: String,
+}
+
+/// Windows of one session ("tabs" in the mobile UI), each with its panes.
 pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
     let mut cmd = tmux();
     cmd.args([
@@ -260,24 +269,59 @@ pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
         "-t",
         &format!("={session}"),
         "-F",
-        "#{window_index} #{window_active} #{window_panes} #{window_zoomed_flag} #{window_name}",
+        "#{window_index} #{window_active} #{window_zoomed_flag} #{window_name}",
     ]);
     let Ok(out) = run(cmd) else {
         return Ok(Vec::new());
     };
-    Ok(out.lines().filter_map(parse_window_line).collect())
+    let mut windows = Vec::new();
+    for line in out.lines() {
+        if let Some((index, active, zoomed, name)) = parse_window_line(line) {
+            let panes = list_panes(session, index).unwrap_or_default();
+            windows.push(WindowInfo {
+                index,
+                active,
+                zoomed,
+                name,
+                panes,
+            });
+        }
+    }
+    Ok(windows)
 }
 
-/// `<index> <active> <panes> <zoomed> <name (may contain spaces)>` — numerics
-/// first, so the name is simply the remainder.
-fn parse_window_line(line: &str) -> Option<WindowInfo> {
-    let mut f = line.splitn(5, ' ');
-    Some(WindowInfo {
+/// `<index> <active> <zoomed> <name (may contain spaces)>` — numerics first.
+fn parse_window_line(line: &str) -> Option<(u32, bool, bool, String)> {
+    let mut f = line.splitn(4, ' ');
+    Some((
+        f.next()?.parse().ok()?,
+        f.next()? == "1",
+        f.next()? == "1",
+        sanitize(f.next().unwrap_or("")),
+    ))
+}
+
+fn list_panes(session: &str, window_index: u32) -> Result<Vec<PaneInfo>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "list-panes",
+        "-t",
+        &format!("={session}:{window_index}"),
+        "-F",
+        "#{pane_index} #{pane_active} #{pane_current_command}",
+    ]);
+    let out = run(cmd)?;
+    Ok(out.lines().filter_map(parse_pane_line).collect())
+}
+
+/// `<index> <active> <command>` — command is the remainder (comm has no spaces
+/// in practice, but be permissive).
+fn parse_pane_line(line: &str) -> Option<PaneInfo> {
+    let mut f = line.splitn(3, ' ');
+    Some(PaneInfo {
         index: f.next()?.parse().ok()?,
         active: f.next()? == "1",
-        panes: f.next()?.parse().ok()?,
-        zoomed: f.next()? == "1",
-        name: sanitize(f.next().unwrap_or("")),
+        command: sanitize(f.next().unwrap_or("")),
     })
 }
 
@@ -360,6 +404,12 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
         "select_window" => {
             let i = index.context("select_window requires an index")?;
             cmd.args(["select-window", "-t", &format!("{target}:{i}")]);
+        }
+        // Switch to a specific pane in the current window. Pure select — no
+        // zoom (affects all clients); small screens re-zoom client-side.
+        "select_pane" => {
+            let i = index.context("select_pane requires an index")?;
+            cmd.args(["select-pane", "-t", &format!("{target}:.{i}")]);
         }
         other => bail!("unknown window action {other:?}"),
     }
@@ -463,22 +513,31 @@ mod tests {
 
     #[test]
     fn window_line_parsing() {
-        // index active panes zoomed name(may have spaces)
+        // index active zoomed name(may have spaces)
         assert_eq!(
-            parse_window_line("2 1 3 1 my window"),
-            Some(WindowInfo {
-                index: 2,
+            parse_window_line("2 1 1 my window"),
+            Some((2, true, true, "my window".to_string()))
+        );
+        let (idx, active, zoomed, name) = parse_window_line("0 0 0 bash").unwrap();
+        assert_eq!(
+            (idx, active, zoomed, name.as_str()),
+            (0, false, false, "bash")
+        );
+        assert_eq!(parse_window_line("garbage"), None);
+    }
+
+    #[test]
+    fn pane_line_parsing() {
+        assert_eq!(
+            parse_pane_line("1 1 vim"),
+            Some(PaneInfo {
+                index: 1,
                 active: true,
-                panes: 3,
-                zoomed: true,
-                name: "my window".into(),
+                command: "vim".into(),
             })
         );
-        let w = parse_window_line("0 0 1 0 bash").unwrap();
-        assert!(!w.active);
-        assert!(!w.zoomed);
-        assert_eq!(w.panes, 1);
-        assert_eq!(parse_window_line("garbage"), None);
+        assert!(!parse_pane_line("0 0 bash").unwrap().active);
+        assert_eq!(parse_pane_line("x"), None);
     }
 
     #[test]

@@ -280,6 +280,8 @@ function stopPing(): void {
 }
 
 interface PaneTopo {
+  /** tmux pane id (`%N`) — stable identity, unlike index. */
+  id: string;
   index: number;
   active: boolean;
   command: string;

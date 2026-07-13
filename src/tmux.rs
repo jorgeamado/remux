@@ -256,6 +256,10 @@ pub struct WindowInfo {
 
 #[derive(serde::Serialize, Debug, PartialEq, Clone)]
 pub struct PaneInfo {
+    /// tmux pane id (`%N`) — stable for the pane's lifetime, unlike `index`.
+    /// Matches `$TMUX_PANE` in the pane's environment, which is how M4
+    /// ingest events are mapped back to a session.
+    pub id: String,
     pub index: u32,
     pub active: bool,
     pub command: String,
@@ -308,17 +312,22 @@ fn list_panes(session: &str, window_index: u32) -> Result<Vec<PaneInfo>> {
         "-t",
         &format!("={session}:{window_index}"),
         "-F",
-        "#{pane_index} #{pane_active} #{pane_current_command}",
+        "#{pane_id} #{pane_index} #{pane_active} #{pane_current_command}",
     ]);
     let out = run(cmd)?;
     Ok(out.lines().filter_map(parse_pane_line).collect())
 }
 
-/// `<index> <active> <command>` — command is the remainder (comm has no spaces
-/// in practice, but be permissive).
+/// `<id> <index> <active> <command>` — command is the remainder (comm has no
+/// spaces in practice, but be permissive). The id must be `%N`-shaped.
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
-    let mut f = line.splitn(3, ' ');
+    let mut f = line.splitn(4, ' ');
+    let id = f.next()?;
+    if !id.starts_with('%') || !id[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     Some(PaneInfo {
+        id: id.to_string(),
         index: f.next()?.parse().ok()?,
         active: f.next()? == "1",
         command: sanitize(f.next().unwrap_or("")),
@@ -529,15 +538,20 @@ mod tests {
     #[test]
     fn pane_line_parsing() {
         assert_eq!(
-            parse_pane_line("1 1 vim"),
+            parse_pane_line("%5 1 1 vim"),
             Some(PaneInfo {
+                id: "%5".into(),
                 index: 1,
                 active: true,
                 command: "vim".into(),
             })
         );
-        assert!(!parse_pane_line("0 0 bash").unwrap().active);
+        assert!(!parse_pane_line("%0 0 0 bash").unwrap().active);
         assert_eq!(parse_pane_line("x"), None);
+        // id must be %N-shaped: reject a line missing it (old format) or
+        // with a mangled id, rather than mis-assigning fields.
+        assert_eq!(parse_pane_line("1 1 vim"), None);
+        assert_eq!(parse_pane_line("%x 1 1 vim"), None);
     }
 
     #[test]

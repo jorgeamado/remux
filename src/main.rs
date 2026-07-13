@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
-    admin, attention, auth, host_of_url, push, server, tmux, topology, App, Cli, Cmd, DevicesCmd,
+    admin, attention, auth, host_of_url, ingest, push, server, tmux, topology, App, Cli, Cmd,
+    DevicesCmd, EmitCmd,
 };
 use std::sync::Arc;
 
@@ -55,6 +56,28 @@ async fn main() -> Result<()> {
                     println!("renamed");
                 }
             }
+            return Ok(());
+        }
+        Cmd::Emit { cmd } => {
+            let EmitCmd::NeedsInput {
+                pane,
+                source,
+                message,
+            } = cmd;
+            let pane = pane
+                .or_else(|| std::env::var("TMUX_PANE").ok())
+                .context("no --pane and no $TMUX_PANE in the environment")?;
+            let v = ingest::request(
+                &state_dir,
+                serde_json::json!({
+                    "v": 1, "kind": "agent_needs_input",
+                    "pane": pane, "source": source, "message": message,
+                }),
+            )?;
+            println!(
+                "ok: event accepted for session {}",
+                v["session"].as_str().unwrap_or("?")
+            );
             return Ok(());
         }
     };
@@ -119,6 +142,9 @@ async fn main() -> Result<()> {
     attention::spawn(app.clone());
     push::spawn_dispatcher(app.clone());
     topology::spawn(app.clone());
+    // Ingest last: its acks promise the attention pipeline saw the event, so
+    // the dispatcher must be subscribed (and topology publishing) first.
+    ingest::spawn(app.clone(), &state_dir)?;
     server::run(app).await
 }
 

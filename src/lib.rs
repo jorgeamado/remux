@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod attention;
+pub mod ingest;
 pub mod auth;
 pub mod push;
 pub mod server;
@@ -29,6 +30,27 @@ pub enum Cmd {
     Devices {
         #[command(subcommand)]
         cmd: DevicesCmd,
+    },
+    /// Report a semantic event to the running daemon (for hook scripts).
+    Emit {
+        #[command(subcommand)]
+        cmd: EmitCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum EmitCmd {
+    /// An agent (e.g. Claude Code) is waiting for input in a pane.
+    NeedsInput {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Producer label, e.g. claude-code.
+        #[arg(long, default_value = "unknown")]
+        source: String,
+        /// Short human-readable detail (sanitized and capped by the daemon).
+        #[arg(long)]
+        message: Option<String>,
     },
 }
 

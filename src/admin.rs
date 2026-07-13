@@ -36,7 +36,7 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
 /// Peer credential check: only the uid that owns the socket (the daemon's
 /// own user) may drive admin commands. Defence in depth beyond 0600 — a
 /// leaked/inherited fd from another user is still rejected.
-fn peer_allowed(stream: &UnixStream, owner_uid: u32) -> bool {
+pub(crate) fn peer_allowed(stream: &UnixStream, owner_uid: u32) -> bool {
     match stream.peer_cred() {
         Ok(cred) => cred.uid() == owner_uid,
         Err(_) => false,

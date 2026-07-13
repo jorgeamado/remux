@@ -95,7 +95,9 @@ async fn run_client(app: &Arc<App>, session: &str) -> anyhow::Result<()> {
 
 async fn publish(app: &Arc<App>) {
     if let Ok(Ok(snap)) = tokio::task::spawn_blocking(tmux::capture_topology).await {
-        // watch::send only errors if all receivers dropped — harmless.
-        let _ = app.topology.send(Arc::new(snap));
+        // send_replace, not send: send() DROPS the value when no receivers
+        // exist, and the ingest socket reads this snapshot via borrow() —
+        // typically exactly when no client is connected (phone locked).
+        let _ = app.topology.send_replace(Arc::new(snap));
     }
 }

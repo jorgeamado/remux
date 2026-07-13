@@ -52,7 +52,22 @@ control-mode arc is done and deployed.
 2. Create the `jorgeamado/homebrew-remux` tap repo and drop the release's
    generated `remux.rb` into `Formula/` → makes `brew install` real.
 
-## Planned next (all V2/V3 parked — see PLAN.md "Parked")
+## Active: M4 — semantic layer (started 2026-07-13)
+
+Plan drafted, Codex-reviewed (20 findings, 4 blockers), and rewritten
+before any code — see PLAN.md §M4. The review killed in-band OSC 133
+parsing (per-connection PTY = no byte source while the phone is locked;
+attached clients see rendered output, not per-pane bytes; tmux <3.4 lacks
+native OSC 133). New mechanism: out-of-band hooks → a local ingest socket
+(`remux emit`), agent hooks actionable / shell hooks informational-only,
+approvals returned to the blocked Claude Code hook as decision JSON (never
+send-keys), gated by a new per-device `approve` capability.
+
+Next step: **M4.0 protocol spike** — verify the Claude Code permission
+hook (name, context, can it block awaiting a remote decision), and the
+ingest-socket + `$TMUX_PANE`↔topology mapping.
+
+## Parked (see PLAN.md "Parked")
 
 - **Multi-machine client** (new idea, 2026-07-13): one app talks to several
   remux daemons (laptop / home server / cloud VM) — machine picker, per-host
@@ -61,12 +76,12 @@ control-mode arc is done and deployed.
   native shell, mutual origin allowlisting, or a hub/relay. Plus host
   discovery. Independent of M3.
 - Custom renderer + snapshot/delta protocol (only if xterm.js/bandwidth hurt).
-- Semantic layer: OSC 133 shell integration, command feed, Claude Code
-  approval cards (OSC 133 doesn't depend on control mode).
 - Per-device permission tiers (observer/controller/admin) — unlocks
-  invite-from-device and shared use.
+  invite-from-device and shared use (M4 pulls just the `approve` flag out).
 - Hosted apt repo (GPG-signed); built-in ACME (VPN-agnostic TLS — no code
   dependency on Tailscale today, it's only the zero-config cert path).
+- M4d streamed-output feed — gated on M4c metadata cards proving
+  insufficient.
 
 Optional small polish still open: a live pane-command **breadcrumb** in the
 header (the session button + tabs already form a breadcrumb, so low value).

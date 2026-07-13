@@ -214,6 +214,133 @@ breadcrumb `session / window / pane-command`, session picker fed by topology
 instead of polling, fit-width upgraded to live window dims. Ships separately
 from M3a so the risky plumbing and the UI each land shippable.
 
+## M4 — semantic layer (hooks → events → approval cards → command feed)
+
+The V3 thesis from DESIGN.md, now unblocked: the daemon stops guessing what
+a session is doing and starts knowing. Today attention is a busy→quiet timer
+(`src/attention.rs`).
+
+> Reviewed 2026-07-13 by Codex (20 findings, 4 blockers) before any code.
+> The review invalidated the first draft's core mechanism — parsing OSC 133
+> in-band on the PTY path — for architectural reasons, not detail ones:
+> ⚑ the PTY exists only per live WebSocket (`ws.rs`), so there is *no byte
+> source at all* when no phone is connected, which is exactly when
+> notifications matter; ⚑ what a connected client receives is tmux's
+> *rendered* active window (redraws, status line, one window at a time),
+> not raw per-pane output, so "one parse per session" doesn't exist on
+> that path; ⚑ tmux only handles OSC 133 natively from 3.4 (3.3 needs
+> wrapped DCS passthrough, off by default, and `allow-passthrough` opens
+> far more than OSC 133). Conclusion: **semantics arrive out-of-band via
+> hooks, not in-band via escape-sequence parsing.** OSC 133 is demoted to
+> a possible future client-side nicety.
+
+Mechanism: one narrow local **ingest socket** (Unix, 0600, strict JSON
+schema, rate/size caps — a *separate* socket from admin: it accepts data,
+never commands). A tiny `remux emit` helper posts events to it. Two
+producers, sharply distinguished by trust:
+
+- **Agent hooks** (Claude Code, later Codex/OpenCode): the tool itself
+  reports "I need permission for X" with structured context, and — for
+  approvals — *blocks awaiting the decision*. Authenticated by the
+  filesystem boundary; these events may be **actionable**.
+- **Shell hooks** (zsh/bash precmd/preexec): report command start/end,
+  exit, duration, cwd, keyed by `$TMUX_PANE`. Any process in the session
+  could forge these, so they are **informational only, provenance-labeled,
+  never actionable** (⚑ forged markers must not be able to create an
+  Approve button).
+
+Guiding constraints, recorded up front:
+- **No screen scraping, no keystroke approvals.** TUIs are never parsed or
+  re-rendered; approve/deny is returned to the *waiting hook process* as
+  its documented decision JSON — ⚑ never `send-keys` into a pane, where
+  focus/prompt races make "y" a confused-deputy write.
+- **Cards are bound and one-shot**: unguessable request id + pane/session
+  identity (from M3 topology — ⚑ a real dependency, not "independent") +
+  expiry + atomic consumption; stale or duplicate decisions are rejected.
+- ⚑ **Approval is a new privilege.** Flat device tokens were acceptable
+  for "view and type"; remotely authorizing agent tool-use is more. Pull
+  the minimal capability from the parked tiers: approvals require a
+  per-device `approve` flag, host-CLI-granted (`remux devices`), off by
+  default.
+- ⚑ **Secrets posture**: command lines carry tokens and passwords. Command
+  text is capped, redacted (common secret shapes), bounded-retention,
+  in-memory only; lock-screen/push text stays generic (push is already
+  payload-less — detail is fetched post-auth on tap, as with attention).
+- **Progressive enhancement.** No hooks installed → today's behavior,
+  busy→quiet heuristic stays as the fallback detector.
+
+### M4.0 — protocol spike (small, do first)
+
+Same day-1-gate discipline as M3a/M1. (a) Claude Code side: which hook
+carries permission requests and can return an allow/deny decision
+(PermissionRequest vs PreToolUse `permissionDecision` — verify against
+current docs on the versions we support), what context it provides
+(tool, input, session, cwd), and confirm a hook can block for tens of
+seconds awaiting a remote decision without Claude Code timing out or
+misbehaving. (b) Daemon side: ingest socket shape + `remux emit` helper +
+pane identity (`$TMUX_PANE` ↔ topology pane id, including pane death while
+a request is pending). Deliverable: a written protocol note; if hooks
+can't block, M4b re-plans around Notification-hook + polling before any
+daemon code.
+
+### M4a — ingest + Claude Code attention (medium)
+
+The ingest socket, event model with **classes** (`agent_needs_input`,
+`command_finished`, …) and provenance, wired into the existing attention
+broadcast → push dispatcher → `/api/attention` deep link. ⚑ Suppression
+rules become class-aware: approval-class events bypass the live-socket
+skip and per-session throttle (a backgrounded PWA counts as a live socket
+today — that must not swallow an approval), with dedup + expiry + ack
+instead. Ships alone as: precise, named lock-screen notifications for
+Claude Code ("Claude Code needs permission in remux:main") instead of
+"went quiet".
+
+Acceptance: phone locked, Claude Code asks on the Mac → notification ≤30s
+naming the session; opening the app deep-links to it; marker-less panes
+still get busy→quiet.
+
+### M4b — approval decisions (medium)
+
+The headline. Pending-request registry (one-shot ids, expiry, atomic
+consume), card payload over the WS + fetched on deep link, Approve/Deny
+in the PWA, decision returned to the blocked hook as Claude Code's
+documented decision JSON. Requires the `approve` device capability (off by
+default), and revocation cancels pending cards (extends the M2 cascade).
+
+Acceptance: locked phone → notification → card shows tool + command →
+Approve → Claude proceeds; Deny → Claude declines; expired/duplicate
+decisions rejected; a device without `approve` sees the card read-only;
+revoking a device kills its pending cards.
+
+### M4c — shell command events + metadata cards (medium)
+
+zsh/bash hook snippets (installed via a documented one-liner, idempotent,
+narrow supported matrix — nested shells/ssh/fish explicitly degrade to
+busy→quiet) emitting `command_started`/`command_finished {exit, duration,
+cwd}` through `remux emit`. Attention v2 for plain shells ("`cargo build`
+failed (101) after 4m"). PWA gets the first feed: **metadata-only command
+cards** (command, exit badge, duration, running-state) with tap-through to
+the terminal — ⚑ no output streaming: OSC boundaries don't make arbitrary
+terminal bytes safely re-renderable outside xterm, so output stays in the
+real terminal.
+
+Acceptance: long command fails while phone is locked → named notification;
+feed shows the day's command history for a session; forged events can at
+worst pollute the informational feed, never trigger actions.
+
+### M4d — streamed-output feed (large, gated)
+
+The full chat-timeline with output in the blocks. Explicitly gated on M4c
+proving insufficient — rendering command output outside the terminal means
+real VT handling per block (progress bars, cursor rewrites, color) and a
+capture path that doesn't exist today. Decide with usage data, like the
+custom renderer.
+
+Sequencing: M4.0 → M4a → M4b is the shortest path to the differentiating
+feature (remote approvals) on the most trustworthy signal (agent hooks);
+M4c adds breadth for every plain shell; M4d only if metadata cards leave
+a real gap.
+
 ## Cross-cutting
 
 - e2e suite stays fast (<5s) and deterministic; every milestone adds its
@@ -224,9 +351,6 @@ from M3a so the risky plumbing and the UI each land shippable.
 
 - Custom renderer + snapshot/delta protocol — only if xterm.js or bandwidth
   measurably hurts; the protocol boundary already allows it.
-- Semantic layer (V3): OSC 133 shell integration, command feed, Claude Code
-  approval cards. Note: OSC 133 does *not* depend on control mode — if M3
-  slips, it can be re-evaluated independently.
 - Per-device permission tiers (observer/controller/admin) — prerequisite
   for invite-from-device and shared use.
 - Hosted apt repo (GPG-signed), cloud relay, collaboration.

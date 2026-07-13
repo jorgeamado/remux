@@ -240,6 +240,7 @@ function connect(): void {
     pendingInput = "";
     isController = false;
     controlBanner.hidden = true;
+    windowTabs.hidden = true;
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -305,6 +306,7 @@ function handleControl(msg: ControlMsg): void {
       if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
       setRole(nowController);
+      renderTabs(); // session may have changed
       if (nowController) {
         hint.hidden = true;
         controlRequested = false;
@@ -321,6 +323,8 @@ function handleControl(msg: ControlMsg): void {
     }
     case "topology":
       topology = msg.sessions ?? [];
+      renderTabs();
+      if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
       onAttention();
@@ -363,12 +367,6 @@ function scheduleReconnect(): void {
 
 // ---------- session picker ----------
 
-interface SessionInfo {
-  name: string;
-  windows: number;
-  attached: number;
-}
-
 function menuItem(label: string, onClick: () => void): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.className = "btn";
@@ -377,26 +375,14 @@ function menuItem(label: string, onClick: () => void): HTMLButtonElement {
   return btn;
 }
 
-async function openSessionMenu(): Promise<void> {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) return;
-  let sessions: SessionInfo[];
-  try {
-    const resp = await fetch("/api/sessions", {
-      headers: { authorization: `Bearer ${token}` },
-    });
-    if (!resp.ok) throw new Error(String(resp.status));
-    sessions = (await resp.json()) as SessionInfo[];
-  } catch {
-    showHint("Couldn't list sessions");
-    return;
-  }
+// Fed by the live topology stream (M3b) — no polling, always current.
+function openSessionMenu(): void {
   sessionMenu.textContent = "";
-  for (const s of sessions) {
+  for (const s of topology) {
     const marker = s.name === sessionTitle ? "● " : "";
-    const attached = s.attached > 0 ? " · attached" : "";
+    const attached = s.attached ? " · attached" : "";
     sessionMenu.appendChild(
-      menuItem(`${marker}${s.name} — ${s.windows}w${attached}`, () =>
+      menuItem(`${marker}${s.name} — ${s.windows.length}w${attached}`, () =>
         switchSession(s.name)
       )
     );
@@ -431,21 +417,15 @@ function switchSession(name: string): void {
 sessionName.addEventListener("click", (ev) => {
   ev.stopPropagation();
   menu.hidden = true;
+  tmuxMenu.hidden = true;
   if (sessionMenu.hidden) {
-    void openSessionMenu();
+    openSessionMenu();
   } else {
     sessionMenu.hidden = true;
   }
 });
 
 // ---------- windows & panes (tmux "tabs") ----------
-
-interface WindowInfo {
-  index: number;
-  active: boolean;
-  panes: number;
-  name: string;
-}
 
 const tmuxBtn = $<HTMLButtonElement>("tmux-btn");
 const tmuxMenu = $("tmux-menu");
@@ -459,35 +439,10 @@ function windowAction(action: string, index?: number): void {
   sendJson({ type: "window_action", action, index });
 }
 
-async function openTmuxMenu(): Promise<void> {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token || !sessionTitle) return;
-  let windows: WindowInfo[] = [];
-  try {
-    const resp = await fetch(
-      `/api/windows?session=${encodeURIComponent(sessionTitle)}`,
-      { headers: { authorization: `Bearer ${token}` } }
-    );
-    if (resp.ok) windows = (await resp.json()) as WindowInfo[];
-  } catch {
-    /* menu still offers the actions */
-  }
+// Window switching now lives in the always-visible tab strip (renderTabs);
+// the + menu is create-only.
+function openTmuxMenu(): void {
   tmuxMenu.textContent = "";
-  if (windows.length > 0) {
-    const label = document.createElement("div");
-    label.className = "menu-label";
-    label.textContent = "Windows";
-    tmuxMenu.appendChild(label);
-    for (const w of windows) {
-      const marker = w.active ? "● " : "";
-      const panes = w.panes > 1 ? ` · ${w.panes} panes` : "";
-      tmuxMenu.appendChild(
-        menuItem(`${marker}${w.index}: ${w.name}${panes}`, () =>
-          windowAction("select_window", w.index)
-        )
-      );
-    }
-  }
   const label = document.createElement("div");
   label.className = "menu-label";
   label.textContent = "Create";
@@ -506,11 +461,39 @@ tmuxBtn.addEventListener("click", (ev) => {
   menu.hidden = true;
   sessionMenu.hidden = true;
   if (tmuxMenu.hidden) {
-    void openTmuxMenu();
+    openTmuxMenu();
   } else {
     tmuxMenu.hidden = true;
   }
 });
+
+// ---------- window tabs (live from topology) ----------
+
+const windowTabs = $("window-tabs");
+
+/// Render the current session's windows as tappable tabs, active highlighted.
+/// Driven purely by the topology stream — no polling.
+function renderTabs(): void {
+  const sess = topology.find((s) => s.name === sessionTitle);
+  const windows = sess?.windows ?? [];
+  windowTabs.textContent = "";
+  if (windows.length < 2) {
+    // A single window needs no tabs.
+    windowTabs.hidden = true;
+    return;
+  }
+  for (const w of windows) {
+    const tab = document.createElement("button");
+    tab.className = `wtab${w.active ? " active" : ""}`;
+    const panes = w.panes > 1 ? ` ·${w.panes}` : "";
+    tab.textContent = `${w.index}: ${w.name}${panes}`;
+    tab.addEventListener("click", () => {
+      if (!w.active) windowAction("select_window", w.index);
+    });
+    windowTabs.appendChild(tab);
+  }
+  windowTabs.hidden = false;
+}
 
 // ---------- attention notifications ----------
 

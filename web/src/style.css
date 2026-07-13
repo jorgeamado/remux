@@ -143,6 +143,41 @@ body {
   flex: 1;
 }
 
+/* ---------- window tabs (M3b: live from topology) ---------- */
+
+#window-tabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 2px 4px;
+  scrollbar-width: none;
+}
+
+#window-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.wtab {
+  flex: none;
+  max-width: 40vw;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wtab.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
 /* ---------- buttons ---------- */
 
 .btn {

@@ -175,7 +175,8 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
 
-  // --- Windows: create a second window via the + menu, then switch back. ---
+  // --- Windows: create a second window via the + menu; the live topology
+  // (M3a) surfaces it as a tab (M3b), then switch back via the tabs. ---
   await page.locator("#tmux-btn").click();
   await expect(page.locator("#tmux-menu")).toBeVisible();
   await page.locator("#tmux-menu .btn", { hasText: "New window" }).click();
@@ -184,27 +185,18 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .not.toContain("direct4typing");
 
-  // M3a: the control-mode topology client reports the new window (2 windows
-  // in this session) to the client without any UI action.
-  await expect
-    .poll(
-      async () =>
-        page.evaluate(() => {
-          const t = (window as unknown as { __topology: () => unknown[] }).__topology();
-          const s = (t as { name: string; windows: unknown[] }[]).find(
-            (x) => x.name === "e2emain"
-          );
-          return s ? s.windows.length : 0;
-        }),
-      { timeout: 10_000 }
-    )
-    .toBeGreaterThanOrEqual(2);
-  await page.locator("#tmux-btn").click();
-  await expect(page.locator("#tmux-menu")).toContainText("Windows");
-  await page.locator("#tmux-menu .btn", { hasText: "0:" }).click();
+  // The tab strip renders from topology with no polling: two tabs appear.
+  await expect(page.locator("#window-tabs")).toBeVisible();
+  await expect(page.locator("#window-tabs .wtab")).toHaveCount(2);
+  // The active tab is the new window; tap window 0's tab to switch back.
+  await page.locator("#window-tabs .wtab", { hasText: /^0:/ }).click();
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
+  // After switching, window 0's tab is the active one.
+  await expect(
+    page.locator("#window-tabs .wtab.active")
+  ).toHaveText(/^0:/);
 
   // --- Key row: ^C lives in the "…" overflow row. ---
   await page.locator("#more-key").click();

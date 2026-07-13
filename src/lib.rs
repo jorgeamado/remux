@@ -99,13 +99,42 @@ pub struct Args {
     pub url: Option<String>,
 }
 
+/// An attention-worthy moment in a session. `kind`/`reason`/`source` ride
+/// the in-band ws frame and `/api/attention` — never the push payload,
+/// which stays empty by design.
+#[derive(Clone, Debug, serde::Serialize, PartialEq)]
+pub struct Attention {
+    pub session: String,
+    /// `agent_needs_input` (hook-fed, precise) or `quiet_after_busy`
+    /// (the heuristic fallback detector).
+    pub kind: String,
+    /// Producer-supplied detail ("permission prompt"); sanitized at ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Producer label ("claude-code"); hook-fed events only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl Attention {
+    /// The heuristic detector's event: no detail beyond the session.
+    pub fn quiet(session: String) -> Self {
+        Self {
+            session,
+            kind: "quiet_after_busy".into(),
+            reason: None,
+            source: None,
+        }
+    }
+}
+
 pub struct App {
     pub args: Args,
     pub auth: auth::Auth,
     pub allowed_hosts: Vec<String>,
-    /// Attention events (payload = session name), fanned out to websockets
-    /// attached to that session.
-    pub attention: tokio::sync::broadcast::Sender<String>,
+    /// Attention events, fanned out to websockets attached to the session
+    /// and to the push dispatcher.
+    pub attention: tokio::sync::broadcast::Sender<Attention>,
     /// URL clients use to reach the daemon (goes into pairing links).
     pub public_url: String,
     /// Web Push state (VAPID key + subscriptions).
@@ -113,8 +142,10 @@ pub struct App {
     /// Live websocket connections: (device id, session) -> count. Push
     /// delivery skips devices that already get the in-band frame.
     pub connections: std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
-    /// Sessions with recent attention (session -> when), for /api/attention.
-    pub pending_attention: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Sessions with recent attention (session -> when + what), for
+    /// /api/attention.
+    pub pending_attention:
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Attention)>>,
     /// Revocations (payload = device id): live sockets of that device close.
     pub revoked: tokio::sync::broadcast::Sender<String>,
     /// Latest tmux topology (sessions → windows), streamed to every client.

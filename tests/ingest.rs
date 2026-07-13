@@ -84,7 +84,11 @@ async fn needs_input_event_raises_attention_for_the_panes_session() {
     .unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["session"], "ing1");
-    assert_eq!(attention.try_recv().unwrap(), "ing1");
+    let att = attention.try_recv().unwrap();
+    assert_eq!(att.session, "ing1");
+    assert_eq!(att.kind, "agent_needs_input");
+    assert_eq!(att.reason.as_deref(), Some("permission needed"));
+    assert_eq!(att.source.as_deref(), Some("claude-code"));
 }
 
 #[tokio::test]

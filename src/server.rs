@@ -116,10 +116,13 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
     }
     let mut pending = app.pending_attention.lock().unwrap();
     let now = std::time::Instant::now();
-    pending.retain(|_, t| now.duration_since(*t) < PENDING_TTL);
+    pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_TTL);
     let mut sessions: Vec<&String> = pending.keys().collect();
     sessions.sort();
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    // `details` is additive; `sessions` stays for older clients.
+    let mut details: Vec<&crate::Attention> = pending.values().map(|(_, a)| a).collect();
+    details.sort_by(|a, b| a.session.cmp(&b.session));
+    Json(serde_json::json!({ "sessions": sessions, "details": details })).into_response()
 }
 
 /// Read-only device list for the PWA sheet. Management (revoke/rename) is

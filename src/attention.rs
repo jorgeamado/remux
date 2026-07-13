@@ -110,7 +110,7 @@ async fn monitor(app: Arc<App>, cfg: Config) {
                 .or_insert_with(|| Detector::new(&cfg));
             if detector.observe(activity as f64, now) {
                 tracing::debug!(session = %name, "attention raised");
-                let _ = app.attention.send(name);
+                let _ = app.attention.send(crate::Attention::quiet(name));
             }
         }
     }

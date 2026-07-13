@@ -94,7 +94,9 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
 
     remux::push::spawn_dispatcher(app.clone());
     tokio::time::sleep(Duration::from_millis(50)).await;
-    app.attention.send("pd".to_string()).unwrap();
+    app.attention
+        .send(remux::Attention::quiet("pd".to_string()))
+        .unwrap();
 
     // One push to /ok with a VAPID header; /gone pruned from the store.
     let mut delivered = false;

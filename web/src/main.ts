@@ -305,6 +305,10 @@ interface ControlMsg {
   code?: string;
   message?: string;
   sessions?: SessionTopo[];
+  /** attention frames: event kind + optional hook-fed detail */
+  kind?: string;
+  reason?: string;
+  source?: string;
 }
 
 // Latest tmux topology (M3a). M3b renders it as tabs/breadcrumb; for now it's
@@ -342,7 +346,7 @@ function handleControl(msg: ControlMsg): void {
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
-      onAttention();
+      onAttention(msg.source, msg.reason);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -675,7 +679,7 @@ async function checkPendingAttention(): Promise<void> {
   }
 }
 
-function onAttention(): void {
+function onAttention(source?: string, reason?: string): void {
   if (document.visibilityState === "visible") {
     return;
   }
@@ -683,8 +687,13 @@ function onAttention(): void {
   if (!notifyPref || !("Notification" in window) || Notification.permission !== "granted") {
     return;
   }
+  // Hook-fed events know who wants what ("claude-code: permission prompt");
+  // the heuristic can only say "may need your attention".
+  const what = source
+    ? `${source}: ${reason || "needs input"}`
+    : "may need your attention";
   const opts: NotificationOptions = {
-    body: `${sessionTitle || "session"} may need your attention`,
+    body: `${sessionTitle || "session"} — ${what}`,
     tag: "remux-attention", // replaces, never stacks
     icon: "/icon-512.png",
   };

@@ -251,11 +251,12 @@ pub fn spawn_dispatcher(app: std::sync::Arc<crate::App>) {
         let mut rx = app.attention.subscribe();
         loop {
             match rx.recv().await {
-                Ok(session) => {
+                Ok(att) => {
+                    let session = att.session.clone();
                     app.pending_attention
                         .lock()
                         .unwrap()
-                        .insert(session.clone(), Instant::now());
+                        .insert(session.clone(), (Instant::now(), att));
                     let at_keyboard = tokio::task::spawn_blocking(|| {
                         crate::tmux::any_client_active_within(KEYBOARD_GRACE_SECS)
                     })

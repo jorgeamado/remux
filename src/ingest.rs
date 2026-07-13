@@ -152,15 +152,17 @@ fn process(app: &App, ev: Event) -> serde_json::Value {
     if ev.v != 1 {
         return serde_json::json!({ "ok": false, "error": "unsupported version" });
     }
-    if ev.source.is_empty() || ev.source.len() > MAX_SOURCE {
-        return serde_json::json!({ "ok": false, "error": "bad source" });
-    }
     if !valid_pane(&ev.pane) {
         return serde_json::json!({ "ok": false, "error": "bad pane id (want %N)" });
     }
     let message = ev.message.as_deref().map(sanitize).unwrap_or_default();
-    // All producer strings are same-uid-controlled; sanitize before logging.
+    // All producer strings are same-uid-controlled; sanitize, then validate
+    // what will actually be stored/logged (a control-chars-only source must
+    // be rejected, not become "").
     let source = sanitize(&ev.source);
+    if source.is_empty() || source.len() > MAX_SOURCE {
+        return serde_json::json!({ "ok": false, "error": "bad source" });
+    }
     match ev.kind.as_str() {
         "agent_needs_input" => {
             let session = match sessions_of_pane(app, &ev.pane).as_slice() {
@@ -180,7 +182,12 @@ fn process(app: &App, ev: Event) -> serde_json::Value {
             // The existing attention pipeline does the rest: push dispatch
             // (with its suppression rules), in-band ws frames, and the
             // /api/attention deep link.
-            let _ = app.attention.send(session.clone());
+            let _ = app.attention.send(crate::Attention {
+                session: session.clone(),
+                kind: ev.kind,
+                reason: (!message.is_empty()).then_some(message),
+                source: Some(source),
+            });
             serde_json::json!({ "ok": true, "session": session })
         }
         _ => serde_json::json!({ "ok": false, "error": "unknown kind" }),

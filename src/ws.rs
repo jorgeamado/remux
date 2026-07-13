@@ -61,8 +61,15 @@ enum ServerMsg<'a> {
         code: &'a str,
         message: &'a str,
     },
-    /// The session was busy and went quiet — likely finished or waiting.
-    Attention,
+    /// Someone/something in this session wants the user: a hook-fed event
+    /// (agent_needs_input) or the busy→quiet heuristic.
+    Attention {
+        kind: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<&'a str>,
+    },
     Pong,
 }
 
@@ -318,8 +325,17 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         async move {
             loop {
                 match rx.recv().await {
-                    Ok(name) => {
-                        if name == session && out.send(json(&ServerMsg::Attention)).await.is_err() {
+                    Ok(att) => {
+                        if att.session == session
+                            && out
+                                .send(json(&ServerMsg::Attention {
+                                    kind: &att.kind,
+                                    reason: att.reason.as_deref(),
+                                    source: att.source.as_deref(),
+                                }))
+                                .await
+                                .is_err()
+                        {
                             break;
                         }
                     }

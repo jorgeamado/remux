@@ -11,7 +11,10 @@
 > (observer Fit toggle; window dims ride the status frame). **M2 done**
 > (revocation cascade incl. persist-rollback and lagged-broadcast fail-safe,
 > `remux devices` CLI over the admin socket, read-only PWA Devices sheet).
-> Next: M3a, starting with the control-mode compatibility spike. Shakedown
+> **M3a done** (control-mode topology adapter: watcher client, dirty-bit
+> re-list, watch→ws "topology" frames, attached-count excludes the
+> internal watcher, ensure_session made idempotent). Next: M3b — topology
+> UI (window tabs, live breadcrumb, restored status-hide + observer-fit). Shakedown
 > findings fixed along the way: attestations are public-repo-only, the
 > macos-13 runner pool is starved (cross-target from macos-14), and a
 > second rustls crypto provider panicked the TLS listener (now a smoke-

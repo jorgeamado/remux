@@ -189,7 +189,10 @@ fn process(app: &App, ev: Event) -> serde_json::Value {
 
 /// Terminal-controlled text: strip control chars, cap length.
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(MAX_MESSAGE).collect()
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_MESSAGE)
+        .collect()
 }
 
 fn valid_pane(s: &str) -> bool {
@@ -231,8 +234,7 @@ pub fn request(state_dir: &Path, body: serde_json::Value) -> Result<serde_json::
     stream.write_all(format!("{body}\n").as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    let v: serde_json::Value =
-        serde_json::from_str(line.trim()).context("bad ingest response")?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).context("bad ingest response")?;
     if v["ok"] != serde_json::json!(true) {
         anyhow::bail!("daemon refused event: {}", v["error"]);
     }

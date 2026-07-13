@@ -1,7 +1,7 @@
 pub mod admin;
 pub mod attention;
-pub mod ingest;
 pub mod auth;
+pub mod ingest;
 pub mod push;
 pub mod server;
 pub mod tmux;

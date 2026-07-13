@@ -118,7 +118,10 @@ async fn rejects_unknown_pane_kind_version_and_extra_fields() {
             .unwrap();
         assert_eq!(v["ok"], false, "accepted: {v}");
     }
-    assert!(attention.try_recv().is_err(), "no event may raise attention");
+    assert!(
+        attention.try_recv().is_err(),
+        "no event may raise attention"
+    );
 }
 
 #[tokio::test]
@@ -177,5 +180,8 @@ async fn oversized_line_is_rejected_not_buffered() {
     .await
     .unwrap();
     assert!(rejected);
-    assert!(attention.try_recv().is_err(), "oversized event must not fire");
+    assert!(
+        attention.try_recv().is_err(),
+        "oversized event must not fire"
+    );
 }

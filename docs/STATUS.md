@@ -4,7 +4,8 @@
 > project is and what's planned. The durable plan is `docs/PLAN.md`.
 
 Repo state: `main` clean, everything pushed to `github.com/jorgeamado/remux`
-(public), CI green. HEAD = `a1a9d5a` (M3b window tabs).
+(public), CI green. HEAD = `5251fdd` (M3b pane tabs). The whole M3
+control-mode arc is done and deployed.
 
 ## Deployed
 
@@ -37,8 +38,13 @@ Repo state: `main` clean, everything pushed to `github.com/jorgeamado/remux`
 - **M3a control-mode topology adapter** — read-only watcher client, dirty-bit
   full re-list, `topology` frames over a watch channel; attached-count excludes
   the internal watcher; `ensure_session` made idempotent (race fix).
-- **M3b (part 1)** — live **window tabs** from topology (tap to switch),
-  session picker fed from topology, `+` menu create-only.
+- **M3b DONE** — live **window tabs** + **pane tabs** from topology (tap to
+  switch; no polling), session picker fed from topology, `+` menu create-only,
+  **status-bar hiding restored** (controller-only, render-extra-row-and-clip,
+  not the old pixel hack), **phone splits auto-zoom** (small screens never
+  render split geometry; pane tabs navigate a split pane-by-pane, each
+  full-screen). WebGL renderer + debounced sizing underneath (font = tmux
+  resolution). **M3 control-mode arc complete.**
 
 ## Waiting on the user (both one-click, public-facing — I can't do these)
 
@@ -46,18 +52,24 @@ Repo state: `main` clean, everything pushed to `github.com/jorgeamado/remux`
 2. Create the `jorgeamado/homebrew-remux` tap repo and drop the release's
    generated `remux.rb` into `Formula/` → makes `brew install` real.
 
-## Planned next
+## Planned next (all V2/V3 parked — see PLAN.md "Parked")
 
-- **M3b (part 2) — polish** (next up):
-  - Restore proper **status-bar hiding** (tabs now show window info, so the
-    tmux status row is redundant) — done correctly on the clean sizing base,
-    not the old pixel hack.
-  - Live **breadcrumb**: active window's running command in the header.
-- **V2/V3 parked** (see PLAN.md "Parked"): custom renderer + snapshot/delta
-  protocol; semantic layer (OSC 133 shell integration, command feed, Claude
-  Code approval cards); per-device permission tiers (unlocks invite-from-
-  device); hosted apt repo (GPG); built-in ACME (VPN-agnostic TLS — no code
+- **Multi-machine client** (new idea, 2026-07-13): one app talks to several
+  remux daemons (laptop / home server / cloud VM) — machine picker, per-host
+  device tokens. Blocker to design around: cross-origin (a PWA from host A
+  → WebSocket to host B is rejected by B's Host/Origin guard) — needs a
+  native shell, mutual origin allowlisting, or a hub/relay. Plus host
+  discovery. Independent of M3.
+- Custom renderer + snapshot/delta protocol (only if xterm.js/bandwidth hurt).
+- Semantic layer: OSC 133 shell integration, command feed, Claude Code
+  approval cards (OSC 133 doesn't depend on control mode).
+- Per-device permission tiers (observer/controller/admin) — unlocks
+  invite-from-device and shared use.
+- Hosted apt repo (GPG-signed); built-in ACME (VPN-agnostic TLS — no code
   dependency on Tailscale today, it's only the zero-config cert path).
+
+Optional small polish still open: a live pane-command **breadcrumb** in the
+header (the session button + tabs already form a breadcrumb, so low value).
 
 ## Working notes / gotchas
 

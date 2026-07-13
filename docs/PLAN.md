@@ -11,14 +11,24 @@
 > (observer Fit toggle; window dims ride the status frame). **M2 done**
 > (revocation cascade incl. persist-rollback and lagged-broadcast fail-safe,
 > `remux devices` CLI over the admin socket, read-only PWA Devices sheet).
-> **M3a done** (control-mode topology adapter: watcher client, dirty-bit
-> re-list, watch→ws "topology" frames, attached-count excludes the
-> internal watcher, ensure_session made idempotent). Next: M3b — topology
-> UI (window tabs, live breadcrumb, restored status-hide + observer-fit). Shakedown
-> findings fixed along the way: attestations are public-repo-only, the
-> macos-13 runner pool is starved (cross-target from macos-14), and a
-> second rustls crypto provider panicked the TLS listener (now a smoke-
-> tested class).
+> **M1 iPhone push spike PASSED** (lock-screen notification confirmed on
+> the installed PWA). **M3a done** (control-mode topology adapter). **M3b
+> done** — live window tabs + pane tabs (fed by topology, no polling),
+> topology-fed session picker, status-bar hiding restored (controller-only,
+> clean mechanism not the old pixel hack), and phone splits auto-zoom
+> (small screens never render split geometry; pane tabs navigate them).
+> **The whole M3 control-mode arc is complete and deployed.**
+>
+> Shakedown findings fixed along the way: attestations are public-repo-only,
+> the macos-13 runner pool is starved (cross-target from macos-14), a second
+> rustls crypto provider panicked the TLS listener (now smoke-tested).
+> M3.0 sizing rework replaced the fragile pixel hacks with WebGL rendering +
+> debounced grid == what's reported to tmux (fixed garbled full-screen apps
+> and small-font glyph overlap); font size = tmux resolution (default 10px).
+>
+> Remaining user actions: publish the draft v0.1.0 release; create the
+> `homebrew-remux` tap with the generated `remux.rb`. Remaining engineering:
+> the Parked list below.
 
 Where we are: V1 + V1.x are built and deployed (daemon + PWA, pairing/TLS,
 observer/controller handoff, session picker, windows/panes menu, attention
@@ -220,6 +230,15 @@ from M3a so the risky plumbing and the UI each land shippable.
 - Per-device permission tiers (observer/controller/admin) — prerequisite
   for invite-from-device and shared use.
 - Hosted apt repo (GPG-signed), cloud relay, collaboration.
+- **Multi-machine client** (the "Machines" screen from the original design):
+  one PWA/app talks to several remux daemons — laptop, home server, cloud VM
+  — with a machine picker and per-host device tokens. Key challenge: a PWA
+  served from host A opening a WebSocket to host B is cross-origin, which each
+  daemon's Host/Origin guard currently rejects; needs one of (a) a native
+  shell not bound to a single origin, (b) each daemon allowlisting the others'
+  origins, or (c) a small hub/relay the app talks to. Also: host discovery
+  (MagicDNS/manual/QR) and switching sessions across hosts. Independent of
+  M3; a real V2/V3 direction.
 - Built-in ACME (`rustls-acme`, e.g. `--acme-domain` + DNS-01 credentials):
   the daemon issues and renews its own publicly-trusted certificate, making
   remux fully VPN-agnostic (today Tailscale is only "special" because

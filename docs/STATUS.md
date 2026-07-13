@@ -13,6 +13,15 @@ control-mode arc is done and deployed.
   `https://georges-macbook-air.shrew-fort.ts.net:7777` (Tailscale cert).
 - It runs the devcontainer image + the debug binary from the bind-mounted repo;
   `docker restart remux-mobile` after a `cargo build` picks up new code.
+- ⚠️ **Deploy hazard (bitten 2026-07-13):** the container execs
+  `target/debug/remux` from the bind mount, and a *host* (macOS) `cargo
+  build`/`test` overwrites it with a Mach-O binary → the container
+  crash-loops with exit 126. Rebuild the Linux binary with
+  `docker run --rm -v $PWD:/workspaces/remux <devcontainer-image> bash -c
+  'cd /workspaces/remux && CARGO_TARGET_DIR=target-linux cargo build && cp
+  target-linux/debug/remux target/debug/remux'` and the restart policy
+  self-heals. Durable fix worth doing: recreate the container to exec from
+  `target-linux/debug/remux` so host and container builds never collide.
 - Mint a pairing link: `docker exec remux-mobile /workspaces/remux/target/debug/remux pair`.
 
 ## Done (this arc)

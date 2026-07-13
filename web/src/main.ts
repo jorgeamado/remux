@@ -130,6 +130,11 @@ function setRole(controller: boolean): void {
   isController = controller;
   renderBanner();
   menuBtn.hidden = false;
+  // Hide the tmux status line only while we drive the size (controller); as an
+  // observer tmux's status isn't on our bottom row, so clipping would misfire.
+  // The window tabs make the status line redundant anyway.
+  handle.setHideStatusRow(controller);
+  maybeAutoZoom(); // a split active window auto-zooms once we can drive it
 }
 
 /// The control row: a role chip on the left, the takeover button on the right.
@@ -277,6 +282,7 @@ interface WindowTopo {
   index: number;
   active: boolean;
   panes: number;
+  zoomed: boolean;
   name: string;
 }
 interface SessionTopo {
@@ -324,6 +330,7 @@ function handleControl(msg: ControlMsg): void {
     case "topology":
       topology = msg.sessions ?? [];
       renderTabs();
+      maybeAutoZoom();
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
@@ -470,6 +477,21 @@ tmuxBtn.addEventListener("click", (ev) => {
 // ---------- window tabs (live from topology) ----------
 
 const windowTabs = $("window-tabs");
+
+// Small screens shouldn't render tmux split geometry — it's unusable at phone
+// size. Instead we auto-zoom the active pane so a split window shows as a
+// single full pane; "Next pane" cycles between them (each stays zoomed). Only
+// on coarse-pointer (touch) devices, and only while we drive the window.
+const smallScreen = matchMedia("(pointer: coarse)").matches;
+
+function maybeAutoZoom(): void {
+  if (!smallScreen || !isController) return;
+  const sess = topology.find((s) => s.name === sessionTitle);
+  const active = sess?.windows.find((w) => w.active);
+  if (active && active.panes > 1 && !active.zoomed) {
+    sendJson({ type: "window_action", action: "zoom_pane" });
+  }
+}
 
 /// Render the current session's windows as tappable tabs, active highlighted.
 /// Driven purely by the topology stream — no polling.

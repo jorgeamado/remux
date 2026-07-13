@@ -342,6 +342,8 @@ button {
 #termbox {
   position: absolute;
   inset: 8px;
+  /* Clip the extra tmux-status row that setHideStatusRow renders below. */
+  overflow: hidden;
 }
 
 /* Never let iOS text auto-sizing rescale terminal glyphs after xterm has

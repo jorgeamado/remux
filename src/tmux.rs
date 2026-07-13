@@ -246,6 +246,9 @@ pub struct WindowInfo {
     pub index: u32,
     pub active: bool,
     pub panes: u32,
+    /// The active pane is zoomed (fills the window). On phones we auto-zoom
+    /// split windows so no split geometry is rendered on a small screen.
+    pub zoomed: bool,
     pub name: String,
 }
 
@@ -257,7 +260,7 @@ pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
         "-t",
         &format!("={session}"),
         "-F",
-        "#{window_index} #{window_active} #{window_panes} #{window_name}",
+        "#{window_index} #{window_active} #{window_panes} #{window_zoomed_flag} #{window_name}",
     ]);
     let Ok(out) = run(cmd) else {
         return Ok(Vec::new());
@@ -265,14 +268,15 @@ pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
     Ok(out.lines().filter_map(parse_window_line).collect())
 }
 
-/// `<index> <active> <panes> <name (may contain spaces)>` — numerics first,
-/// so the name is simply the remainder.
+/// `<index> <active> <panes> <zoomed> <name (may contain spaces)>` — numerics
+/// first, so the name is simply the remainder.
 fn parse_window_line(line: &str) -> Option<WindowInfo> {
-    let mut f = line.splitn(4, ' ');
+    let mut f = line.splitn(5, ' ');
     Some(WindowInfo {
         index: f.next()?.parse().ok()?,
         active: f.next()? == "1",
         panes: f.next()?.parse().ok()?,
+        zoomed: f.next()? == "1",
         name: sanitize(f.next().unwrap_or("")),
     })
 }
@@ -340,7 +344,18 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
             cmd.args(["split-window", "-v", "-t", &format!("{target}:")]);
         }
         "next_pane" => {
+            // Pure pane cycling — NO zoom here: this path affects every
+            // client, and desktop controllers must keep their split layout.
+            // Small screens re-zoom client-side (maybeAutoZoom) via zoom_pane
+            // after the topology update.
             cmd.args(["select-pane", "-t", &format!("{target}:.+")]);
+        }
+        // Ensure the active pane fills the window (phones auto-zoom splits so
+        // they never render split geometry on a small screen). Idempotent, and
+        // only ever sent by small-screen clients.
+        "zoom_pane" => {
+            ensure_zoom(session)?;
+            return Ok(());
         }
         "select_window" => {
             let i = index.context("select_window requires an index")?;
@@ -349,6 +364,29 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
         other => bail!("unknown window action {other:?}"),
     }
     run(cmd)?;
+    Ok(())
+}
+
+/// Zoom the active pane if the current window is split and not already zoomed.
+/// `resize-pane -Z` toggles, so we check the flag first to stay idempotent.
+fn ensure_zoom(session: &str) -> Result<()> {
+    let mut q = tmux();
+    q.args([
+        "display-message",
+        "-p",
+        "-t",
+        &format!("={session}:"),
+        "#{window_zoomed_flag} #{window_panes}",
+    ]);
+    let out = run(q)?;
+    let mut f = out.split_whitespace();
+    let zoomed = f.next() == Some("1");
+    let panes: u32 = f.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if !zoomed && panes > 1 {
+        let mut cmd = tmux();
+        cmd.args(["resize-pane", "-Z", "-t", &format!("={session}:")]);
+        run(cmd)?;
+    }
     Ok(())
 }
 
@@ -425,16 +463,21 @@ mod tests {
 
     #[test]
     fn window_line_parsing() {
+        // index active panes zoomed name(may have spaces)
         assert_eq!(
-            parse_window_line("2 1 3 my window"),
+            parse_window_line("2 1 3 1 my window"),
             Some(WindowInfo {
                 index: 2,
                 active: true,
                 panes: 3,
+                zoomed: true,
                 name: "my window".into(),
             })
         );
-        assert!(!parse_window_line("0 0 1 bash").unwrap().active);
+        let w = parse_window_line("0 0 1 0 bash").unwrap();
+        assert!(!w.active);
+        assert!(!w.zoomed);
+        assert_eq!(w.panes, 1);
         assert_eq!(parse_window_line("garbage"), None);
     }
 

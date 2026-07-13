@@ -10,6 +10,11 @@ export interface TermHandle {
   onResize: (cb: (cols: number, rows: number) => void) => void;
   size: () => { cols: number; rows: number };
   setFontSize: (px: number) => void;
+  /// Hide the tmux status line: render one extra row (which tmux draws the
+  /// status on) and let #termbox clip it. Only meaningful while this client
+  /// drives the window size (controller); as an observer tmux's status isn't
+  /// on our bottom row, so the caller passes false.
+  setHideStatusRow: (hide: boolean) => void;
   /// Sizing diagnostics — surfaced in the UI to debug device-specific grids.
   debug: () => string;
   /// Allow/forbid typing straight into the terminal. When off, taps never
@@ -73,11 +78,20 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
     notifyTimer = window.setTimeout(() => resizeCb?.(cols, rows), 120);
   });
 
+  // When true, report one extra row to tmux so it draws its status line on a
+  // row that #termbox (overflow:hidden) clips out of view.
+  let hideStatusRow = false;
+
   const fit = () => {
     try {
-      fitAddon.fit();
+      fitAddon.fit(); // sizes the grid to the visible box (N rows)
     } catch {
-      /* container not laid out yet */
+      return; /* container not laid out yet */
+    }
+    if (hideStatusRow && term.rows > 1) {
+      // The +1 row falls below the box and is clipped; tmux puts its status
+      // line there. term.resize does not touch the box, so no observer loop.
+      term.resize(term.cols, term.rows + 1);
     }
   };
 
@@ -148,6 +162,10 @@ export function createTerminal(container: HTMLElement, fontSize = 14): TermHandl
     },
     setFontSize: (px) => {
       term.options.fontSize = px;
+      fit();
+    },
+    setHideStatusRow: (hide) => {
+      hideStatusRow = hide;
       fit();
     },
     setDirectInput: (enabled) => {

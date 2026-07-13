@@ -260,6 +260,35 @@ async fn full_terminal_flow_over_tmux() {
     }
     assert!(split, "split_v did not create a second pane");
 
+    // zoom_pane makes the split window show a single full pane (phones auto-
+    // zoom so no split geometry renders). Idempotent.
+    for _ in 0..2 {
+        ws.send(WsMsg::text(
+            serde_json::json!({"type": "window_action", "action": "zoom_pane"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut zoomed = false;
+        for _ in 0..50 {
+            let z = tmux_sock(
+                &sock,
+                &[
+                    "display-message",
+                    "-t",
+                    session,
+                    "-p",
+                    "#{window_zoomed_flag}",
+                ],
+            );
+            if z == "1" {
+                zoomed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(zoomed, "zoom_pane did not zoom the split window");
+    }
+
     ws.send(WsMsg::text(
         serde_json::json!({"type": "window_action", "action": "select_window", "index": 0})
             .to_string(),

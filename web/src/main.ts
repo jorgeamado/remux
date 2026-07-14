@@ -887,7 +887,13 @@ composerInput.addEventListener("keydown", (ev) => {
 /// Step back through composer history into the (editable) field. The ▴
 /// button wraps from oldest to newest — one button must never dead-end.
 function composerHistoryPrev(wrap: boolean): void {
-  if (cmdHistory.length === 0) return;
+  if (cmdHistory.length === 0) {
+    // Silence reads as "broken" — say why there's nothing to recall.
+    const prev = composerInput.placeholder;
+    composerInput.placeholder = "history is empty — send a command from here first";
+    window.setTimeout(() => (composerInput.placeholder = prev), 2500);
+    return;
+  }
   if (historyIdx === null) {
     historyIdx = cmdHistory.length - 1;
   } else if (historyIdx === 0) {

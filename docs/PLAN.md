@@ -343,12 +343,15 @@ a real gap.
 
 ## PWA input backlog (reported from daily use)
 
-- **Tab key** (2026-07-14): no way to send Tab from the phone — needed for
-  shell completion. Make the on-screen key panel's Tab actionable for the
-  terminal input field.
-- **Ctrl+letter broken** (2026-07-14): the ⌃ modifier + letter combos do
-  not reach the terminal. Diagnose whether the keypanel modifier state or
-  the iOS keyboard event path drops them.
+- ~~**Tab key**~~ / ~~**Ctrl+letter**~~ — DONE 2026-07-14 (`66db6ca`),
+  plus composer-first routing for punctuation/cursor/paste and the ▴
+  composer-history button (`a0f5819`).
+- **Shell-history mirroring** (2026-07-14, wants M4c): key-row ↑ recalls
+  the shell's previous command in the terminal, but the phone can't edit
+  it there and the client can't lift it into the composer — it only sees
+  pixels, with no prompt/command boundary. Once OSC 133 marks command
+  spans (M4c), mirror the recalled shell line into the editable composer.
+  This was the user's instinctive expectation of ↑.
 
 ## Cross-cutting
 

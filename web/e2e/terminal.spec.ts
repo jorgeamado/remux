@@ -11,7 +11,12 @@ import { fileURLToPath } from "node:url";
 const PORT = 7900 + Math.floor(Math.random() * 100);
 const BASE = `http://127.0.0.1:${PORT}`;
 const SOCK = `remux-e2e-${process.pid}`;
-const BIN = join(dirname(fileURLToPath(import.meta.url)), "../../target/debug/remux");
+// Overridable because target/debug/remux is sometimes the *Linux* binary:
+// the remux-mobile container execs it from the bind mount, so deploys copy
+// a cross-build there (see docs/STATUS.md "deploy hazard").
+const BIN =
+  process.env.REMUX_BIN ??
+  join(dirname(fileURLToPath(import.meta.url)), "../../target/debug/remux");
 
 let daemon: ChildProcess;
 let pairToken: string;

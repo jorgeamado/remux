@@ -765,8 +765,20 @@ async function pasteFromClipboard(): Promise<void> {
     text = window.prompt("Paste text to send:") ?? "";
   }
   if (text) {
-    // Goes through xterm so bracketed paste is applied when the app wants it.
-    handle.term.paste(text);
+    // Single-line paste while composing lands in the field — you see what
+    // you pasted before it can run. "Composing" = field focused or holding
+    // a draft (tapping the menu's paste button blurs the field first).
+    // Multi-line paste keeps going through xterm so bracketed paste
+    // applies; a text input would silently flatten the newlines.
+    const composing = composerFocused() || composerInput.value !== "";
+    if (composing && !text.includes("\n") && !text.includes("\r")) {
+      insertIntoComposer(text);
+      // Routed here on a stale draft alone? Focus the field so it's
+      // visible where the paste went instead of a silent surprise.
+      composerInput.focus();
+    } else {
+      handle.term.paste(text);
+    }
   }
   menu.hidden = true;
 }
@@ -1010,11 +1022,57 @@ applyDebug();
 (window as unknown as { __topology?: () => SessionTopo[] }).__topology = () =>
   topology;
 
-// Key-row Tab completes the composer draft when there is one; every other
-// key goes straight to the terminal as before.
+function composerFocused(): boolean {
+  return document.activeElement === composerInput;
+}
+
+/// Insert at the field's cursor, preserving selection semantics.
+function insertIntoComposer(text: string): void {
+  const value = composerInput.value;
+  const s = composerInput.selectionStart ?? value.length;
+  const e = composerInput.selectionEnd ?? value.length;
+  composerInput.value = value.slice(0, s) + text + value.slice(e);
+  const pos = s + text.length;
+  composerInput.setSelectionRange(pos, pos);
+}
+
+function moveComposerCursor(target: "left" | "right" | "home" | "end"): void {
+  const len = composerInput.value.length;
+  const s = composerInput.selectionStart ?? 0;
+  const e = composerInput.selectionEnd ?? s;
+  let next: number;
+  if (target === "home") {
+    next = 0;
+  } else if (target === "end") {
+    next = len;
+  } else if (s !== e) {
+    // A selected range collapses to its edge, like native cursor keys.
+    next = target === "left" ? s : e;
+  } else {
+    next = Math.max(0, Math.min(len, s + (target === "left" ? -1 : 1)));
+  }
+  composerInput.setSelectionRange(next, next);
+}
+
+/// Key-row keys that act on the composer while it's focused: punctuation
+/// inserts into the draft (that's why those keys exist — iOS buries them),
+/// and cursor keys edit the draft when there is one. Arrows on an empty
+/// field still reach the terminal — TUIs need them.
+const COMPOSER_INSERT = new Set(["-", "|", "/", "~"]);
+const COMPOSER_CURSOR: Record<string, "left" | "right" | "home" | "end"> = {
+  "\x1b[D": "left",
+  "\x1b[C": "right",
+  "\x1b[H": "home",
+  "\x1b[F": "end",
+};
+
 setupKeyRow((data) => {
   if (data === "\t" && composerInput.value) {
     composerTabComplete();
+  } else if (composerFocused() && COMPOSER_INSERT.has(data)) {
+    insertIntoComposer(data);
+  } else if (composerFocused() && composerInput.value && COMPOSER_CURSOR[data]) {
+    moveComposerCursor(COMPOSER_CURSOR[data]);
   } else {
     sendInput(data);
   }

@@ -67,6 +67,18 @@ const setup = $("setup");
 const setupError = $("setup-error");
 const composer = $("composer");
 const composerInput = $<HTMLInputElement>("composer-input");
+const composerPlaceholder = composerInput.placeholder;
+let placeholderTimer: number | undefined;
+/// Briefly show a hint in the composer placeholder, then restore it. A single
+/// managed timer, so rapid repeats can't leave the hint stuck.
+function flashPlaceholder(msg: string): void {
+  composerInput.placeholder = msg;
+  if (placeholderTimer !== undefined) window.clearTimeout(placeholderTimer);
+  placeholderTimer = window.setTimeout(() => {
+    composerInput.placeholder = composerPlaceholder;
+    placeholderTimer = undefined;
+  }, 2500);
+}
 
 const encoder = new TextEncoder();
 
@@ -1233,17 +1245,24 @@ composerInput.addEventListener("keydown", (ev) => {
     composerHistoryPrev(false);
   } else if (ev.key === "ArrowDown" && recallIdx !== null) {
     ev.preventDefault();
-    recallIdx = recallIdx <= 0 ? null : recallIdx - 1;
-    if (recallIdx === null) {
-      composerInput.value = "";
-      composerFromFeed = false;
-    } else {
-      const val = recallSnapshot[recallIdx] ?? "";
-      composerFromFeed = feedCommandSet().has(val);
-      composerInput.value = val;
-    }
+    composerHistoryNext();
   }
 });
+
+/// Step forward (toward newer) through the frozen recall snapshot; reaching the
+/// newest end clears the field. No-op when not currently recalling.
+function composerHistoryNext(): void {
+  if (recallIdx === null) return;
+  recallIdx = recallIdx <= 0 ? null : recallIdx - 1;
+  if (recallIdx === null) {
+    composerInput.value = "";
+    composerFromFeed = false;
+  } else {
+    const val = recallSnapshot[recallIdx] ?? "";
+    composerFromFeed = feedCommandSet().has(val);
+    composerInput.value = val;
+  }
+}
 
 // Manually clearing the field drops feed provenance, so a fresh command typed
 // from scratch persists normally.
@@ -1260,9 +1279,7 @@ function composerHistoryPrev(wrap: boolean): void {
     recallSnapshot = recallList();
     if (recallSnapshot.length === 0) {
       // Silence reads as "broken" — say why there's nothing to recall.
-      const prev = composerInput.placeholder;
-      composerInput.placeholder = "no command history yet for this session";
-      window.setTimeout(() => (composerInput.placeholder = prev), 2500);
+      flashPlaceholder("no command history yet for this session");
       return;
     }
     recallIdx = 0; // newest
@@ -1444,9 +1461,29 @@ const COMPOSER_CURSOR: Record<string, "left" | "right" | "home" | "end"> = {
   "\x1b[F": "end",
 };
 
+/// Should the key-row ↑/↓ drive the composer's history recall, or pass through
+/// to the terminal? Recall only when the M4c feed says the session is idle at a
+/// prompt (its newest command has finished). While a command/tool is running
+/// (newest entry "running") — or when there's no feed signal at all (no hook,
+/// or nothing has run yet) — the arrows pass straight through, so vim/htop/less
+/// always receive them. This uses the feed, which the shell hooks update in
+/// ~real time, rather than tmux's pane_current_command, which is NOT refreshed
+/// when the foreground process changes (so it would be stale and could hijack a
+/// tool's arrows — the one thing we must never do).
+function keyRowArrowsRecall(): boolean {
+  if (feedCommands.length === 0) return false; // no signal → safe: terminal
+  return feedCommands[feedCommands.length - 1].state !== "running";
+}
+
 setupKeyRow((data) => {
   if (data === "\t" && composerInput.value) {
     composerTabComplete();
+  } else if ((data === "\x1b[A" || data === "\x1b[B") && keyRowArrowsRecall()) {
+    // At a shell prompt, ↑/↓ recall the session's commands into the editable
+    // composer (what "up" is expected to do on the phone). A running command or
+    // tool makes this false, so the arrows pass through to the terminal.
+    if (data === "\x1b[A") composerHistoryPrev(false);
+    else composerHistoryNext();
   } else if (composerFocused() && COMPOSER_INSERT.has(data)) {
     insertIntoComposer(data);
   } else if (composerFocused() && composerInput.value && COMPOSER_CURSOR[data]) {

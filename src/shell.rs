@@ -162,14 +162,19 @@ fn process(app: &App, bytes: &[u8]) {
             let Ok(session) = crate::ingest::sessions_of_pane(app, &ev.pane) else {
                 return; // unknown or ambiguous pane
             };
-            app.feed.start(
+            // start() returns Some when a finish had raced ahead of it — run the
+            // same finish handling so a failed command whose finish arrived
+            // first still resets the detector and notifies.
+            if let Some(fin) = app.feed.start(
                 &session,
                 &ev.pane,
                 &ev.shell_id,
                 ev.command_id,
                 &ev.command,
                 &ev.cwd,
-            );
+            ) {
+                on_finished(app, fin);
+            }
         }
         "command_finished" => {
             let Ok(ev) = serde_json::from_str::<FinishEvent>(line) else {
@@ -179,11 +184,56 @@ fn process(app: &App, bytes: &[u8]) {
                 return;
             }
             // The match carries the session; pane isn't needed on finish.
-            // Attention on notable finishes is M4c increment 2 — for now the
-            // feed just records the transition.
-            let _ = app.feed.finish(&ev.shell_id, ev.command_id, ev.exit);
+            if let Some(fin) = app.feed.finish(&ev.shell_id, ev.command_id, ev.exit) {
+                on_finished(app, fin);
+            }
         }
         _ => {}
+    }
+}
+
+/// React to a matched command finish (whether it arrived in order, or as a
+/// finish that raced ahead of its start and was applied when the start landed).
+fn on_finished(app: &App, fin: crate::feed::Finished) {
+    // Every matched finish consumes this session's busy→quiet epoch so the
+    // heuristic doesn't also fire for the same command.
+    let _ = app.detector_reset.send(fin.session.clone());
+    // Notable finishes (a failure, or a long-running command) raise a precise
+    // attention. Secrets-safe by construction: the text is built ONLY from exit
+    // + duration + session — never the command, which the service worker would
+    // render on the lock screen.
+    if fin.exit != 0 || fin.elapsed_ms >= LONG_MS {
+        let _ = app.attention.send(crate::Attention {
+            session: fin.session,
+            kind: "command_finished".into(),
+            reason: Some(notable_reason(fin.exit, fin.elapsed_ms)),
+            source: Some("shell".into()),
+        });
+    }
+}
+
+/// A command finish is worth a notification if it failed or ran at least this
+/// long (a quick success is silent).
+const LONG_MS: u64 = 30_000;
+
+/// Secrets-safe notification text: exit + duration only, never the command.
+fn notable_reason(exit: i32, elapsed_ms: u64) -> String {
+    let dur = human_duration(elapsed_ms);
+    if exit != 0 {
+        format!("failed ({exit}) after {dur}")
+    } else {
+        format!("took {dur}")
+    }
+}
+
+fn human_duration(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
     }
 }
 
@@ -230,6 +280,21 @@ mod tests {
         assert!(!sane_id("has space", 64));
         assert!(!sane_id("semi;colon", 64));
         assert!(!sane_id(&"a".repeat(65), 64));
+    }
+
+    #[test]
+    fn notable_reason_never_contains_a_command() {
+        // Only exit + duration; a failing command and a long success.
+        assert_eq!(notable_reason(101, 245_000), "failed (101) after 4m");
+        assert_eq!(notable_reason(0, 45_000), "took 45s");
+        assert_eq!(notable_reason(1, 7_400_000), "failed (1) after 2h3m");
+    }
+
+    #[test]
+    fn human_duration_buckets() {
+        assert_eq!(human_duration(5_000), "5s");
+        assert_eq!(human_duration(90_000), "1m");
+        assert_eq!(human_duration(3_600_000), "1h0m");
     }
 
     #[test]

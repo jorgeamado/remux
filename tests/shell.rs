@@ -25,6 +25,7 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
         feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     })
 }
 
@@ -106,6 +107,131 @@ async fn command_start_then_finish_lands_in_the_session_feed() {
     })
     .await;
     assert_eq!(snap[0]["exit"], 101);
+}
+
+#[tokio::test]
+async fn failed_command_raises_secrets_safe_attention_and_resets_detector() {
+    let dir = std::env::temp_dir().join(format!("remux-shell-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "sh3");
+    app.topology.send_replace(snapshot("sh3"));
+    remux::shell::spawn(app.clone(), &dir).unwrap();
+
+    let mut attention = app.attention.subscribe();
+    let mut resets = app.detector_reset.subscribe();
+
+    // A command whose text is a "secret" — it must never reach the notification.
+    let secret = "curl -H 'authorization: Bearer SUPERSECRET' https://x";
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_started", "pane": "%1", "source": "shell",
+            "shell_id": "sh-a", "command_id": 1, "command": secret, "cwd": "/w"
+        }),
+    );
+    await_feed(&app, "sh3", |s| s.len() == 1).await;
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_finished", "source": "shell",
+            "shell_id": "sh-a", "command_id": 1, "exit": 101
+        }),
+    );
+
+    // A precise attention fires for the failure.
+    let att = tokio::time::timeout(Duration::from_secs(2), attention.recv())
+        .await
+        .expect("attention within 2s")
+        .unwrap();
+    assert_eq!(att.session, "sh3");
+    assert_eq!(att.kind, "command_finished");
+    let reason = att.reason.unwrap();
+    assert!(reason.contains("101"), "reason should carry the exit code");
+    assert!(
+        !reason.contains("SUPERSECRET") && !reason.contains("curl"),
+        "the command must never appear in the notification: {reason}"
+    );
+    // And the busy→quiet detector was reset for this session.
+    let reset = tokio::time::timeout(Duration::from_secs(2), resets.recv())
+        .await
+        .expect("reset within 2s")
+        .unwrap();
+    assert_eq!(reset, "sh3");
+}
+
+#[tokio::test]
+async fn finish_that_races_ahead_of_its_start_still_notifies() {
+    // The two datagrams reordered: the failed finish arrives before its start.
+    let dir = std::env::temp_dir().join(format!("remux-shell-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "sh5");
+    app.topology.send_replace(snapshot("sh5"));
+    remux::shell::spawn(app.clone(), &dir).unwrap();
+    let mut attention = app.attention.subscribe();
+
+    // Finish first (buffered), then the start applies it.
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_finished", "source": "shell",
+            "shell_id": "sh-c", "command_id": 1, "exit": 2
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_started", "pane": "%1", "source": "shell",
+            "shell_id": "sh-c", "command_id": 1, "command": "false", "cwd": "/w"
+        }),
+    );
+
+    let att = tokio::time::timeout(Duration::from_secs(2), attention.recv())
+        .await
+        .expect("attention within 2s")
+        .unwrap();
+    assert_eq!(att.kind, "command_finished");
+    assert!(att.reason.unwrap().contains('2'));
+}
+
+#[tokio::test]
+async fn quick_success_is_silent_but_still_resets() {
+    let dir = std::env::temp_dir().join(format!("remux-shell-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "sh4");
+    app.topology.send_replace(snapshot("sh4"));
+    remux::shell::spawn(app.clone(), &dir).unwrap();
+
+    let mut attention = app.attention.subscribe();
+    let mut resets = app.detector_reset.subscribe();
+
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_started", "pane": "%1", "source": "shell",
+            "shell_id": "sh-b", "command_id": 1, "command": "ls", "cwd": "/w"
+        }),
+    );
+    await_feed(&app, "sh4", |s| s.len() == 1).await;
+    send(
+        &dir,
+        serde_json::json!({
+            "v": 1, "kind": "command_finished", "source": "shell",
+            "shell_id": "sh-b", "command_id": 1, "exit": 0
+        }),
+    );
+
+    // Reset fires (every matched finish consumes the epoch)…
+    let reset = tokio::time::timeout(Duration::from_secs(2), resets.recv())
+        .await
+        .expect("reset within 2s")
+        .unwrap();
+    assert_eq!(reset, "sh4");
+    // …but no notification for a quick success.
+    assert!(
+        attention.try_recv().is_err(),
+        "a quick successful command must not notify"
+    );
 }
 
 #[tokio::test]

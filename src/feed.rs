@@ -160,7 +160,10 @@ impl Feed {
 
     /// Record a command start. Order-tolerant and idempotent:
     /// - duplicate `(shell_id, command_id)` → no-op;
-    /// - a buffered pending finish for this key → the entry lands already Done;
+    /// - a buffered pending finish for this key → the entry lands already Done,
+    ///   and the finish is **returned** so the caller can run the same
+    ///   reset/notification logic it would for an in-order finish (the finish
+    ///   raced ahead of its start);
     /// - a start whose id is below the shell's high-water mark (a delayed start
     ///   for an earlier command) is recorded Aborted, and never supersedes the
     ///   newer command;
@@ -173,12 +176,12 @@ impl Feed {
         command_id: u64,
         command: &str,
         cwd: &str,
-    ) {
-        {
+    ) -> Option<Finished> {
+        let applied = {
             let inner = &mut *self.inner.lock().unwrap();
             let key = (shell_id.to_string(), command_id);
             if inner.by_key.contains_key(&key) {
-                return; // duplicate start
+                return None; // duplicate start
             }
             let prev_max = inner.shell_max.get(shell_id).copied();
             let is_latest = prev_max.is_none_or(|m| command_id >= m);
@@ -195,15 +198,15 @@ impl Feed {
                 }
             }
 
-            let state = if let Some(exit) = inner.pending.remove(&key) {
-                State::Done {
+            // A finish that beat its start (elapsed unknown → 0).
+            let raced_finish = inner.pending.remove(&key);
+            let state = match raced_finish {
+                Some(exit) => State::Done {
                     exit,
                     elapsed_ms: 0,
-                } // finish beat the start; elapsed unknown
-            } else if is_latest {
-                State::Running
-            } else {
-                State::Aborted // a newer command already started
+                },
+                None if is_latest => State::Running,
+                None => State::Aborted, // a newer command already started
             };
 
             let id = inner.next_id;
@@ -232,8 +235,14 @@ impl Feed {
             if self.enforce_bounds(inner, session) {
                 inner.reindex();
             }
-        }
+            raced_finish.map(|exit| Finished {
+                session: session.to_string(),
+                exit,
+                elapsed_ms: 0,
+            })
+        };
         let _ = self.events.send(());
+        applied
     }
 
     /// Record a command finish, paired by `(shell_id, command_id)`. A finish

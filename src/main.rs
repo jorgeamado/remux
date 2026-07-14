@@ -269,6 +269,7 @@ async fn main() -> Result<()> {
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
         feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
 
     if !app.args.no_pair {

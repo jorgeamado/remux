@@ -93,8 +93,39 @@ pub fn spawn(app: Arc<App>) {
 async fn monitor(app: Arc<App>, cfg: Config) {
     let mut detectors: std::collections::HashMap<String, Detector> =
         std::collections::HashMap::new();
+    // A precise `command_finished` (M4c) resets a session's detector so the
+    // busy→quiet heuristic doesn't *also* fire for the same command. Dropping
+    // the detector re-baselines it on the next sample. NB: the detector is
+    // per-session, so this suppresses the whole session's busy epoch, not just
+    // the finishing pane — an accepted coarseness of the existing heuristic.
+    let mut resets = app.detector_reset.subscribe();
+    // Guard against a misconfigured zero poll (interval panics on zero); Delay
+    // matches the old sleep-loop cadence (no back-to-back catch-up ticks).
+    let mut ticker = tokio::time::interval(cfg.poll.max(Duration::from_millis(1)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::time::sleep(cfg.poll).await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            r = resets.recv() => {
+                if matches!(r, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    break; // shutting down
+                }
+                // Otherwise fall through to the drain below (which handles this
+                // reset and any others) before the next observe.
+            }
+        }
+        // Drain ALL pending resets before observing, so a reset that arrived
+        // (or raced) since the last observe is applied first — this is what
+        // actually prevents the precise event and the heuristic double-firing.
+        loop {
+            match resets.try_recv() {
+                Ok(session) => {
+                    detectors.remove(&session);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break, // Empty or Closed — stop draining
+            }
+        }
         let sessions = tokio::task::spawn_blocking(tmux::sessions_activity).await;
         let Ok(Ok(sessions)) = sessions else {
             continue; // tmux briefly unavailable

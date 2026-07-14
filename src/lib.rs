@@ -238,6 +238,11 @@ pub struct App {
     pub perms: permit::Registry,
     /// Per-session shell command feed (M4c), fed by the shell datagram socket.
     pub feed: feed::Feed,
+    /// Session names whose busy→quiet detector should reset — sent when a
+    /// precise `command_finished` arrives (M4c), so the heuristic doesn't
+    /// *also* fire "went quiet" for the same command. Consumed by the
+    /// attention monitor.
+    pub detector_reset: tokio::sync::broadcast::Sender<String>,
 }
 
 /// Select the process-wide rustls crypto provider. Both axum-server and

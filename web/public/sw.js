@@ -53,18 +53,30 @@ function idbTokenClear() {
   }
 }
 
-async function attentionBody() {
-  const token = await idbToken();
-  if (!token) return null;
-  const resp = await fetch("/api/attention", {
-    headers: { authorization: `Bearer ${token}` },
-  });
+async function authedJson(path, token) {
+  const resp = await fetch(path, { headers: { authorization: `Bearer ${token}` } });
   if (resp.status === 401) {
     idbTokenClear(); // revoked/re-paired elsewhere: stop sending it
     return null;
   }
-  if (!resp.ok) return null;
-  const { details } = await resp.json();
+  return resp.ok ? resp.json() : null;
+}
+
+// A pending permission request outranks a busy→quiet attention: it's blocking
+// an agent. Never carries the command (secrets stay off the lock screen) —
+// only the agent and session, enough to decide whether to open the app.
+async function permissionBody(token) {
+  const body = await authedJson("/api/permissions", token);
+  const cards = body && body.cards;
+  if (!Array.isArray(cards) || cards.length === 0) return null;
+  const c = cards[0];
+  const more = cards.length > 1 ? ` (+${cards.length - 1} more)` : "";
+  return `${c.source || "an agent"} needs permission in ${c.session}${more}`.slice(0, 180);
+}
+
+async function attentionBody(token) {
+  const body = await authedJson("/api/attention", token);
+  const details = body && body.details;
   if (!Array.isArray(details) || details.length === 0) return null;
   const d = details[0]; // freshest first, per the API
   const what = d.source
@@ -74,6 +86,18 @@ async function attentionBody() {
   return `${d.session} — ${what}${more}`.slice(0, 180);
 }
 
+async function notificationBody() {
+  const token = await idbToken();
+  if (!token) return null;
+  // Concurrent, not sequential: a slow /api/permissions must not eat the 8s
+  // budget that /api/attention needs on a cold tailnet wake. Prefer permission.
+  const [perm, att] = await Promise.all([
+    permissionBody(token).catch(() => null),
+    attentionBody(token).catch(() => null),
+  ]);
+  return perm || att;
+}
+
 self.addEventListener("push", (event) => {
   // A stalled fetch/IndexedDB must never starve showNotification — iOS
   // revokes push permission for pushes that surface nothing. Hard deadline,
@@ -81,7 +105,7 @@ self.addEventListener("push", (event) => {
   // needs a few seconds to wake before /api/attention is reachable.
   const deadline = new Promise((resolve) => setTimeout(() => resolve(null), 8000));
   event.waitUntil(
-    Promise.race([attentionBody().catch(() => null), deadline]).then((body) =>
+    Promise.race([notificationBody().catch(() => null), deadline]).then((body) =>
       self.registration.showNotification("remux", {
         body: body || "A session may need your attention",
         tag: "remux-attention",

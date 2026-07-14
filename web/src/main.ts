@@ -281,6 +281,7 @@ function connect(): void {
     controlBanner.hidden = true;
     windowTabs.hidden = true;
     paneTabs.hidden = true;
+    clearPermissionCards();
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -343,6 +344,20 @@ interface ControlMsg {
   kind?: string;
   reason?: string;
   source?: string;
+  /** permission_cards frames (M4b) */
+  cards?: PermissionCard[];
+}
+
+/** An open agent permission request (M4b). Mirrors the daemon's Card::view. */
+interface PermissionCard {
+  id: string;
+  session: string;
+  pane: string;
+  source: string;
+  tool: string;
+  summary: string;
+  prompt_id?: string;
+  remaining_secs: number;
 }
 
 // Latest tmux topology (M3a). M3b renders it as tabs/breadcrumb; for now it's
@@ -381,6 +396,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "attention":
       onAttention(msg.source, msg.reason);
+      break;
+    case "permission_cards":
+      renderPermissionCards(msg.cards ?? []);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -592,6 +610,135 @@ function renderPaneTabs(): void {
     paneTabs.appendChild(tab);
   }
   paneTabs.hidden = false;
+}
+
+// ---------- M4b permission cards ----------
+
+const permissionCards = $("permission-cards");
+// Latest cards from the WS reconcile, plus the wall-clock we received them, so
+// the countdown keeps ticking between frames without trusting a stale value.
+let permCards: PermissionCard[] = [];
+let permReceivedAt = 0;
+// Ids currently being decided — disables the buttons so a double-tap can't
+// fire two POSTs (the second would 404, but the flicker is confusing).
+const permDeciding = new Set<string>();
+let permTicker: number | undefined;
+
+function renderPermissionCards(cards: PermissionCard[]): void {
+  // Each WS frame is a full reconcile: replace the model and re-baseline the
+  // countdown to now (the frame carries fresh remaining_secs).
+  permCards = cards;
+  permReceivedAt = performance.now();
+  if (cards.length > 0 && permTicker === undefined) {
+    permTicker = window.setInterval(paintPermissionCards, 1000);
+  }
+  paintPermissionCards(); // may stop the ticker if nothing is live
+}
+
+function clearPermissionCards(): void {
+  renderPermissionCards([]);
+}
+
+/// (Re)paint from the current model. Called on each frame and each tick.
+/// Prunes cards that have run out locally (the daemon's empty frame usually
+/// arrives moments later, but the UI must not wait on it) and stops the ticker
+/// once nothing is live.
+function paintPermissionCards(): void {
+  const elapsed = Math.floor((performance.now() - permReceivedAt) / 1000);
+  const live = permCards.filter((c) => c.remaining_secs - elapsed > 0);
+  permCards = live;
+  permissionCards.textContent = "";
+  for (const card of live) {
+    permissionCards.appendChild(permCardEl(card, card.remaining_secs - elapsed));
+  }
+  permissionCards.hidden = live.length === 0;
+  if (live.length === 0 && permTicker !== undefined) {
+    window.clearInterval(permTicker);
+    permTicker = undefined;
+  }
+}
+
+function permCardEl(card: PermissionCard, left: number): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "perm-card";
+
+  const head = document.createElement("div");
+  head.className = "perm-head";
+  const title = document.createElement("span");
+  title.className = "perm-title";
+  // source is the agent, tool is what it wants to run.
+  title.textContent = `${card.source} · ${card.tool}`;
+  const countdown = document.createElement("span");
+  countdown.className = "perm-countdown";
+  countdown.textContent = `${left}s`;
+  head.append(title, countdown);
+
+  const summary = document.createElement("div");
+  summary.className = "perm-summary";
+  summary.textContent = card.summary || "(no detail)";
+
+  const actions = document.createElement("div");
+  actions.className = "perm-actions";
+  const deciding = permDeciding.has(card.id);
+  const approve = document.createElement("button");
+  approve.className = "btn perm-approve";
+  approve.textContent = "Approve";
+  approve.disabled = deciding;
+  approve.addEventListener("click", () => void decidePermission(card, "allow"));
+  const deny = document.createElement("button");
+  deny.className = "btn perm-deny";
+  deny.textContent = "Deny";
+  deny.disabled = deciding;
+  deny.addEventListener("click", () => void decidePermission(card, "deny"));
+  actions.append(approve, deny);
+
+  el.append(head, summary, actions);
+
+  if (card.session !== sessionTitle) {
+    const note = document.createElement("div");
+    note.className = "perm-note";
+    note.textContent = `in session ${card.session}`;
+    el.append(note);
+  }
+  return el;
+}
+
+async function decidePermission(card: PermissionCard, decision: "allow" | "deny"): Promise<void> {
+  if (permDeciding.has(card.id)) return;
+  permDeciding.add(card.id);
+  paintPermissionCards();
+  try {
+    const resp = await fetch(`/api/permissions/${encodeURIComponent(card.id)}/decide`, {
+      method: "POST",
+      headers: { ...authHeader(), "content-type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
+    // Drop the card locally only on a terminal outcome (decided, or the daemon
+    // says it's gone). On an unexpected failure keep it: the WS reconcile is
+    // the source of truth and will repair, and the buttons re-enable.
+    const terminal = resp.ok || [409, 410, 404, 403].includes(resp.status);
+    if (terminal) {
+      permCards = permCards.filter((c) => c.id !== card.id);
+      paintPermissionCards();
+    }
+    if (resp.ok) {
+      showHint(decision === "allow" ? "Approved" : "Denied");
+    } else if (resp.status === 409) {
+      showHint("Too late — the request was already answered");
+    } else if (resp.status === 410) {
+      showHint("That request expired");
+    } else if (resp.status === 404) {
+      showHint("That request is no longer pending");
+    } else if (resp.status === 403) {
+      showHint("This device can't approve — grant it on the host");
+    } else {
+      showHint("Could not send the decision — try again");
+    }
+  } catch {
+    showHint("Could not reach the daemon");
+  } finally {
+    permDeciding.delete(card.id);
+  }
 }
 
 // ---------- attention notifications ----------

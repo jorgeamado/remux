@@ -49,6 +49,18 @@ pub enum Cmd {
         #[arg(long, default_value = "test notification — it works!")]
         message: String,
     },
+    /// Test the M4b approval flow end to end: open a real permission card for
+    /// this pane's session and block until you Approve/Deny it from the phone
+    /// (or it expires ~100s). Needs this device granted `approve`
+    /// (`remux devices grant-approve <id>`) and the PWA open.
+    TestPermission {
+        /// Tool name shown on the card.
+        #[arg(long, default_value = "Bash")]
+        tool: String,
+        /// One-line summary shown on the card (stand-in for a command).
+        #[arg(long, default_value = "echo hello from remux   # test approval")]
+        summary: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

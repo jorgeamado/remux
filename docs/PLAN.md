@@ -412,8 +412,14 @@ would change the fallback from "ask on Mac" to "hard block".
    bypass the busy→quiet throttle. Codex-reviewed (0 blockers, 4 major, 1
    minor — all fixed). Tests: registry hints, http auth/visibility/validation/
    delivery.
-3. PWA card UI (notification → post-auth fetch → Approve/Deny; disabled
-   past deadline via a returned remaining-TTL). Non-approve = no details.
+3. **DONE (2026-07-14).** PWA `permission_cards` handler → Approve/Deny card
+   with a live countdown (prunes locally on expiry; retains on unexpected
+   POST failure so the WS reconcile repairs; double-tap-guarded; textContent
+   only, no HTML sink). SW prefers a "needs permission in <session>"
+   notification (agent+session, never the command), fetched concurrently with
+   attention under the 8s deadline. `remux test-permission` opens a real card
+   and blocks so the whole path is exercisable without a Claude Code hook.
+   Codex-reviewed (0 blockers, 2 major, 2 minor — all fixed).
 4. On-device integration test.
 
 Acceptance: locked phone → generic notification → open → card shows tool +

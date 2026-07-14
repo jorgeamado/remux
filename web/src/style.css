@@ -502,3 +502,78 @@ button {
 [hidden] {
   display: none !important;
 }
+
+/* ---------- M4b permission cards ---------- */
+#permission-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.perm-card {
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.perm-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.perm-title {
+  color: var(--accent-fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.perm-countdown {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.perm-summary {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--input);
+  border-radius: 6px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.perm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.perm-actions .btn {
+  flex: 1;
+  padding: 9px;
+  font-size: 14px;
+}
+
+.perm-approve {
+  background: var(--ok);
+  color: #04140a;
+  font-weight: 600;
+}
+
+.perm-deny {
+  background: var(--danger);
+  color: #1a0505;
+  font-weight: 600;
+}
+
+.perm-note {
+  color: var(--muted);
+  font-size: 12px;
+}

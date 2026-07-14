@@ -117,6 +117,37 @@ async fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Cmd::TestPermission { tool, summary } => {
+            let pane = std::env::var("TMUX_PANE")
+                .context("run this inside the remux-served tmux session")?;
+            println!(
+                "Opening a permission card for this session — Approve or Deny it \
+                 on your phone (expires in ~100s)…"
+            );
+            let v = ingest::request_wait(
+                &state_dir,
+                serde_json::json!({
+                    "v": 1, "kind": "agent_permission", "pane": pane,
+                    "source": "test", "tool": tool, "summary": summary,
+                }),
+            )?;
+            match v["decision"]
+                .as_str()
+                .filter(|_| v["ok"] == serde_json::json!(true))
+            {
+                Some(d) => {
+                    println!("decision: {d}");
+                    return Ok(());
+                }
+                // Report failure through the error path (stderr, non-zero) so a
+                // smoke test doesn't read "no decision" as success.
+                _ => anyhow::bail!(
+                    "no decision ({}) — did you approve in time, and is this device \
+                     granted approve? (remux devices grant-approve <id>)",
+                    v["error"].as_str().unwrap_or("unknown")
+                ),
+            }
+        }
         Cmd::Emit { cmd } => match cmd {
             EmitCmd::NeedsInput {
                 pane,

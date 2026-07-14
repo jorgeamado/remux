@@ -82,9 +82,34 @@ OSC 133 prompt/command boundaries). Field notes: "direct typing" is a
 deliberate off-by-default phone setting (aA menu), and a hard reload
 resets it + wipes composer history — both read as bugs until explained.
 
-Next: **M4b approval decisions** (day 1: the ~90s blocking
-PermissionRequest-hook empirical test — needs Claude Code installed in
-the container or a daemon serving a host tmux; user hasn't chosen).
+**M4b day-1 gate PASSED (2026-07-14).** Ran the blocking
+PermissionRequest-hook test against live Claude Code v2.1.197 (isolated
+tmux, scratch project, hook sleeps 90s then returns allow). Confirmed:
+the hook blocks and its decision is honored; hook death → the Mac dialog
+stays live and never auto-decides; and — the load-bearing one — when the
+user answers the Mac dialog *while the hook blocks*, Claude **SIGTERMs the
+hook** and honors the Mac, never accepting hook output afterward. See
+`docs/spikes/M4.0-protocol.md` "Empirical check" + "Mac-vs-hook race".
+Consequence baked into the plan: the held ingest connection must watch for
+socket EOF (= "Mac already answered") alongside the decision + expiry.
+
+**M4b detailed design reviewed by Codex (2026-07-14): 6 blockers, 7 major,
+minors — all folded into PLAN.md §M4b before any code.** Key corrections:
+same-uid is already trusted (the phone is remote auth, not a local-attacker
+boundary); capability checked by current device id at decision time (not a
+captured clone); permission cards need their own broadcast+registry
+(App.connections holds counts, not senders) with reconcile-on-subscribe;
+held waits get their own small cap (never the shared 16-slot ingest pool);
+generic lock-screen text only (command fetched post-auth); HTTP POST is the
+canonical decision op. Next: build increment 1 (ingest lifecycle refactor
++ registry + resolver + emit permission --wait + Device.approve).
+
+Note on where Claude Code runs: the day-1 test needed no container decision
+(ran on the host). For real use the hook's `remux emit` must reach the
+daemon's ingest socket, so Claude Code runs wherever the daemon's tmux is —
+today that's the container. Deferred to integration (increment 4); doesn't
+block increments 1–3.
+
 Housekeeping owed: 6 stale iPhone device rows to revoke (user go-ahead
 needed); local e2e assumes a "$" prompt (fails under the user's zsh
 theme, fine in CI); v0.1.0 publish + brew tap still user-only.

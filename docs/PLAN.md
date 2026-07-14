@@ -301,16 +301,113 @@ still get busy→quiet.
 
 ### M4b — approval decisions (medium)
 
-The headline. Pending-request registry (one-shot ids, expiry, atomic
-consume), card payload over the WS + fetched on deep link, Approve/Deny
-in the PWA, decision returned to the blocked hook as Claude Code's
-documented decision JSON. Requires the `approve` device capability (off by
-default), and revocation cancels pending cards (extends the M2 cascade).
+The headline: approve/deny Claude Code's permission prompts from the
+locked phone. `remux emit permission --wait` (the hook) blocks on the
+ingest socket; the daemon holds a pending card until a phone decision or
+expiry; the decision is returned to the hook as Claude Code's documented
+decision JSON. Empirically de-risked (spike + Codex plan review,
+2026-07-14) — the design below reflects both.
 
-Acceptance: locked phone → notification → card shows tool + command →
-Approve → Claude proceeds; Deny → Claude declines; expired/duplicate
-decisions rejected; a device without `approve` sees the card read-only;
-revoking a device kills its pending cards.
+**Threat model (corrected — Codex blocker 1).** Same-uid is *already
+fully trusted*: the admin socket lets any same-uid process pair a device
+and (M4b) grant it `approve`, and it can run commands directly anyway. So
+M4b is **not** a defense against local same-uid code — the phone is
+remote authorization + a second human in the loop, not a privilege
+boundary against the host. What M4b *does* guarantee: a card carries no
+authority (opening one only makes a prompt appear); only a paired,
+`approve`-capable device resolves it; and no failure path ever fabricates
+a decision. Do not claim more than that in code or docs.
+
+**The Mac-vs-hook race is settled (spike Q6).** Claude shows its own
+dialog concurrently while the hook blocks; answering the Mac dialog
+**SIGTERMs the hook** and honors the Mac — Claude never accepts hook
+output afterward. So there's no conflicting-decision hazard, but it makes
+one thing a hard requirement, not cleanup: the held ingest connection
+**must monitor its socket for EOF/reset concurrently** with the decision
+channel and the expiry timer. A broken wait = "the Mac already answered"
+→ drop the card; no phone decision may resolve it after. (Codex blocker
+5; timeout-only cleanup is insufficient.)
+
+**Ingest lifecycle refactor (Codex blocker 6).** The current 5s timeout
+wraps all of `handle()` before the line is even read. Split into: bounded
+admission/read/parse (keeps the 5s budget + a short pre-parse cap) →
+kind dispatch → either the short ack path (today's behavior) or a
+separately-bounded held-wait path (up to CARD_TTL). Held permission waits
+get their **own small cap** (~4–8 global, 1–2 per pane), never the shared
+16-slot ingest pool — else 16 prompts starve all shell events (Codex
+major 1, Q1). Excess → immediate reject → hook falls back to the Mac.
+
+**Registry + resolver.** `App.pending_permissions` (its own type; keyed by
+a daemon-minted ≥128-bit id, *not* 48-bit — Codex minor; correlate with
+Claude's `prompt_id` for dedup so a retry can't double-card — Q5). One
+`resolve(id, decision, device_id)` operation does everything under the
+registry mutex **without awaiting**: check not-expired, check the device's
+*current* `approve` capability by id (not a captured `Device` clone — a
+socket authed before a grant/revoke must see the change; Codex blocker 2),
+remove exactly one entry, then send on its `oneshot` (sync send, so no
+mutex held across `.await` — Codex major 2). A failed send = "waiter gone"
+→ report "request gone", never success. Aborting the ingest future must
+not orphan the map entry (guard/RAII on the registry slot).
+
+**Delivery (Codex blocker 3).** Add a dedicated permission broadcast
+channel (App.connections holds counts, not senders — can't fan frames
+today). But broadcast is a **hint only**: every eligible socket reconciles
+against a registry snapshot on (a) connect/subscribe and (b) `Lagged`.
+Subscribe *before* the connection is marked push-suppression-eligible, or
+the setup-race drops the card on both surfaces (Codex blocker 3 / major 7).
+Decision transport: an authenticated **HTTP POST is the canonical decision
+op** (Q3 — approving shouldn't require a full PTY WebSocket); the WS frame
+invokes the same `resolve`. Card *details* (tool, command) are
+`approve`-only on **both** WS and HTTP (Codex major 6 — visibility is
+privileged since commands leak secrets); ids never ride push payloads or
+URLs (fetched post-auth, as attention does).
+
+**Secrets / notification hygiene (Codex major 3).** Permission attention
+must **not** reuse the 600s `/api/attention` retention (cards expire at
+CARD_TTL≈100s — a tap would point at a dead card) and must **not** put the
+command/path in `Attention.reason` (the service worker prints it on the
+lock screen). Lock-screen text stays generic ("Claude Code needs
+permission in remux:main"); the command is fetched only after the PWA
+opens and authenticates. Resolve/expire correlates the attention away.
+
+**Capability plumbing.** `Device.approve: bool` (`#[serde(default)]`, off;
+compatible with existing devices.json). `remux devices grant-approve <id>`
+/ `revoke-approve <id>`, host-CLI-only, persisted-then-return with
+rollback on write failure (like `revoke`). Decision-time check is always
+by current id state. Revoking a device or its capability drops *its* right
+to resolve, but does **not** cancel cards it doesn't own (Q4) — other
+approvers may still act; if none remain, cards expire to the Mac.
+
+**Install snippet is part of the boundary (Codex major 5).** The hook is a
+one-liner that pipes Claude's stdin JSON straight into `remux emit
+permission --wait` (structured parse inside the CLI — no fragile shell
+arg extraction); the CLI reads `$TMUX_PANE` from its own env, prints
+*only* Claude's exact decision JSON on stdout (diagnostics to stderr),
+exits non-zero on any failure → Mac dialog. `timeout: 120` in the hook
+config, CARD_TTL≈100s comfortably under it. Document that
+PermissionRequest doesn't fire in `-p` mode and that swapping in PreToolUse
+would change the fallback from "ask on Mac" to "hard block".
+
+**Build increments** (each: tests + Codex review + commit):
+1. Ingest lifecycle refactor + registry + `resolve` + held-wait path with
+   EOF monitoring + `emit permission --wait` + `Device.approve` +
+   grant/revoke CLI. Tested via a **test-only resolver**, not a shipped
+   host approve-bypass command (Codex minor). Update all `App` test
+   constructors for the new fields.
+2. Broadcast channel + reconcile-on-subscribe + HTTP decide/list endpoints
+   (approve-gated) + WS card frame + generic permission attention with its
+   own retention. Delivery tests: setup race, backgrounded live socket,
+   socket on another session, non-approve socket.
+3. PWA card UI (notification → post-auth fetch → Approve/Deny; disabled
+   past deadline via a returned remaining-TTL). Non-approve = no details.
+4. On-device integration test.
+
+Acceptance: locked phone → generic notification → open → card shows tool +
+command (approve-capable only) with a live countdown → Approve → Claude
+proceeds; Deny → Claude declines; answering on the Mac instead kills the
+card cleanly; expired/duplicate/already-resolved decisions rejected
+distinctly; a non-approve device sees neither details nor buttons;
+granting/revoking `approve` takes effect on already-connected sockets.
 
 ### M4c — shell command events + metadata cards (medium)
 

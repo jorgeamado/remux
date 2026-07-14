@@ -41,8 +41,12 @@ idbTokenWrite(localStorage.getItem(TOKEN_KEY));
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
-const HISTORY_KEY = "remux.history";
 const TERMKB_KEY = "remux.termkb";
+// Purge any typed-command history persisted by older builds — command lines can
+// contain secrets and must never live on disk. History is memory-only now.
+for (const k of Object.keys(localStorage)) {
+  if (k.startsWith("remux.history")) localStorage.removeItem(k);
+}
 // Font size is effectively the tmux resolution: smaller font = more cols/rows.
 // Default to a compact grid; A-/A+ tune it, down to a still-legible floor.
 const FONT_MIN = 7;
@@ -385,6 +389,9 @@ interface PermissionCard {
   source: string;
   tool: string;
   summary: string;
+  // The summary is only a prefix of the real input — the phone must not offer a
+  // remote Allow it can't fully see. Deny stays available.
+  truncated?: boolean;
   prompt_id?: string;
   remaining_secs: number;
 }
@@ -424,7 +431,7 @@ function handleControl(msg: ControlMsg): void {
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
-      onAttention(msg.source, msg.reason);
+      onAttention();
       break;
     case "permission_cards":
       renderPermissionCards(msg.cards ?? []);
@@ -711,7 +718,8 @@ function permCardEl(card: PermissionCard, left: number): HTMLElement {
 
   const summary = document.createElement("div");
   summary.className = "perm-summary";
-  summary.textContent = card.summary || "(no detail)";
+  // A truncated summary is only a prefix — mark it visibly with an ellipsis.
+  summary.textContent = (card.summary || "(no detail)") + (card.truncated ? " …" : "");
 
   const actions = document.createElement("div");
   actions.className = "perm-actions";
@@ -719,7 +727,11 @@ function permCardEl(card: PermissionCard, left: number): HTMLElement {
   const approve = document.createElement("button");
   approve.className = "btn perm-approve";
   approve.textContent = "Approve";
-  approve.disabled = deciding;
+  // When the input was too long to show in full, the phone must not Allow it —
+  // a hidden suffix could be destructive. Disable Approve only; Deny is always
+  // safe, and the host (which sees the whole command) can still approve.
+  approve.disabled = deciding || !!card.truncated;
+  if (card.truncated) approve.title = "Full command not shown — approve on the host";
   approve.addEventListener("click", () => void decidePermission(card, "allow"));
   const deny = document.createElement("button");
   deny.className = "btn perm-deny";
@@ -728,7 +740,14 @@ function permCardEl(card: PermissionCard, left: number): HTMLElement {
   deny.addEventListener("click", () => void decidePermission(card, "deny"));
   actions.append(approve, deny);
 
-  el.append(head, summary, actions);
+  el.append(head, summary);
+  if (card.truncated) {
+    const warn = document.createElement("div");
+    warn.className = "perm-warn";
+    warn.textContent = "⚠ too long to show in full — approve on the host";
+    el.append(warn);
+  }
+  el.append(actions);
 
   if (card.session !== sessionTitle) {
     const note = document.createElement("div");
@@ -767,6 +786,10 @@ async function decidePermission(card: PermissionCard, decision: "allow" | "deny"
       showHint("That request is no longer pending");
     } else if (resp.status === 403) {
       showHint("This device can't approve — grant it on the host");
+    } else if (resp.status === 422) {
+      // Truncated card: server refused a remote Allow. Card stays open (Deny
+      // still works), so this is deliberately not terminal.
+      showHint("Full command not shown — approve on the host");
     } else {
       showHint("Could not send the decision — try again");
     }
@@ -774,6 +797,9 @@ async function decidePermission(card: PermissionCard, decision: "allow" | "deny"
     showHint("Could not reach the daemon");
   } finally {
     permDeciding.delete(card.id);
+    // Repaint so buttons re-enable on a non-terminal outcome (e.g. a 422 that
+    // leaves the card open); terminal outcomes already dropped the card.
+    paintPermissionCards();
   }
 }
 
@@ -1017,7 +1043,7 @@ async function checkPendingAttention(): Promise<void> {
   }
 }
 
-function onAttention(source?: string, reason?: string): void {
+function onAttention(): void {
   if (document.visibilityState === "visible") {
     return;
   }
@@ -1025,13 +1051,12 @@ function onAttention(source?: string, reason?: string): void {
   if (!notifyPref || !("Notification" in window) || Notification.permission !== "granted") {
     return;
   }
-  // Hook-fed events know who wants what ("claude-code: permission prompt");
-  // the heuristic can only say "may need your attention".
-  const what = source
-    ? `${source}: ${reason || "needs input"}`
-    : "may need your attention";
+  // This fires only while backgrounded, so it lands on the lock screen — build
+  // the body from a fixed template + our own session label ONLY, never the
+  // producer-supplied source/reason (they can carry secrets). Full detail is
+  // shown in-app after the user opens it. Matches sw.js.
   const opts: NotificationOptions = {
-    body: `${sessionTitle || "session"} — ${what}`,
+    body: `${sessionTitle || "session"} — needs your attention`,
     tag: "remux-attention", // replaces, never stacks
     icon: "/icon-512.png",
   };
@@ -1121,36 +1146,33 @@ renderNotifyBtn();
 const HISTORY_MAX = 50;
 // Composer recall (↑ / ▴) draws from this session's real command history: the
 // feed (every command run in the session, from the Mac or the phone) plus
-// commands typed from the composer. Only the *typed* ones are persisted, and
-// per session; feed-derived commands stay in memory (M4c) — they can contain
-// secrets and aren't ours to write to localStorage.
+// commands typed from the composer. ALL of it is memory-only, per session:
+// command lines can contain secrets, so — like the feed — typed history is
+// never written to localStorage/disk. It is intentionally cleared on reload.
 // Recall is anchored to a snapshot frozen when it starts, so a feed frame
 // arriving mid-recall can't shift the positional index under the user.
 let recallIdx: number | null = null; // index into recallSnapshot; 0 = newest
 let recallSnapshot: string[] = [];
-// True while the composer holds a value that originated from the feed (or an
-// edit of one) — such commands are never persisted to localStorage, since the
-// feed can contain secrets and is memory-only by design.
+// Kept only to avoid double-storing feed commands (already in `feedCommands`)
+// into the typed-history buffer; persistence provenance no longer matters now
+// that nothing is persisted.
 let composerFromFeed = false;
+
+// Per-session typed-command history, MEMORY ONLY (see above). session -> lines.
+const typedHistoryMem = new Map<string, string[]>();
 
 function typedHistory(): string[] {
   if (!sessionTitle) return [];
-  try {
-    const v = JSON.parse(localStorage.getItem(HISTORY_KEY + ":" + sessionTitle) ?? "[]");
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
+  return typedHistoryMem.get(sessionTitle) ?? [];
 }
 
-/// Persist a *typed* command for this session. Never called for feed-derived
-/// text (secrets) and never before a session identity exists.
+/// Record a *typed* command for this session, in memory only. Skips
+/// feed-derived text (already recallable via the feed) and the no-session case.
 function recordTyped(cmd: string): void {
   if (!sessionTitle || composerFromFeed) return;
   const h = typedHistory();
   if (h[h.length - 1] === cmd) return;
-  const next = [...h, cmd].slice(-HISTORY_MAX);
-  localStorage.setItem(HISTORY_KEY + ":" + sessionTitle, JSON.stringify(next));
+  typedHistoryMem.set(sessionTitle, [...h, cmd].slice(-HISTORY_MAX));
 }
 
 function feedCommandSet(): Set<string> {

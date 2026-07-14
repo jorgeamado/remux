@@ -33,6 +33,14 @@ const PENDING_MAX: usize = 512;
 const AGE: Duration = Duration::from_secs(12 * 3600);
 /// A still-"running" entry older than this is marked aborted.
 const STALE_RUNNING: Duration = Duration::from_secs(6 * 3600);
+/// Forget a shell's high-water mark after this long without a new command. It
+/// only guards against a *delayed lower-id start* (a reorder window of
+/// milliseconds), so aging it out with the entries it protects is safe — and it
+/// stops a churn of short-lived shells from leaking the map forever.
+const SHELL_TTL: Duration = AGE;
+/// Backstop cap on tracked shells, in case a burst mints many within one TTL
+/// window: drop the least-recently-seen down to this.
+const SHELL_MAX_ENTRIES: usize = 4096;
 const MAX_COMMAND_BYTES: usize = 512;
 const MAX_CWD_BYTES: usize = 256;
 
@@ -96,8 +104,10 @@ struct Inner {
     next_id: u64,
     /// (shell_id, command_id) -> index into `cmds`.
     by_key: HashMap<(String, u64), usize>,
-    /// shell_id -> highest command_id seen (survives eviction of the entry).
-    shell_max: HashMap<String, u64>,
+    /// shell_id -> (highest command_id seen, last-seen instant). Survives
+    /// eviction of the entry, but is itself GC'd by [`Feed::sweep`] once the
+    /// shell has been idle past `SHELL_TTL` (else it would leak per shell_id).
+    shell_max: HashMap<String, (u64, Instant)>,
     /// Finishes that arrived before their start: (shell_id, command_id) -> exit.
     pending: HashMap<(String, u64), i32>,
 }
@@ -183,7 +193,7 @@ impl Feed {
             if inner.by_key.contains_key(&key) {
                 return None; // duplicate start
             }
-            let prev_max = inner.shell_max.get(shell_id).copied();
+            let prev_max = inner.shell_max.get(shell_id).map(|(m, _)| *m);
             let is_latest = prev_max.is_none_or(|m| command_id >= m);
 
             // Newest start ends any still-running predecessor on this shell.
@@ -229,8 +239,11 @@ impl Feed {
             inner
                 .shell_max
                 .entry(shell_id.to_string())
-                .and_modify(|m| *m = (*m).max(command_id))
-                .or_insert(command_id);
+                .and_modify(|(m, seen)| {
+                    *m = (*m).max(command_id);
+                    *seen = now;
+                })
+                .or_insert((command_id, now));
 
             if self.enforce_bounds(inner, session) {
                 inner.reindex();
@@ -348,6 +361,36 @@ impl Feed {
                 inner.pending.clear();
                 mutated = true;
             }
+            // GC per-shell high-water marks for shells idle past the TTL, then
+            // hard-cap by least-recently-seen. Purely internal bookkeeping — it
+            // touches neither `cmds` nor `by_key`, so it needs no reindex and no
+            // client hint (it changes nothing the UI can see).
+            inner
+                .shell_max
+                .retain(|_, (_, seen)| now.saturating_duration_since(*seen) <= SHELL_TTL);
+            if inner.shell_max.len() > SHELL_MAX_ENTRIES {
+                let drop_n = inner.shell_max.len() - SHELL_MAX_ENTRIES;
+                // Only cap-prune ORPHANED marks — ones no retained command still
+                // references. Pruning a live shell's mark could let a delayed
+                // lower-id start look "latest" and abort its running command
+                // (Codex). If orphans are too few to reach the cap, we leave the
+                // rest: live marks are already bounded by GLOBAL_MAX commands.
+                let orphans: Vec<String> = {
+                    let live: std::collections::HashSet<&str> =
+                        inner.cmds.iter().map(|c| c.shell_id.as_str()).collect();
+                    let mut o: Vec<(&String, Instant)> = inner
+                        .shell_max
+                        .iter()
+                        .filter(|(k, _)| !live.contains(k.as_str()))
+                        .map(|(k, (_, seen))| (k, *seen))
+                        .collect();
+                    o.sort_by_key(|(_, seen)| *seen);
+                    o.into_iter().take(drop_n).map(|(k, _)| k.clone()).collect()
+                };
+                for k in orphans {
+                    inner.shell_max.remove(&k);
+                }
+            }
             if mutated {
                 inner.reindex();
             }
@@ -403,6 +446,21 @@ impl Feed {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().cmds.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn shell_count(&self) -> usize {
+        self.inner.lock().unwrap().shell_max.len()
+    }
+
+    /// Test-only: force every shell's high-water mark to look ancient so a
+    /// following `sweep()` GCs it — exercises the TTL path without a 12h wait.
+    #[cfg(test)]
+    pub fn age_shell_marks(&self) {
+        let old = Instant::now() - (SHELL_TTL + Duration::from_secs(1));
+        for (_, seen) in self.inner.lock().unwrap().shell_max.values_mut() {
+            *seen = old;
+        }
     }
 }
 
@@ -511,6 +569,25 @@ mod tests {
         // Stored (not just the view) is capped at SESSION_MAX.
         assert!(f.len() <= SESSION_MAX);
         assert_eq!(f.snapshot("s").len(), f.len());
+    }
+
+    #[test]
+    fn sweep_gcs_idle_shell_high_water_marks() {
+        let f = Feed::default();
+        // Many short-lived shells, each one command — the classic churn leak.
+        for s in 0..50u64 {
+            let sh = format!("sh{s}");
+            f.start("s", "%1", &sh, 1, "ls", "/w");
+            f.finish(&sh, 1, 0);
+        }
+        assert_eq!(f.shell_count(), 50);
+        // A sweep now keeps them (freshly seen)...
+        f.sweep();
+        assert_eq!(f.shell_count(), 50);
+        // ...but once idle past SHELL_TTL, a sweep forgets them.
+        f.age_shell_marks();
+        f.sweep();
+        assert_eq!(f.shell_count(), 0);
     }
 
     #[test]

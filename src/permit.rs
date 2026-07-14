@@ -70,6 +70,11 @@ pub struct Card {
     pub source: String,
     pub tool: String,
     pub summary: String,
+    /// The `summary` is only a prefix of the real tool input (it was too long to
+    /// show in full). The phone must then refuse a remote Allow — approving a
+    /// command whose destructive suffix you never saw defeats the whole point of
+    /// the second-human check. Deny stays allowed.
+    pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
     /// Not serialized: delivery adds a remaining-TTL in increment 2 instead of
@@ -96,6 +101,7 @@ impl Card {
             "source": self.source,
             "tool": self.tool,
             "summary": self.summary,
+            "truncated": self.truncated,
             "prompt_id": self.prompt_id,
             "remaining_secs": self.remaining().as_secs(),
         })
@@ -119,6 +125,12 @@ pub enum ResolveError {
     /// Present and live, but the deciding device is not (or no longer)
     /// `approve`-capable. The card is left open for a device that is.
     Forbidden,
+    /// An `Allow` on a card whose input was truncated — the decider can't have
+    /// seen the whole command, so a remote Allow is refused (a hidden suffix
+    /// could be destructive). The card is left open: Deny still works, and the
+    /// host, which sees the full command, can approve. Server-side backstop for
+    /// the client that already disables the button.
+    Truncated,
 }
 
 pub struct Registry {
@@ -228,6 +240,13 @@ impl Registry {
                 Err(ResolveError::Expired)
             } else if !authorized() {
                 return Err(ResolveError::Forbidden); // card left open, nothing changed
+            } else if matches!(decision, Decision::Allow)
+                && map.get(id).is_some_and(|e| e.card.truncated)
+            {
+                // Refuse a remote Allow you couldn't fully see; leave it open so
+                // Deny / host-approve still work. Checked under the lock, so it
+                // can't race the decision through.
+                return Err(ResolveError::Truncated);
             } else {
                 let entry = map.remove(id).expect("present under the same lock");
                 let (conf_tx, conf_rx) = oneshot::channel();
@@ -299,6 +318,7 @@ mod tests {
             source: "claude-code".into(),
             tool: "Bash".into(),
             summary: "touch x".into(),
+            truncated: false,
             prompt_id: None,
             created: now,
             deadline: now + CARD_TTL,
@@ -333,6 +353,23 @@ mod tests {
         // Card is left open for a device that is capable.
         assert_eq!(reg.len(), 1);
         assert!(reg.resolve("a", Decision::Allow, || true).is_ok());
+    }
+
+    #[test]
+    fn truncated_card_refuses_allow_but_allows_deny() {
+        let reg = Registry::default();
+        let mut c = card("a", "%1");
+        c.truncated = true;
+        let _rx = reg.insert(c).unwrap();
+        // A remote Allow is refused and the card is left open...
+        assert_eq!(
+            reg.resolve("a", Decision::Allow, || true).err(),
+            Some(ResolveError::Truncated)
+        );
+        assert_eq!(reg.len(), 1);
+        // ...but Deny still resolves it.
+        assert!(reg.resolve("a", Decision::Deny, || true).is_ok());
+        assert_eq!(reg.len(), 0);
     }
 
     #[tokio::test]

@@ -63,15 +63,18 @@ async function authedJson(path, token) {
 }
 
 // A pending permission request outranks a busy→quiet attention: it's blocking
-// an agent. Never carries the command (secrets stay off the lock screen) —
-// only the agent and session, enough to decide whether to open the app.
+// an agent. Lock-screen text is built ONLY from daemon/user-controlled values:
+// a fixed template plus the session name (the user's own tmux label). Producer/
+// hook-supplied strings (source, reason/message) are deliberately NOT shown —
+// a hook could put a secret in them, and the lock screen is visible unlocked.
+// Fuller detail (agent, tool) is shown in-app after auth.
 async function permissionBody(token) {
   const body = await authedJson("/api/permissions", token);
   const cards = body && body.cards;
   if (!Array.isArray(cards) || cards.length === 0) return null;
   const c = cards[0];
   const more = cards.length > 1 ? ` (+${cards.length - 1} more)` : "";
-  return `${c.source || "an agent"} needs permission in ${c.session}${more}`.slice(0, 180);
+  return `An agent needs permission in ${c.session}${more}`.slice(0, 180);
 }
 
 async function attentionBody(token) {
@@ -79,11 +82,9 @@ async function attentionBody(token) {
   const details = body && body.details;
   if (!Array.isArray(details) || details.length === 0) return null;
   const d = details[0]; // freshest first, per the API
-  const what = d.source
-    ? `${d.source}: ${d.reason || "needs input"}`
-    : "may need your attention";
+  // Session name only — never d.source / d.reason (producer-supplied).
   const more = details.length > 1 ? ` (+${details.length - 1} more)` : "";
-  return `${d.session} — ${what}${more}`.slice(0, 180);
+  return `${d.session} — needs your attention${more}`.slice(0, 180);
 }
 
 async function notificationBody() {

@@ -288,6 +288,7 @@ fn a_card(id: &str, session: &str) -> remux::permit::Card {
         source: "claude-code".into(),
         tool: "Bash".into(),
         summary: "touch x".into(),
+        truncated: false,
         prompt_id: None,
         created: now,
         deadline: now + remux::permit::CARD_TTL,

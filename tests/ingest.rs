@@ -218,6 +218,83 @@ async fn permission_card_resolves_and_wakes_the_blocked_hook() {
 }
 
 #[tokio::test]
+async fn mid_length_summary_is_shown_in_full_not_capped() {
+    // Regression guard: an earlier double-cap (sanitize's 256) would clip a
+    // 300-char command to 256 and *still* mark it truncated:false. It must now
+    // reach the card in full, and Allow must work.
+    let dir = std::env::temp_dir().join(format!("remux-ingest-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "permM");
+    app.topology.send_replace(snapshot("permM"));
+    remux::ingest::spawn(app.clone(), &dir).unwrap();
+
+    let long = "a".repeat(300);
+    let long2 = long.clone();
+    let dir2 = dir.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        send(
+            &dir2,
+            serde_json::json!({
+                "v": 1, "kind": "agent_permission", "pane": "%1",
+                "source": "claude-code", "tool": "Bash", "summary": long2
+            }),
+        )
+    });
+
+    let snap = await_perms(&app, |s| s.len() == 1).await;
+    let card = &snap[0];
+    assert_eq!(card.summary.chars().count(), 300, "shown in full");
+    assert!(!card.truncated, "300 < MAX_SUMMARY, nothing hidden");
+    assert_eq!(card.summary, long);
+    app.perms
+        .resolve(&card.id, Decision::Allow, || true)
+        .unwrap();
+    let v = client.await.unwrap();
+    assert_eq!(v["decision"], "allow");
+}
+
+#[tokio::test]
+async fn over_long_summary_is_flagged_and_refuses_remote_allow() {
+    let dir = std::env::temp_dir().join(format!("remux-ingest-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "permT");
+    app.topology.send_replace(snapshot("permT"));
+    remux::ingest::spawn(app.clone(), &dir).unwrap();
+
+    // Over MAX_SUMMARY (2048), sent with truncated omitted → the daemon must
+    // detect the cut itself and flag it.
+    let huge = "b".repeat(2500);
+    let dir2 = dir.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        send(
+            &dir2,
+            serde_json::json!({
+                "v": 1, "kind": "agent_permission", "pane": "%1",
+                "source": "claude-code", "tool": "Bash", "summary": huge
+            }),
+        )
+    });
+
+    let snap = await_perms(&app, |s| s.len() == 1).await;
+    let card = &snap[0];
+    assert_eq!(card.summary.chars().count(), 2048, "capped to MAX_SUMMARY");
+    assert!(card.truncated, "a hidden suffix must flag the card");
+
+    // A remote Allow is refused server-side and the card stays open...
+    assert_eq!(
+        app.perms.resolve(&card.id, Decision::Allow, || true).err(),
+        Some(remux::permit::ResolveError::Truncated)
+    );
+    assert_eq!(app.perms.snapshot().len(), 1, "left open for Deny/host");
+    // ...but Deny still resolves it and wakes the blocked hook.
+    app.perms
+        .resolve(&card.id, Decision::Deny, || true)
+        .unwrap();
+    let v = client.await.unwrap();
+    assert_eq!(v["decision"], "deny");
+}
+
+#[tokio::test]
 async fn permission_card_dropped_when_the_hook_disconnects() {
     // The Mac-answered case: Claude SIGTERMs the hook, its socket closes; the
     // daemon must notice the EOF and drop the card so no late device decision

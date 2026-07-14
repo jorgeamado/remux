@@ -214,6 +214,11 @@ async fn permission_decide(
         Err(crate::permit::ResolveError::Forbidden) => {
             (StatusCode::FORBIDDEN, "approve capability required").into_response()
         }
+        Err(crate::permit::ResolveError::Truncated) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the full command was not shown — approve on the host",
+        )
+            .into_response(),
         Err(crate::permit::ResolveError::Expired) => {
             (StatusCode::GONE, "this request expired").into_response()
         }

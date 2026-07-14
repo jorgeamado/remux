@@ -90,6 +90,25 @@ pub fn spawn(app: Arc<App>) {
 /// window activity tracks content output, unlike `session_activity` which
 /// tracks client input). Events carry the session name; each websocket
 /// forwards only events for the session it is attached to.
+/// Apply every queued detector reset (each drops that session's detector so it
+/// re-baselines on the next sample). On Lagged the dropped payloads can't be
+/// reconstructed, so clear all detectors — the conservative choice: miss a
+/// suppression rather than let a stale busy epoch double-fire. Non-blocking.
+fn drain_resets(
+    resets: &mut tokio::sync::broadcast::Receiver<String>,
+    detectors: &mut std::collections::HashMap<String, Detector>,
+) {
+    loop {
+        match resets.try_recv() {
+            Ok(session) => {
+                detectors.remove(&session);
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => detectors.clear(),
+            Err(_) => break, // Empty or Closed — stop draining
+        }
+    }
+}
+
 async fn monitor(app: Arc<App>, cfg: Config) {
     let mut detectors: std::collections::HashMap<String, Detector> =
         std::collections::HashMap::new();
@@ -106,30 +125,35 @@ async fn monitor(app: Arc<App>, cfg: Config) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            r = resets.recv() => {
-                if matches!(r, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
-                    break; // shutting down
-                }
-                // Otherwise fall through to the drain below (which handles this
-                // reset and any others) before the next observe.
-            }
-        }
-        // Drain ALL pending resets before observing, so a reset that arrived
-        // (or raced) since the last observe is applied first — this is what
-        // actually prevents the precise event and the heuristic double-firing.
-        loop {
-            match resets.try_recv() {
+            r = resets.recv() => match r {
+                // The reset that *woke* us must be applied here — recv() has
+                // already consumed it, so the drain below can't see it. (This
+                // was the bug: dropping `Ok(session)` meant a lone
+                // command_finished never reset its detector, and the heuristic
+                // could still double-fire "went quiet".)
                 Ok(session) => {
                     detectors.remove(&session);
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(_) => break, // Empty or Closed — stop draining
-            }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break, // shutting down
+                // Lagged: some resets were dropped and can't be reconstructed by
+                // draining. Clear every detector so a missed reset can't leave a
+                // stale busy epoch that double-fires (each re-baselines on the
+                // next sample).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => detectors.clear(),
+            },
         }
+        // Drain any further resets queued since the wake (each removes that
+        // session's detector) before observing.
+        drain_resets(&mut resets, &mut detectors);
         let sessions = tokio::task::spawn_blocking(tmux::sessions_activity).await;
         let Ok(Ok(sessions)) = sessions else {
             continue; // tmux briefly unavailable
         };
+        // Drain AGAIN: a reset can land while the (awaited) tmux query is in
+        // flight, and it must win over the sample we're about to observe — else
+        // the heuristic could fire "went quiet" for the very command that just
+        // reset us (Codex).
+        drain_resets(&mut resets, &mut detectors);
         detectors.retain(|name, _| sessions.iter().any(|(n, _)| n == name));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

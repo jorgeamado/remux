@@ -578,6 +578,17 @@ button {
   font-size: 12px;
 }
 
+.perm-warn {
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.perm-approve:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ---------- M4c command feed ---------- */
 #command-feed-panel {
   position: absolute;

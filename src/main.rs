@@ -605,10 +605,11 @@ fn emit_permission(
     if tool.is_empty() {
         anyhow::bail!("hook payload missing tool_name");
     }
-    let summary = summarize_tool(&payload["tool_input"]);
+    let (summary, truncated) = summarize_tool(&payload["tool_input"]);
     let mut body = serde_json::json!({
         "v": 1, "kind": "agent_permission",
-        "pane": pane, "source": source, "tool": tool, "summary": summary,
+        "pane": pane, "source": source, "tool": tool,
+        "summary": summary, "truncated": truncated,
     });
     if let Some(pid) = payload["prompt_id"].as_str() {
         body["prompt_id"] = pid.into();
@@ -653,9 +654,26 @@ fn truncate_bytes(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// A one-line human summary of a tool_input for the card. Never shown on the
-/// lock screen (fetched post-auth); capped here, sanitized again daemon-side.
-fn summarize_tool(input: &serde_json::Value) -> String {
+/// Max chars of tool input shown on an approval card. Generous on purpose: the
+/// phone user must see the *whole* command they approve — a benign prefix can
+/// hide a destructive suffix — so we only clip pathological inputs. Kept under
+/// the ingest line/summary caps so a compliant value is never re-cut.
+const SUMMARY_MAX_CHARS: usize = 1500;
+
+/// A human summary of a `tool_input` for the card, plus whether it was
+/// truncated. The primary key is the security-relevant identity (the Bash
+/// `command`, the edited `file_path`, the fetched `url`, …); when none matches
+/// we fall back to the whole input object so no field is silently hidden.
+/// `truncated` means the phone did NOT see the full input and must refuse a
+/// remote Allow. Never shown on the lock screen (fetched post-auth); sanitized
+/// again daemon-side.
+fn summarize_tool(input: &serde_json::Value) -> (String, bool) {
+    let clip = |s: &str| -> (String, bool) {
+        let out: String = s.chars().take(SUMMARY_MAX_CHARS).collect();
+        // Truncated iff `take` actually dropped chars.
+        let truncated = out.chars().count() < s.chars().count();
+        (out, truncated)
+    };
     for key in [
         "command",
         "file_path",
@@ -666,11 +684,11 @@ fn summarize_tool(input: &serde_json::Value) -> String {
     ] {
         if let Some(s) = input[key].as_str() {
             if !s.is_empty() {
-                return s.chars().take(200).collect();
+                return clip(s);
             }
         }
     }
-    input.to_string().chars().take(200).collect()
+    clip(&input.to_string())
 }
 
 /// Let's Encrypt certificates live ~90 days; nudge before it bites. (The

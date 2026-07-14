@@ -31,13 +31,19 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// Cap on the bytes read from one connection; a document that large without
-/// its newline inside the cap fails parsing. Events are tiny; anything
-/// bigger is a bug or an abuse attempt.
-const MAX_LINE: u64 = 4096;
+/// its newline inside the cap fails parsing. Most events are tiny, but a
+/// permission `summary` can be ~2 KB of UTF-8 (a phone must see the whole
+/// command it approves), so this leaves comfortable headroom while still
+/// bounding abuse on a same-uid socket.
+const MAX_LINE: u64 = 16384;
 const MAX_SOURCE: usize = 32;
 const MAX_MESSAGE: usize = 256;
 const MAX_TOOL: usize = 32;
-const MAX_SUMMARY: usize = 256;
+/// A phone approving a command must see the whole thing (a benign prefix can
+/// hide a destructive suffix), so this is generous — it only clips pathological
+/// inputs, and when it does the card is flagged `truncated` and Allow is
+/// disabled. Still well under `MAX_LINE` so the event never overflows the wire.
+const MAX_SUMMARY: usize = 2048;
 const MAX_PROMPT_ID: usize = 64;
 const MAX_PANE: usize = 16;
 /// Rate limit: events *offered* per window, across all producers — charged
@@ -100,6 +106,12 @@ struct PermissionEvent {
     /// One-line human summary (command / file path). Sanitized and capped;
     /// never shown on the lock screen — fetched post-auth (secrets posture).
     summary: String,
+    /// The producer already had to truncate `summary` (the real input was
+    /// longer than it could send). The daemon ORs this with its own cap so the
+    /// card's `truncated` flag is true if *either* side cut — the phone then
+    /// won't offer Allow. Optional (older/simple producers omit it).
+    #[serde(default)]
+    truncated: bool,
     /// Claude Code's `prompt_id`, for dedup/correlation. Optional; validated.
     #[serde(default)]
     prompt_id: Option<String>,
@@ -289,7 +301,14 @@ async fn handle_permission(
     if tool.is_empty() || tool.len() > MAX_TOOL {
         return write_ack(&mut write, &json_err("bad tool")).await;
     }
-    let summary: String = sanitize(&ev.summary).chars().take(MAX_SUMMARY).collect();
+    // Cap daemon-side too, and mark truncation if *we* cut it (or the producer
+    // already did) — the card carries this so the phone can refuse a remote
+    // Allow it can't fully see. Strip control chars WITHOUT `sanitize`'s own
+    // 256-char cap first, or that cap would silently truncate below MAX_SUMMARY
+    // and leave `truncated` false (a real approval bypass — Codex).
+    let clean_summary = strip_control(&ev.summary);
+    let summary: String = clean_summary.chars().take(MAX_SUMMARY).collect();
+    let truncated = ev.truncated || summary.chars().count() < clean_summary.chars().count();
     // A present-but-malformed prompt_id is rejected, not silently dropped —
     // dropping it to None would sever dedup/correlation and turn a retry into
     // an unrelated card.
@@ -311,6 +330,7 @@ async fn handle_permission(
         source: source.clone(),
         tool: tool.clone(),
         summary,
+        truncated,
         prompt_id,
         created: now,
         deadline: now + permit::CARD_TTL,
@@ -396,12 +416,15 @@ async fn wait_for_decision(
     }
 }
 
+/// Strip control chars, no length cap. Callers that need a bound apply their
+/// own `.take(...)` and can then tell whether *they* truncated.
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Terminal-controlled text: strip control chars, cap length.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_MESSAGE)
-        .collect()
+    strip_control(s).chars().take(MAX_MESSAGE).collect()
 }
 
 pub(crate) fn valid_pane(s: &str) -> bool {

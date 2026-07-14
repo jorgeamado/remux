@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
     admin, attention, auth, host_of_url, ingest, push, server, shell, tmux, topology, App, Cli,
-    Cmd, DevicesCmd, EmitCmd,
+    Cmd, DevicesCmd, EmitCmd, SetupCmd,
 };
 use std::sync::Arc;
 
@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
                 ),
             }
         }
+        Cmd::Setup { cmd } => return setup_shell(cmd),
         Cmd::Emit { cmd } => match cmd {
             EmitCmd::NeedsInput {
                 pane,
@@ -287,6 +288,190 @@ async fn main() -> Result<()> {
     // Shell command feed (M4c): its own datagram socket + a sweeper task.
     shell::spawn(app.clone(), &state_dir)?;
     server::run(app).await
+}
+
+const SHELL_HOOK_BEGIN: &str = "# >>> remux command feed >>>";
+const SHELL_HOOK_END: &str = "# <<< remux command feed <<<";
+
+/// The zsh block installed into ~/.zshrc. Fire-and-forget (backgrounded and
+/// disowned), guarded to only run inside a remux tmux, and self-documenting so
+/// a reader of their rc file knows what it is and how to remove it.
+fn shell_hook_block() -> String {
+    format!(
+        "{SHELL_HOOK_BEGIN}
+# Reports each command's start/finish to remux for a phone command feed +
+# precise failure notifications (M4c). Informational only; command lines go to
+# your paired devices over the authed connection (never the lock screen / push)
+# and are kept in daemon memory only. Remove with: remux setup shell --uninstall
+export REMUX_CAPTURE=1
+if [[ -n $TMUX_PANE && -n $REMUX_CAPTURE ]] && command -v remux >/dev/null 2>&1; then
+  typeset -g  _REMUX_SHELL_ID=\"$$-${{RANDOM}}${{RANDOM}}\"
+  typeset -gi _REMUX_CMD_ID=0
+  _remux_preexec() {{
+    [[ -n $_REMUX_SHELL_ID ]] || return
+    _REMUX_CMD_ID=$(( _REMUX_CMD_ID + 1 ))
+    remux emit command-start --shell-id \"$_REMUX_SHELL_ID\" --command-id \"$_REMUX_CMD_ID\" --command \"$1\" --cwd \"$PWD\" &>/dev/null &!
+  }}
+  _remux_precmd() {{
+    local ec=$?
+    [[ -n $_REMUX_SHELL_ID ]] || return
+    (( _REMUX_CMD_ID > 0 )) || return
+    remux emit command-end --shell-id \"$_REMUX_SHELL_ID\" --command-id \"$_REMUX_CMD_ID\" --exit \"$ec\" &>/dev/null &!
+  }}
+  autoload -Uz add-zsh-hook
+  add-zsh-hook preexec _remux_preexec
+  add-zsh-hook precmd  _remux_precmd
+fi
+{SHELL_HOOK_END}"
+    )
+}
+
+const SHELL_HOOK_WHY: &str = "\
+remux command feed (zsh) — what this installs and why
+
+A zsh hook that tells remux when each command starts and finishes, giving you:
+  • precise lock-screen notifications — \"cargo test failed (1) after 6m\"
+    instead of the vague \"a session went quiet\";
+  • a command feed on your phone (aA -> Command feed): what ran, exit, duration;
+  • up-arrow recall in the composer of the session's real commands (including
+    ones you ran at your Mac), editable.
+
+Informational and opt-in. Command lines can hold secrets, so they go only to
+your paired devices over the authenticated connection — never the lock screen,
+never Web Push — and live in daemon memory only, never on disk.
+";
+
+/// `remux setup shell` — describe, confirm, and install/remove the zsh hook.
+/// Only edits ~/.zshrc; does not need the daemon running.
+fn setup_shell(cmd: SetupCmd) -> Result<()> {
+    use std::io::Write;
+    let SetupCmd::Shell {
+        yes,
+        uninstall,
+        print,
+    } = cmd;
+    let block = shell_hook_block();
+    if print {
+        println!("{block}");
+        return Ok(());
+    }
+    let rc = dirs::home_dir()
+        .context("no home directory")?
+        .join(".zshrc");
+    // A read error other than "missing" must NEVER lead to overwriting the
+    // file (a non-UTF-8 or transiently-unreadable rc would otherwise be
+    // clobbered with just our block).
+    let existing = match std::fs::read(&rc) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "{} is not UTF-8 — refusing to edit it. Use `remux setup shell --print` \
+                 and add the block by hand.",
+                rc.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", rc.display()));
+        }
+    };
+    let installed = existing.contains(SHELL_HOOK_BEGIN);
+
+    if uninstall {
+        if !installed {
+            println!("No remux hook found in {}.", rc.display());
+            return Ok(());
+        }
+        let stripped = strip_hook_block(&existing).context(
+            "the remux hook block in ~/.zshrc is malformed (unpaired markers) — \
+             refusing to edit it; remove it by hand",
+        )?;
+        atomic_write_rc(&rc, &stripped)?;
+        println!(
+            "Removed the remux command-feed hook from {}. Open a new shell to apply.",
+            rc.display()
+        );
+        return Ok(());
+    }
+
+    if installed {
+        println!(
+            "The remux command-feed hook is already installed in {}.",
+            rc.display()
+        );
+        return Ok(());
+    }
+
+    println!("{SHELL_HOOK_WHY}");
+    if !yes {
+        print!("Add this hook to {}? [y/N] ", rc.display());
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Skipped — nothing was changed. Run this again anytime, or see docs/shell-hooks.md.");
+            return Ok(());
+        }
+    }
+
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(&block);
+    content.push('\n');
+    atomic_write_rc(&rc, &content)?;
+    println!(
+        "Installed into {}. Open a new shell (or `source ~/.zshrc`) inside your \
+         remux tmux, then check aA -> Command feed on your phone.",
+        rc.display()
+    );
+    Ok(())
+}
+
+/// Write rc contents durably: through a temp file in the same directory + an
+/// atomic rename, so a crash or full disk can't leave a half-written rc. A
+/// symlinked rc (dotfile managers) is followed so we edit the real file rather
+/// than replacing the link; the original mode is preserved.
+fn atomic_write_rc(path: &std::path::Path, contents: &str) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().context("rc path has no parent directory")?;
+    let fname = target.file_name().context("rc path has no file name")?;
+    let tmp = dir.join(format!(".{}.remux-tmp", fname.to_string_lossy()));
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&target) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &tmp,
+            std::fs::Permissions::from_mode(meta.permissions().mode()),
+        );
+    }
+    std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
+    Ok(())
+}
+
+/// Remove the marked hook block, plus the single blank separator line we insert
+/// before it, preserving the rest of the file **byte for byte** (line endings
+/// included — no CRLF→LF normalization). Returns `None` if the markers are
+/// missing or unpaired, so the caller can refuse rather than delete too much.
+fn strip_hook_block(s: &str) -> Option<String> {
+    let begin = s.find(SHELL_HOOK_BEGIN)?;
+    let end = s[begin..].find(SHELL_HOOK_END)? + begin;
+    // Expand to whole lines: start of BEGIN's line … through END's newline.
+    let mut start = s[..begin].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let stop = s[end..].find('\n').map(|i| end + i + 1).unwrap_or(s.len());
+    // Consume one blank separator line immediately before the block, if present.
+    if start >= 1 {
+        let prev_start = s[..start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if s[prev_start..start].trim().is_empty() {
+            start = prev_start;
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..start]);
+    out.push_str(&s[stop..]);
+    Some(out)
 }
 
 /// `remux emit permission` — the blocking Claude Code PermissionRequest hook.
@@ -433,5 +618,76 @@ fn print_pairing(pair_url: &str) {
             .quiet_zone(true)
             .build();
         println!("{s}\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror setup_shell's append: ensure trailing newline, blank separator,
+    /// block, trailing newline.
+    fn install_into(original: &str) -> String {
+        let mut c = original.to_string();
+        if !c.is_empty() && !c.ends_with('\n') {
+            c.push('\n');
+        }
+        c.push('\n');
+        c.push_str(&shell_hook_block());
+        c.push('\n');
+        c
+    }
+
+    #[test]
+    fn hook_block_install_uninstall_roundtrips_exactly() {
+        // Files that already end in a newline (the normal case) — and empty —
+        // round-trip byte-for-byte.
+        for original in ["# my rc\nexport A=1\n", "", "\n"] {
+            let installed = install_into(original);
+            assert!(installed.contains(SHELL_HOOK_BEGIN));
+            assert!(installed.contains(SHELL_HOOK_END));
+            assert_eq!(
+                strip_hook_block(&installed).as_deref(),
+                Some(original),
+                "round trip failed for {original:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_normalizes_a_missing_final_newline() {
+        // A file lacking a trailing newline gains one (standard for text files,
+        // harmless); everything else is preserved. Documented, not exact.
+        let installed = install_into("no-final-newline");
+        assert_eq!(
+            strip_hook_block(&installed).as_deref(),
+            Some("no-final-newline\n")
+        );
+    }
+
+    #[test]
+    fn strip_preserves_crlf_and_surrounding_bytes() {
+        // A CRLF file with content before and after the block.
+        let original = "line1\r\nline2\r\n";
+        let installed = install_into(original);
+        // The rest of the file must not be normalized to LF.
+        assert_eq!(strip_hook_block(&installed).as_deref(), Some(original));
+    }
+
+    #[test]
+    fn strip_returns_none_when_markers_missing_or_unpaired() {
+        assert_eq!(strip_hook_block("export A=1\n"), None); // no markers
+                                                            // BEGIN but no END — must refuse (would otherwise delete to EOF).
+        let malformed = format!("keep me\n{SHELL_HOOK_BEGIN}\nrogue\n");
+        assert_eq!(strip_hook_block(&malformed), None);
+    }
+
+    #[test]
+    fn generated_hook_carries_the_opt_in_and_pane_guard() {
+        let b = shell_hook_block();
+        assert!(b.contains("export REMUX_CAPTURE=1"));
+        assert!(b.contains("[[ -n $TMUX_PANE && -n $REMUX_CAPTURE ]]"));
+        assert!(b.contains("emit command-start"));
+        assert!(b.contains("emit command-end"));
     }
 }

@@ -39,6 +39,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: EmitCmd,
     },
+    /// One-time, opt-in setup for features that need host config.
+    Setup {
+        #[command(subcommand)]
+        cmd: SetupCmd,
+    },
     /// Test the notification pipeline end to end: counts down (so you can
     /// lock the phone — pushes are suppressed while you're typing), then
     /// raises an agent_needs_input event for this pane's session.
@@ -129,6 +134,23 @@ pub enum EmitCmd {
         /// The command's exit status.
         #[arg(long)]
         exit: i32,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SetupCmd {
+    /// Install (or remove) the zsh command-feed hook in ~/.zshrc (M4c). Prints
+    /// what it does and why, and asks before writing anything (unless --yes).
+    Shell {
+        /// Install without the interactive confirmation prompt.
+        #[arg(long, conflicts_with_all = ["uninstall", "print"])]
+        yes: bool,
+        /// Remove the remux hook block from ~/.zshrc.
+        #[arg(long, conflicts_with = "print")]
+        uninstall: bool,
+        /// Print the snippet instead of touching ~/.zshrc (manual/other shells).
+        #[arg(long)]
+        print: bool,
     },
 }
 

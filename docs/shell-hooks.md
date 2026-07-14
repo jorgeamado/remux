@@ -25,7 +25,17 @@ remux is running will report commands.
 
 ## Install (zsh)
 
-Add this to `~/.zshrc`. Every call is fire-and-forget over a local datagram
+The easy way — describes what it does, asks first, and writes an idempotent,
+clearly-marked block to `~/.zshrc` (it also sets `REMUX_CAPTURE=1` for you):
+
+```
+remux setup shell
+```
+
+`remux setup shell --uninstall` removes it; `--print` just prints the snippet
+(for another shell or a manual install); `--yes` skips the prompt.
+
+Or add it by hand. Every call is fire-and-forget over a local datagram
 socket — a stopped daemon is a no-op, and the emits are backgrounded and
 disowned so nothing is ever on your prompt's critical path.
 

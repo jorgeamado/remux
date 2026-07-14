@@ -420,7 +420,9 @@ would change the fallback from "ask on Mac" to "hard block".
    attention under the 8s deadline. `remux test-permission` opens a real card
    and blocks so the whole path is exercisable without a Claude Code hook.
    Codex-reviewed (0 blockers, 2 major, 2 minor — all fixed).
-4. On-device integration test.
+4. **DONE (2026-07-14).** On-device integration test PASSED — approved a
+   real permission card from the iPhone via `remux test-permission`; the
+   blocked command received `decision: allow`. Full path proven end to end.
 
 Acceptance: locked phone → generic notification → open → card shows tool +
 command (approve-capable only) with a live countdown → Approve → Claude

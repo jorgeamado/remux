@@ -63,6 +63,19 @@ control-mode arc is done and deployed.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 
+**M4b VERIFIED ON DEVICE (2026-07-14): remote agent approvals work.**
+Approved a permission card from the iPhone (`remux test-permission` → tap
+Approve → the blocked command got `decision: allow`). All four increments
+done, Codex-reviewed, CI-green, deployed: (1) registry + ingest held-wait +
+`Device.approve`; (2) WS card frames + approve-gated HTTP decide with
+delivery confirmation; (3) PWA Approve/Deny card + SW notification +
+`test-permission`; (4) on-device test. Field notes: the phone caches the
+PWA JS hard — a full force-quit (not background) is required to load new
+code; and grant `approve` to the device whose `last seen` is freshest (the
+one the PWA is actually using). Remaining to make it real-world: publish the
+Claude Code PermissionRequest hook install snippet (docs) so an actual
+Claude Code — not just `test-permission` — opens cards.
+
 **M4a VERIFIED ON DEVICE (2026-07-14):** locked iPhone shows the named
 notification ("main — test: test notification — it works!") from a
 `remux test-attention` run. Full path proven: ingest socket → typed

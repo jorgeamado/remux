@@ -58,6 +58,33 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Cmd::TestAttention { delay, message } => {
+            let pane = std::env::var("TMUX_PANE")
+                .context("run this inside the remux-served tmux session")?;
+            println!("Lock your phone now — firing a test notification in {delay}s…");
+            let mut left = delay;
+            while left > 0 {
+                let step = left.min(5);
+                tokio::time::sleep(std::time::Duration::from_secs(step)).await;
+                left -= step;
+                if left > 0 {
+                    println!("  {left}s…");
+                }
+            }
+            let v = ingest::request(
+                &state_dir,
+                serde_json::json!({
+                    "v": 1, "kind": "agent_needs_input",
+                    "pane": pane, "source": "test", "message": message,
+                }),
+            )?;
+            println!(
+                "fired: session {} — check the lock screen (arrives within ~30s; \
+                 no notification means a client was still active on the session)",
+                v["session"].as_str().unwrap_or("?")
+            );
+            return Ok(());
+        }
         Cmd::Emit { cmd } => {
             let EmitCmd::NeedsInput {
                 pane,

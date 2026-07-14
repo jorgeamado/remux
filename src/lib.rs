@@ -36,6 +36,18 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: EmitCmd,
     },
+    /// Test the notification pipeline end to end: counts down (so you can
+    /// lock the phone — pushes are suppressed while you're typing), then
+    /// raises an agent_needs_input event for this pane's session.
+    TestAttention {
+        /// Seconds to wait before firing. Must outlast the dispatcher's
+        /// 30s keyboard grace or the event is (correctly) suppressed.
+        #[arg(long, default_value_t = 45)]
+        delay: u64,
+        /// Notification detail text.
+        #[arg(long, default_value = "test notification — it works!")]
+        message: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

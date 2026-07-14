@@ -21,9 +21,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot};
 
 /// What a held-wait receives when its card is resolved: the decision, plus a
-/// one-shot the waiter fires once it has actually written the decision back to
-/// the (live) hook socket. That fired signal is what tells the deciding device
-/// "the hook got it" — distinct from "the registry consumed the card".
+/// one-shot the waiter fires once it has written the decision back to the (live)
+/// hook socket. That fired signal reports "written to the live hook" to the
+/// deciding device — distinct from "the registry consumed the card", and short
+/// of a guaranteed end-to-end ACK (which would need the hook to reply).
 type DecisionMsg = (Decision, oneshot::Sender<()>);
 
 /// How long a card stays open. Must sit comfortably below the Claude Code
@@ -219,10 +220,10 @@ impl Registry {
     /// authorization through (Codex review). It runs only for a live,
     /// unexpired card; if it returns false the card is left open for a device
     /// that is capable, and the caller gets `Forbidden`.
-    /// On success returns the `Card` and a receiver that fires once the waiting
-    /// hook has actually received the decision (see [`DecisionMsg`]). The
+    /// On success returns the `Card` and a receiver that fires once the decision
+    /// has been written to the live hook socket (see [`DecisionMsg`]). The
     /// deciding device should await it before reporting success, so a decision
-    /// that raced a socket-close isn't reported as delivered.
+    /// that raced a socket-close isn't reported as written.
     pub fn resolve(
         &self,
         id: &str,

@@ -371,9 +371,10 @@ async fn handle_permission(
     match wait_for_decision(rx, read_half).await {
         Some((decision, confirm)) => {
             let resp = serde_json::json!({ "ok": true, "decision": decision.as_str() });
-            // The write IS the delivery. Only if it succeeds do we confirm to
-            // the deciding device that the hook actually got the decision;
-            // otherwise `confirm` drops and the device sees "not delivered".
+            // Confirm only if the write to the live socket succeeds — that's the
+            // signal the deciding device gets ("written", not a guaranteed
+            // end-to-end ACK). If the write fails, `confirm` drops and the
+            // device sees the not-delivered (409) path.
             if let Ok(Ok(())) = tokio::time::timeout(IO_TIMEOUT, write_ack(&mut write, &resp)).await
             {
                 let _ = confirm.send(());

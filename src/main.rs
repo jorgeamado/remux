@@ -55,8 +55,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 DevicesCmd::Revoke { id } => {
-                    admin::request(&state_dir, serde_json::json!({"cmd": "revoke", "id": id}))?;
+                    let v =
+                        admin::request(&state_dir, serde_json::json!({"cmd": "revoke", "id": id}))?;
                     println!("revoked");
+                    // The token is dead regardless, but a push-prune persistence
+                    // failure must not be hidden from the operator.
+                    if let Some(w) = v["warning"].as_str() {
+                        eprintln!("warning: {w}");
+                    }
                 }
                 DevicesCmd::Rename { id, name } => {
                     admin::request(

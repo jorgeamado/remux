@@ -55,6 +55,63 @@ async fn allows_same_origin() {
 }
 
 #[tokio::test]
+async fn rejects_origin_with_embedded_credentials() {
+    // The real host is evil.example.com; the allowlisted 127.0.0.1 is only
+    // userinfo. The old string-splitter read the host as 127.0.0.1 and allowed
+    // it; the url-based parse must reject.
+    let (addr, _app) = start_server("it-origin-creds").await;
+    let client = reqwest::Client::new();
+    for origin in [
+        "http://127.0.0.1:80@evil.example.com",
+        "http://127.0.0.1@evil.example.com",
+        "not-a-valid-origin",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/api/health"))
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "origin: {origin}");
+    }
+}
+
+#[tokio::test]
+async fn rejects_non_text_origin() {
+    // An Origin header that exists but isn't valid text must be rejected, not
+    // silently skipped as if absent.
+    let (addr, _app) = start_server("it-origin-bytes").await;
+    let client = reqwest::Client::new();
+    let val = reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/health"))
+        .header("Origin", val)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn api_responses_are_no_store() {
+    // Authenticated API responses can carry command summaries — keep them out of
+    // the browser HTTP cache.
+    let (addr, _app) = start_server("it-nostore").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store, private")
+    );
+}
+
+#[tokio::test]
 async fn pairing_flow() {
     let (addr, app) = start_server("it-pair").await;
     let client = reqwest::Client::new();
@@ -382,14 +439,14 @@ async fn permission_decide_gating_and_validation() {
 }
 
 #[tokio::test]
-async fn permission_decide_confirms_delivery() {
+async fn permission_decide_confirms_write() {
     let (addr, app) = start_server("it-perm-deliver").await;
     let pairing = app.auth.new_pairing_token();
     let token = app.auth.pair(&pairing, "phone").unwrap();
     let id = app.auth.devices()[0].id.clone();
     app.auth.set_approve(&id, true).unwrap();
 
-    // A stand-in for the held-wait: receive the decision and confirm delivery.
+    // A stand-in for the held-wait: receive the decision and confirm the write.
     let rx = app
         .perms
         .insert(a_card("cardD", "it-perm-deliver"))
@@ -410,7 +467,7 @@ async fn permission_decide_confirms_delivery() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["delivered"], true);
+    assert_eq!(body["written"], true);
     assert_eq!(body["session"], "it-perm-deliver");
     // Consumed.
     assert!(app.perms.snapshot().is_empty());

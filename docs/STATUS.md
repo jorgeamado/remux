@@ -93,7 +93,7 @@ Approved a permission card from the iPhone (`remux test-permission` → tap
 Approve → the blocked command got `decision: allow`). All four increments
 done, Codex-reviewed, CI-green, deployed: (1) registry + ingest held-wait +
 `Device.approve`; (2) WS card frames + approve-gated HTTP decide with
-delivery confirmation; (3) PWA Approve/Deny card + SW notification +
+write confirmation; (3) PWA Approve/Deny card + SW notification +
 `test-permission`; (4) on-device test. Field notes: the phone caches the
 PWA JS hard — a full force-quit (not background) is required to load new
 code; and grant `approve` to the device whose `last seen` is freshest (the
@@ -164,10 +164,10 @@ daemon surface (PWA UI is increment 3):
   current id, quiet until a card exists;
 - approve-gated `GET /api/permissions` (list) + `POST
   /api/permissions/{id}/decide` (canonical decision op);
-- **delivery confirmation**: `resolve` → `(Card, Receiver)`, the held-wait
+- **write confirmation**: `resolve` → `(Card, Receiver)`, the held-wait
   fires it only after a successful socket write, the decide handler awaits it
-  (8s) → `delivered:true` or 409 — so the phone is never told "approved" when
-  the hook didn't get it;
+  (8s) → `written:true` or 409 — so the phone is never told "approved" when
+  the decision wasn't written to the live hook (not a guaranteed end-to-end ACK);
 - generic wake (kind only, no command/source) pushed but not filed in the
   600s attention retention; permission pushes bypass the busy→quiet throttle.
 Codex review: 0 blockers, 4 major, 1 minor — all fixed (capability-change

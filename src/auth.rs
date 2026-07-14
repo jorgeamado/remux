@@ -173,16 +173,22 @@ impl Auth {
         Ok(())
     }
 
-    pub fn rename(&self, device_id: &str, name: &str) -> bool {
+    /// Rename a device. Like `revoke`, a rename that cannot be persisted is
+    /// rolled back and reported as an error — never claim success while the old
+    /// name would silently return on restart.
+    pub fn rename(&self, device_id: &str, name: &str) -> Result<()> {
         let inner = &mut *self.inner.lock().unwrap();
-        let Some(d) = inner.devices.iter_mut().find(|d| d.id == device_id) else {
-            return false;
+        let Some(pos) = inner.devices.iter().position(|d| d.id == device_id) else {
+            anyhow::bail!("no such device");
         };
-        d.name = name.trim().chars().take(64).collect();
+        let new_name: String = name.trim().chars().take(64).collect();
+        let old = std::mem::replace(&mut inner.devices[pos].name, new_name);
         if let Err(e) = self.persist(&inner.devices) {
+            inner.devices[pos].name = old;
             tracing::error!("failed to persist rename: {e:#}");
+            anyhow::bail!("could not persist the rename; name NOT changed");
         }
-        true
+        Ok(())
     }
 
     /// Is this device id still paired? Checked synchronously on each input
@@ -355,6 +361,44 @@ mod tests {
         // Revoking the whole device also drops the capability.
         assert!(reloaded.revoke(&id).is_ok());
         assert!(!reloaded.can_approve(&id));
+    }
+
+    #[test]
+    fn rename_persists_rolls_back_on_failure_and_reports_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = temp_auth();
+        let path = auth.path.clone();
+        let pairing = auth.new_pairing_token();
+        let _ = auth.pair(&pairing, "orig").unwrap();
+        let id = auth.devices()[0].id.clone();
+
+        // Happy path renames.
+        auth.rename(&id, "renamed").unwrap();
+        assert_eq!(auth.devices()[0].name, "renamed");
+        // Unknown device is an error, not a silent success.
+        assert!(auth.rename("nope", "x").is_err());
+
+        // A persist failure must roll back the in-memory name (the bug was
+        // returning success and leaving the doomed name to revert on restart).
+        let dir = path.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Skip the failure assertion where the process can write anyway (root).
+        let can_still_write = std::fs::write(dir.join(".probe"), b"x").is_ok();
+        let _ = std::fs::remove_file(dir.join(".probe"));
+        if !can_still_write {
+            assert!(auth.rename(&id, "should-fail").is_err());
+            assert_eq!(
+                auth.devices()[0].name,
+                "renamed",
+                "rolled back, not applied"
+            );
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // The persisted name is the last successful one.
+        drop(auth);
+        let reloaded = Auth::load(path).unwrap();
+        assert_eq!(reloaded.devices()[0].name, "renamed");
     }
 
     #[test]

@@ -183,6 +183,30 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn drain_resets_removes_sessions_and_clears_on_lag() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(4);
+        let mut detectors = std::collections::HashMap::new();
+        detectors.insert("a".to_string(), detector(1.0, 1.0));
+        detectors.insert("b".to_string(), detector(1.0, 1.0));
+
+        // A queued reset for "a" removes exactly a's detector (this is what the
+        // monitor's waking `recv()` used to drop on the floor).
+        tx.send("a".into()).unwrap();
+        drain_resets(&mut rx, &mut detectors);
+        assert!(!detectors.contains_key("a"));
+        assert!(detectors.contains_key("b"));
+
+        // Overflow the channel (cap 4) so the receiver lags: drain must then
+        // clear ALL detectors, since dropped resets can't be reconstructed.
+        detectors.insert("a".to_string(), detector(1.0, 1.0));
+        for i in 0..8 {
+            tx.send(format!("s{i}")).unwrap();
+        }
+        drain_resets(&mut rx, &mut detectors);
+        assert!(detectors.is_empty(), "lag clears every detector");
+    }
+
     #[test]
     fn fires_after_busy_then_quiet() {
         let mut d = detector(3.0, 5.0);

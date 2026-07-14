@@ -39,6 +39,52 @@ fn run(mut cmd: Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Does this tmux stderr mean "no server is running yet" (a benign, expected
+/// state → empty result) rather than an operational failure (missing binary,
+/// bad flags, protocol change)? Only benign cases may be mapped to empty; every
+/// other failure must surface, or we'd publish a plausible-but-false empty
+/// topology and skip pushes while someone is active (Codex).
+fn is_no_server(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    // The canonical message, OR the socket-connect error *specifically because
+    // the socket file is absent*. We require BOTH parts of the latter so an
+    // "error connecting to … (Permission denied)" — an operational failure —
+    // is NOT swallowed as no-server (Codex).
+    s.contains("no server running")
+        || (s.contains("error connecting to") && s.contains("no such file or directory"))
+}
+
+/// A *scoped* query (`-t session[:window]`) can also fail benignly because the
+/// target vanished (killed, or never existed) — that's an empty result, not an
+/// operational error. Server-wide queries never see this.
+fn is_missing_target(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("can't find")
+}
+
+/// Like [`run`], but maps benign absence to `Ok(None)`. `tolerate_missing`
+/// additionally treats "can't find <target>" as absence, for session/window
+/// scoped queries. Any other non-zero exit stays `Err`.
+fn run_classified(mut cmd: Command, tolerate_missing: bool) -> Result<Option<String>> {
+    let out = cmd.output().context("failed to run tmux")?;
+    if out.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_no_server(&stderr) || (tolerate_missing && is_missing_target(&stderr)) {
+        return Ok(None);
+    }
+    bail!(
+        "tmux {:?} failed: {}",
+        cmd.get_args().collect::<Vec<_>>(),
+        stderr.trim()
+    );
+}
+
+/// Server-wide query: only "no server" is benign.
+fn run_optional(cmd: Command) -> Result<Option<String>> {
+    run_classified(cmd, false)
+}
+
 /// Create the managed session if missing and apply session-scoped options.
 /// Never touches global tmux configuration.
 pub fn ensure_session(session: &str) -> Result<()> {
@@ -149,7 +195,7 @@ pub struct SessionInfo {
 /// counts our own internal topology control client too, so "attached" (exposed
 /// to the UI) would wrongly show sessions as attached; count only regular
 /// clients here. Keyed by session name.
-fn real_attached_counts() -> std::collections::HashMap<String, u32> {
+fn real_attached_counts() -> Result<std::collections::HashMap<String, u32>> {
     let mut cmd = tmux();
     // control_mode is a single 0/1; session name (may contain spaces) is the
     // remainder. (No tab separator — tmux 3.3a would sanitize it to `_`.)
@@ -159,7 +205,9 @@ fn real_attached_counts() -> std::collections::HashMap<String, u32> {
         "#{client_control_mode} #{client_session}",
     ]);
     let mut m = std::collections::HashMap::new();
-    if let Ok(out) = run(cmd) {
+    // No server → no clients. Any other failure propagates rather than silently
+    // reporting everything as unattached (Codex).
+    if let Some(out) = run_optional(cmd)? {
         for line in out.lines() {
             if let Some((ctrl, sess)) = line.split_once(' ') {
                 if ctrl == "0" {
@@ -168,7 +216,7 @@ fn real_attached_counts() -> std::collections::HashMap<String, u32> {
             }
         }
     }
-    m
+    Ok(m)
 }
 
 /// All sessions on the tmux server. Empty when no server is running yet.
@@ -182,10 +230,10 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
         "-F",
         "#{session_name} #{session_windows} #{session_attached} #{session_activity}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new()); // no tmux server running
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(Vec::new()); // no tmux server running yet
     };
-    let counts = real_attached_counts();
+    let counts = real_attached_counts()?;
     Ok(out
         .lines()
         .filter_map(parse_session_line)
@@ -221,8 +269,8 @@ pub fn sessions_activity() -> Result<Vec<(String, u64)>> {
         "-F",
         "#{session_name} #{window_activity}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new()); // no tmux server running
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(Vec::new()); // no tmux server running yet
     };
     let mut latest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for line in out.lines() {
@@ -275,13 +323,15 @@ pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
         "-F",
         "#{window_index} #{window_active} #{window_zoomed_flag} #{window_name}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new());
+    let Some(out) = run_classified(cmd, true)? else {
+        return Ok(Vec::new()); // no server, or the session is gone
     };
     let mut windows = Vec::new();
     for line in out.lines() {
         if let Some((index, active, zoomed, name)) = parse_window_line(line) {
-            let panes = list_panes(session, index).unwrap_or_default();
+            // A pane-list failure that isn't benign absence is a real error;
+            // propagate rather than silently dropping the window's panes.
+            let panes = list_panes(session, index)?;
             windows.push(WindowInfo {
                 index,
                 active,
@@ -314,7 +364,11 @@ fn list_panes(session: &str, window_index: u32) -> Result<Vec<PaneInfo>> {
         "-F",
         "#{pane_id} #{pane_index} #{pane_active} #{pane_current_command}",
     ]);
-    let out = run(cmd)?;
+    // No server, or the window/session vanished mid-capture → no panes. Any
+    // other failure propagates rather than being silently dropped.
+    let Some(out) = run_classified(cmd, true)? else {
+        return Ok(Vec::new());
+    };
     Ok(out.lines().filter_map(parse_pane_line).collect())
 }
 
@@ -454,8 +508,8 @@ fn ensure_zoom(session: &str) -> Result<()> {
 pub fn any_client_active_within(within_secs: u64) -> Result<bool> {
     let mut cmd = tmux();
     cmd.args(["list-clients", "-F", "#{client_activity}"]);
-    let Ok(out) = run(cmd) else {
-        return Ok(false);
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(false); // no server → no clients active
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -486,6 +540,35 @@ pub fn demote_client(client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benign_absence_classification() {
+        // "No server" is benign server-wide → empty, not an error.
+        assert!(is_no_server("no server running on /tmp/tmux-501/default"));
+        assert!(is_no_server(
+            "error connecting to /tmp/tmux-501/default (No such file or directory)"
+        ));
+        assert!(is_no_server("No Server Running On ...")); // case-insensitive
+                                                           // "can't find <target>" is NOT no-server, but IS benign for a scoped
+                                                           // query (the session/window is simply gone → empty).
+        assert!(!is_no_server("can't find session: main"));
+        assert!(is_missing_target("can't find session: main"));
+        assert!(is_missing_target("can't find window: 3"));
+        // Operational failures are neither — they must surface, not become a
+        // false-empty topology. Critically a *permission-denied* socket-connect
+        // error must NOT be mistaken for the absent-socket case, nor a bare
+        // "no such file or directory" without the connect context.
+        for e in [
+            "unknown option -- Q",
+            "lost server",
+            "error connecting to /tmp/tmux-0/default (Permission denied)",
+            "no such file or directory",
+            "",
+        ] {
+            assert!(!is_no_server(e), "{e:?}");
+            assert!(!is_missing_target(e), "{e:?}");
+        }
+    }
 
     #[test]
     fn session_line_parsing() {

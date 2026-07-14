@@ -29,6 +29,10 @@ pub const SESSION_MAX: usize = 200;
 const GLOBAL_MAX: usize = 5000;
 /// Max buffered finishes that arrived before their start.
 const PENDING_MAX: usize = 512;
+/// Drop an unmatched pending finish after this long (one sweep interval). Per
+/// entry, not wholesale — a finish that arrived just before a sweep must still
+/// get its full reorder window, not be cleared moments after landing.
+const PENDING_TTL: Duration = Duration::from_secs(300);
 /// Evict completed entries older than this.
 const AGE: Duration = Duration::from_secs(12 * 3600);
 /// A still-"running" entry older than this is marked aborted.
@@ -108,8 +112,10 @@ struct Inner {
     /// eviction of the entry, but is itself GC'd by [`Feed::sweep`] once the
     /// shell has been idle past `SHELL_TTL` (else it would leak per shell_id).
     shell_max: HashMap<String, (u64, Instant)>,
-    /// Finishes that arrived before their start: (shell_id, command_id) -> exit.
-    pending: HashMap<(String, u64), i32>,
+    /// Finishes that arrived before their start:
+    /// (shell_id, command_id) -> (exit, received-at). The instant ages the entry
+    /// out per-TTL; the first finish for a key wins (idempotent).
+    pending: HashMap<(String, u64), (i32, Instant)>,
 }
 
 impl Inner {
@@ -194,7 +200,15 @@ impl Feed {
                 return None; // duplicate start
             }
             let prev_max = inner.shell_max.get(shell_id).map(|(m, _)| *m);
-            let is_latest = prev_max.is_none_or(|m| command_id >= m);
+            // command_id is monotonic per shell. Past the by_key duplicate check
+            // above, a start whose id EQUALS the high-water is a replay of the
+            // (now-evicted) high-water command — drop it so it can't resurrect as
+            // a fresh Running entry (Codex). A genuinely new command is strictly
+            // greater; a lower id is a delayed older start (recorded Aborted).
+            if prev_max == Some(command_id) {
+                return None;
+            }
+            let is_latest = prev_max.is_none_or(|m| command_id > m);
 
             // Newest start ends any still-running predecessor on this shell.
             if is_latest {
@@ -209,7 +223,7 @@ impl Feed {
             }
 
             // A finish that beat its start (elapsed unknown → 0).
-            let raced_finish = inner.pending.remove(&key);
+            let raced_finish = inner.pending.remove(&key).map(|(exit, _)| exit);
             let state = match raced_finish {
                 Some(exit) => State::Done {
                     exit,
@@ -285,8 +299,10 @@ impl Feed {
                 }
                 None => {
                     // Finish beat its start — buffer it (bounded) for the start.
-                    if inner.pending.len() < PENDING_MAX {
-                        inner.pending.insert(key, exit);
+                    // First finish for a key wins (idempotent); a duplicate/forged
+                    // second finish must not overwrite the recorded exit (Codex).
+                    if !inner.pending.contains_key(&key) && inner.pending.len() < PENDING_MAX {
+                        inner.pending.insert(key, (exit, Instant::now()));
                     }
                     None
                 }
@@ -355,10 +371,15 @@ impl Feed {
             if inner.cmds.len() != before {
                 mutated = true;
             }
-            // A pending finish that never got a start is a leak — after a sweep
-            // interval it's abandoned. Bounded already, but clear on sweep.
-            if !inner.pending.is_empty() {
-                inner.pending.clear();
+            // A pending finish that never got a start is a leak — abandon it
+            // once it's older than PENDING_TTL. Per-entry (not a wholesale clear)
+            // so a finish that landed just before this sweep keeps its full
+            // reorder window instead of being dropped immediately (Codex).
+            let before_pending = inner.pending.len();
+            inner
+                .pending
+                .retain(|_, (_, recv)| now.saturating_duration_since(*recv) <= PENDING_TTL);
+            if inner.pending.len() != before_pending {
                 mutated = true;
             }
             // GC per-shell high-water marks for shells idle past the TTL, then
@@ -451,6 +472,30 @@ impl Feed {
     #[cfg(test)]
     pub fn shell_count(&self) -> usize {
         self.inner.lock().unwrap().shell_max.len()
+    }
+
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap().pending.len()
+    }
+
+    /// Test-only: age every buffered finish past PENDING_TTL so a sweep drops it.
+    #[cfg(test)]
+    pub fn age_pending(&self) {
+        let old = Instant::now() - (PENDING_TTL + Duration::from_secs(1));
+        for (_, recv) in self.inner.lock().unwrap().pending.values_mut() {
+            *recv = old;
+        }
+    }
+
+    /// Test-only: evict all command entries (as AGE-eviction would) while
+    /// keeping the shell high-water marks — the exact state in which a replayed
+    /// command_id could resurrect an entry.
+    #[cfg(test)]
+    pub fn drop_all_commands(&self) {
+        let inner = &mut *self.inner.lock().unwrap();
+        inner.cmds.clear();
+        inner.by_key.clear();
     }
 
     /// Test-only: force every shell's high-water mark to look ancient so a
@@ -569,6 +614,49 @@ mod tests {
         // Stored (not just the view) is capped at SESSION_MAX.
         assert!(f.len() <= SESSION_MAX);
         assert_eq!(f.snapshot("s").len(), f.len());
+    }
+
+    #[test]
+    fn first_finish_before_start_wins_over_a_duplicate() {
+        let f = Feed::default();
+        // Two finishes race in before the start; the first exit must stick.
+        assert!(f.finish("sh1", 1, 2).is_none());
+        assert!(f.finish("sh1", 1, 9).is_none()); // duplicate/forged — ignored
+        f.start("s", "%1", "sh1", 1, "make", "/w");
+        let snap = f.snapshot("s");
+        assert_eq!(state_of(&snap[0]), "done");
+        assert_eq!(snap[0]["exit"], 2, "first finish's exit wins, not the last");
+    }
+
+    #[test]
+    fn pending_finish_survives_a_sweep_within_ttl_then_expires() {
+        let f = Feed::default();
+        f.finish("sh1", 1, 0); // finish beat its start
+        assert_eq!(f.pending_count(), 1);
+        f.sweep(); // fresh → retained (the old wholesale-clear would drop it)
+        assert_eq!(f.pending_count(), 1);
+        // The start still lands the finish, marked done.
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        assert_eq!(state_of(&f.snapshot("s")[0]), "done");
+        // But an unmatched finish aged past the TTL is abandoned.
+        f.finish("sh2", 1, 0);
+        assert_eq!(f.pending_count(), 1);
+        f.age_pending();
+        f.sweep();
+        assert_eq!(f.pending_count(), 0);
+    }
+
+    #[test]
+    fn replayed_high_water_start_does_not_resurrect_after_eviction() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 5, "deploy", "/w");
+        f.finish("sh1", 5, 0);
+        assert_eq!(f.len(), 1);
+        f.drop_all_commands(); // as AGE eviction would (shell_max survives)
+                               // A forged/replayed start with the same (high-water) id must be dropped,
+                               // not re-added as a fresh Running entry.
+        assert!(f.start("s", "%1", "sh1", 5, "deploy", "/w").is_none());
+        assert!(f.is_empty());
     }
 
     #[test]

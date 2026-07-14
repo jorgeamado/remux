@@ -404,14 +404,15 @@ would change the fallback from "ask on Mac" to "hard block".
    frame (reconcile-on-subscribe + on-lag, approve-gated by *current* id, only
    sends when non-empty or clearing); approve-gated `GET /api/permissions` +
    `POST /api/permissions/{id}/decide` (the canonical decision op — the WS
-   only delivers). **Delivery confirmation** implemented: `resolve` returns
+   only delivers). **Write confirmation** implemented: `resolve` returns
    `(Card, Receiver<()>)`; the held-wait fires it only after a successful
    socket write, and the decide handler awaits it (8s > the 5s write timeout)
-   → `delivered:true` or 409. Generic wake (kind only, no command/source)
-   pushed but kept out of the 600s attention retention; permission pushes
-   bypass the busy→quiet throttle. Codex-reviewed (0 blockers, 4 major, 1
-   minor — all fixed). Tests: registry hints, http auth/visibility/validation/
-   delivery.
+   → `written:true` or 409 (this proves the decision was written to the live
+   hook socket, not a guaranteed end-to-end ACK). Generic wake (kind only, no
+   command/source) pushed but kept out of the 600s attention retention;
+   permission pushes bypass the busy→quiet throttle. Codex-reviewed (0
+   blockers, 4 major, 1 minor — all fixed). Tests: registry hints, http
+   auth/visibility/validation/write-confirmation.
 3. **DONE (2026-07-14).** PWA `permission_cards` handler → Approve/Deny card
    with a live countdown (prunes locally on expiry; retains on unexpected
    POST failure so the WS reconcile repairs; double-tap-guarded; textContent

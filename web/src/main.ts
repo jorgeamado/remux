@@ -1483,18 +1483,31 @@ const COMPOSER_CURSOR: Record<string, "left" | "right" | "home" | "end"> = {
   "\x1b[F": "end",
 };
 
+/// The tmux pane the terminal is currently showing (active pane of the active
+/// window in the current session), or undefined if topology hasn't said yet.
+function activePaneId(): string | undefined {
+  return activeWindow()?.panes.find((p) => p.active)?.id;
+}
+
 /// Should the key-row ↑/↓ drive the composer's history recall, or pass through
-/// to the terminal? Recall only when the M4c feed says the session is idle at a
-/// prompt (its newest command has finished). While a command/tool is running
-/// (newest entry "running") — or when there's no feed signal at all (no hook,
-/// or nothing has run yet) — the arrows pass straight through, so vim/htop/less
-/// always receive them. This uses the feed, which the shell hooks update in
-/// ~real time, rather than tmux's pane_current_command, which is NOT refreshed
-/// when the foreground process changes (so it would be stale and could hijack a
-/// tool's arrows — the one thing we must never do).
+/// to the terminal? Recall only when the M4c feed says the ACTIVE PANE is idle
+/// at a prompt (its newest command finished). Crucially this is scoped to the
+/// active pane, not the session's newest command: with a split where pane A runs
+/// vim and pane B just finished, the session-newest entry would be "done" and
+/// would wrongly steal vim's arrows. While a command/tool is running in this
+/// pane — or the pane has no feed history, or the active pane is unknown — the
+/// arrows pass straight through, so vim/htop/less always receive them. Uses the
+/// feed (shell-hook updated in ~real time), never tmux's pane_current_command,
+/// which isn't refreshed on a foreground-process change (stale → could hijack).
 function keyRowArrowsRecall(): boolean {
-  if (feedCommands.length === 0) return false; // no signal → safe: terminal
-  return feedCommands[feedCommands.length - 1].state !== "running";
+  const pane = activePaneId();
+  if (!pane) return false; // unknown active pane → safe: pass through
+  for (let i = feedCommands.length - 1; i >= 0; i--) {
+    if (feedCommands[i].pane === pane) {
+      return feedCommands[i].state !== "running";
+    }
+  }
+  return false; // no feed history for this pane → safe: pass through
 }
 
 setupKeyRow((data) => {

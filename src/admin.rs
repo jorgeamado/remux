@@ -108,20 +108,30 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
         }),
         Ok(Request::Revoke { id }) => match app.auth.revoke(&id) {
             Ok(()) => {
-                app.push.remove_device(&id);
+                // The token is dead (the security-critical part). If pruning the
+                // device's push subscriptions can't be persisted, the revoke
+                // still stands — surface it so the "subscriptions are deleted"
+                // contract isn't silently unmet on disk.
+                let push_ok = app.push.remove_device(&id);
                 let _ = app.revoked.send(id.clone());
                 tracing::info!(device = %id, "device revoked via admin socket");
-                serde_json::json!({ "ok": true })
+                match push_ok {
+                    Ok(()) => serde_json::json!({ "ok": true }),
+                    Err(e) => {
+                        tracing::error!(device = %id, "revoked, but push prune failed: {e:#}");
+                        serde_json::json!({
+                            "ok": true,
+                            "warning": "device revoked, but its push subscriptions could not be deleted from disk",
+                        })
+                    }
+                }
             }
             Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
         },
-        Ok(Request::Rename { id, name }) => {
-            if app.auth.rename(&id, &name) {
-                serde_json::json!({ "ok": true })
-            } else {
-                serde_json::json!({ "ok": false, "error": "no such device" })
-            }
-        }
+        Ok(Request::Rename { id, name }) => match app.auth.rename(&id, &name) {
+            Ok(()) => serde_json::json!({ "ok": true }),
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        },
         Ok(Request::SetApprove { id, grant }) => match app.auth.set_approve(&id, grant) {
             Ok(changed) => {
                 if changed {

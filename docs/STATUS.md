@@ -3,9 +3,14 @@
 > Uncommitted working note (per request). Point-in-time picture of where the
 > project is and what's planned. The durable plan is `docs/PLAN.md`.
 
-Repo state: `main` clean, everything pushed to `github.com/jorgeamado/remux`
-(public), CI green. HEAD = `5251fdd` (M3b pane tabs). The whole M3
-control-mode arc is done and deployed.
+Repo: `github.com/jorgeamado/remux` (public); `main` builds green on CI. The M3
+control-mode arc and the whole M4 semantic layer (M4a attention → M4b approvals
+→ M4c command feed) are done and verified on-device. On top of that, three
+multi-angle Codex-reviewed hardening tiers (security/correctness →
+robustness/honesty → release-readiness/tests/docs): Tiers 1–2 are committed and
+CI-green; Tier 3 lands with this change. Each bug fix carries a regression test,
+release is gated on the full CI, and the load-bearing paths (bash hook, rc-file
+editing, M4b decision/EOF race) now have real tests.
 
 ## Deployed
 
@@ -117,8 +122,9 @@ composer-first routing for key-row punctuation / cursor keys /
 single-line paste. All verified on-device by the user; shell-history
 mirroring into the composer is recorded as an M4c deliverable (needs
 OSC 133 prompt/command boundaries). Field notes: "direct typing" is a
-deliberate off-by-default phone setting (aA menu), and a hard reload
-resets it + wipes composer history — both read as bugs until explained.
+deliberate off-by-default phone setting (aA menu) that a hard reload resets;
+composer history is memory-only by design (command lines can hold secrets, so
+they never touch localStorage — Tier 1), so a reload intentionally clears it.
 
 **M4b day-1 gate PASSED (2026-07-14).** Ran the blocking
 PermissionRequest-hook test against live Claude Code v2.1.197 (isolated

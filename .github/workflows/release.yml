@@ -27,8 +27,13 @@ jobs:
             exit 1
           fi
 
+  # Full CI (tests, clippy, fmt, e2e, audits) against the tagged commit — a tag
+  # on a failing/unmerged commit must not produce release artifacts.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
-    needs: check-version
+    needs: [check-version, ci]
     strategy:
       matrix:
         include:

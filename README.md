@@ -190,9 +190,31 @@ waiting for your answer — remux notifies you.
   wants attention and offers to jump there. No pushes are sent while someone
   is actively typing at any attached client, and delivery is throttled.
 
+## Agent approvals & the command feed
+
+- **Approve from your phone**: `remux emit permission` is a *blocking*
+  PermissionRequest hook helper — when Claude Code asks to run a tool, it opens
+  a card on your paired, approve-capable device (grant it with `remux devices
+  grant-approve <id>`). Approve/Deny remotely; if the command is too long to
+  show in full, remote Approve is disabled and you decide on the host, which
+  sees the whole command. The daemon/CLI path is done and drivable with `remux
+  test-permission`; the copy-paste Claude Code `PermissionRequest` hook config
+  is still to be published (tracked in `docs/STATUS.md`).
+- **Command feed**: `remux setup shell` installs an opt-in hook (bash or zsh,
+  auto-detected; it explains itself and asks first) that streams each command's
+  start/finish — what ran, exit code, duration — to a per-session feed on your
+  phone, plus precise failure notifications ("a command failed (101) in main").
+  Metadata only: command lines travel over the authenticated connection and
+  stay in daemon memory — never the lock screen, never disk. Remove with `remux
+  setup shell --uninstall`.
+
 ## Roadmap
 
 V1.x: device management UI, launchd/systemd unit files.
 V2: tmux control-mode metadata (panes as tabs/cards), snapshot/delta sync with
-a custom renderer, server-paged scrollback. V3: shell integration (OSC 133),
-semantic command feed, Claude Code approval cards, push notifications.
+a custom renderer, server-paged scrollback.
+V3 (shipped): hook-based shell command feed, Web Push notifications, and the
+approval-card path (daemon + phone UI; the Claude Code `PermissionRequest` hook
+config is still to be published). Still exploratory: OSC 133 shell integration
+and streamed command *output* (built only if command metadata proves
+insufficient).

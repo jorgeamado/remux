@@ -23,7 +23,7 @@ you want the feed — for every shell (put `export REMUX_CAPTURE=1` at the top o
 `~/.zshrc`), or only in specific sessions. Any tmux pane where it's set and
 remux is running will report commands.
 
-## Install (zsh)
+## Install
 
 The easy way — it detects your shell (`$SHELL`, or pass `--shell bash|zsh`),
 describes what it does, asks first, and writes an idempotent, clearly-marked
@@ -90,10 +90,11 @@ The model is **interactive-shell submission**, not process lifecycle:
   datagrams, so they can arrive out of order under load — the daemon tolerates
   that (it buffers an early finish and won't let a delayed start clobber a
   newer command).
-- **ssh to another host**, **fish**, and **bash** are not covered (bash 3.2 on
-  stock macOS lacks the timing/hook primitives — a separate, tested bash shim
-  is planned). Unhooked shells fall back to remux's built-in busy→quiet
-  heuristic; nothing breaks.
+- **bash and zsh are both covered** (see the bash notes above for its two
+  caveats — an existing `DEBUG` trap disables it, and a compound line records
+  only its first segment). **ssh to another host** and **fish** are not covered.
+  Unhooked shells fall back to remux's built-in busy→quiet heuristic; nothing
+  breaks.
 - Empty prompts (Enter with no command) are harmless — the daemon
   de-duplicates the repeated finish.
 

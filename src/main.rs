@@ -482,11 +482,13 @@ fn setup_shell(cmd: SetupCmd) -> Result<()> {
     let installed = existing.contains(SHELL_HOOK_BEGIN);
 
     if uninstall {
-        if !installed {
+        // Attempt removal if EITHER marker is present — an orphan END (no BEGIN)
+        // is malformed and must be reported as such, not as "nothing to do".
+        if !installed && !existing.contains(SHELL_HOOK_END) {
             println!("No remux hook found in {}.", rc.display());
             return Ok(());
         }
-        let stripped = strip_hook_block(&existing).with_context(|| {
+        let stripped = strip_all_hook_blocks(&existing).with_context(|| {
             format!(
                 "the remux hook block in {} is malformed (unpaired markers) — \
                  refusing to edit it; remove it by hand",
@@ -524,13 +526,7 @@ fn setup_shell(cmd: SetupCmd) -> Result<()> {
         }
     }
 
-    let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push('\n');
-    content.push_str(&block);
-    content.push('\n');
+    let content = rc_with_block_appended(&existing, &block);
     atomic_write_rc(&rc, &content)?;
     println!(
         "Installed into {}. Open a new shell (a new tmux window/pane, or `exec {shell}`) \
@@ -566,9 +562,43 @@ fn atomic_write_rc(path: &std::path::Path, contents: &str) -> Result<()> {
 /// before it, preserving the rest of the file **byte for byte** (line endings
 /// included — no CRLF→LF normalization). Returns `None` if the markers are
 /// missing or unpaired, so the caller can refuse rather than delete too much.
+/// Compose rc contents with the hook block appended: ensure a trailing newline,
+/// a blank separator, then the block + a final newline. Single source of truth
+/// for how install writes — `setup_shell` and the tests both call it, so they
+/// can't drift.
+fn rc_with_block_appended(existing: &str, block: &str) -> String {
+    let mut content = existing.to_string();
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(block);
+    content.push('\n');
+    content
+}
+
+/// Strip EVERY marked hook block, not just the first. Normally there's exactly
+/// one (the install guard refuses to add a second), but a hand-edited rc could
+/// hold more — uninstall must not leave a still-active block behind. Returns
+/// `None` if ANY marker is unpaired, so we refuse rather than partially edit.
+fn strip_all_hook_blocks(s: &str) -> Option<String> {
+    let mut out = s.to_string();
+    while out.contains(SHELL_HOOK_BEGIN) || out.contains(SHELL_HOOK_END) {
+        out = strip_hook_block(&out)?;
+    }
+    Some(out)
+}
+
 fn strip_hook_block(s: &str) -> Option<String> {
     let begin = s.find(SHELL_HOOK_BEGIN)?;
     let end = s[begin..].find(SHELL_HOOK_END)? + begin;
+    // Between the two markers there must be no other marker: a second BEGIN or
+    // END inside means malformed/nested blocks. Refuse rather than over-strip
+    // the region and silently swallow whatever the user put between them.
+    let inner = s.get(begin + SHELL_HOOK_BEGIN.len()..end)?;
+    if inner.contains(SHELL_HOOK_BEGIN) || inner.contains(SHELL_HOOK_END) {
+        return None;
+    }
     // Expand to whole lines: start of BEGIN's line … through END's newline.
     let mut start = s[..begin].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let stop = s[end..].find('\n').map(|i| end + i + 1).unwrap_or(s.len());
@@ -754,17 +784,10 @@ fn print_pairing(pair_url: &str) {
 mod tests {
     use super::*;
 
-    /// Mirror setup_shell's append: ensure trailing newline, blank separator,
-    /// block, trailing newline.
+    /// Install exactly as setup_shell does — via the shared composition helper,
+    /// so the test can't drift from production.
     fn install_into(original: &str) -> String {
-        let mut c = original.to_string();
-        if !c.is_empty() && !c.ends_with('\n') {
-            c.push('\n');
-        }
-        c.push('\n');
-        c.push_str(&zsh_hook_block());
-        c.push('\n');
-        c
+        rc_with_block_appended(original, &zsh_hook_block())
     }
 
     #[test]
@@ -850,5 +873,220 @@ mod tests {
     fn resolve_shell_honors_flag() {
         assert_eq!(resolve_shell(Some("bash".into())).unwrap(), "bash");
         assert_eq!(resolve_shell(Some("zsh".into())).unwrap(), "zsh");
+    }
+
+    #[test]
+    fn strip_all_removes_multiple_blocks_and_refuses_malformed() {
+        // Two well-formed blocks (a hand-edited rc) → both removed, exact rest.
+        let original = "# rc\nexport A=1\n";
+        let two = format!(
+            "{original}\n{b}\n\n{b}\n",
+            b = zsh_hook_block(),
+            original = original
+        );
+        assert!(two.matches(SHELL_HOOK_BEGIN).count() == 2);
+        let stripped = strip_all_hook_blocks(&two).unwrap();
+        assert!(!stripped.contains(SHELL_HOOK_BEGIN));
+        assert!(!stripped.contains(SHELL_HOOK_END));
+        assert_eq!(stripped, original);
+        // A second, unpaired BEGIN after a good block → refuse (don't half-edit).
+        let malformed = format!("{}\n\nkeep\n{SHELL_HOOK_BEGIN}\nrogue\n", zsh_hook_block());
+        assert_eq!(strip_all_hook_blocks(&malformed), None);
+        // Nested markers (BEGIN…BEGIN…END) must be refused, never over-stripped.
+        let nested =
+            format!("a\n{SHELL_HOOK_BEGIN}\nx\n{SHELL_HOOK_BEGIN}\ny\n{SHELL_HOOK_END}\nb\n");
+        assert_eq!(strip_hook_block(&nested), None);
+        assert_eq!(strip_all_hook_blocks(&nested), None);
+        // An orphan END with no BEGIN is malformed, not "nothing here".
+        assert_eq!(
+            strip_all_hook_blocks(&format!("keep\n{SHELL_HOOK_END}\n")),
+            None
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("remux-rc-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn atomic_write_preserves_mode_follows_symlink_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("atomic");
+        let real = dir.join("zshrc");
+        std::fs::write(&real, "export A=1\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The dotfile-manager pattern: ~/.zshrc is a symlink to the real file.
+        let link = dir.join(".zshrc");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write_rc(&link, "export A=1\n# added\n").unwrap();
+
+        // The symlink is intact (we edited the real file, not replaced the link).
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "export A=1\n# added\n"
+        );
+        // Mode preserved on the real file.
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // No temp file left behind.
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("remux-tmp"));
+        assert!(!leftover, "a .remux-tmp file was left behind");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bash_hook_emits_start_end_with_captured_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        // Exercise the REAL DEBUG-trap capture path: the trap fires before each
+        // top-level command in a script too, so with a fake `remux` on PATH we
+        // can drive `true`/`false` and assert the start/end emits and the
+        // captured exit codes. We invoke `_remux_precmd` at the prompt points
+        // (PROMPT_COMMAND is interactive-only); the append composition itself is
+        // covered separately by bash_hook_appends_to_existing_prompt_command.
+        // Uses only bash-3.2 constructs, so it runs on macOS bash and CI's 5.x.
+        let dir = scratch_dir("bashhook");
+        let log = dir.join("emits.log");
+        let fake = dir.join("remux");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rc = dir.join("bashrc");
+        std::fs::write(&rc, bash_hook_block()).unwrap();
+
+        // Two prompt cycles: run `true` (exit 0) then `false` (exit 1). No
+        // command after the last precmd (it would fire the trap and pollute).
+        let driver = format!(
+            "export TMUX_PANE=%1\n\
+             export PATH={dir:?}:$PATH\n\
+             source {rc:?}\n\
+             _remux_precmd\n\
+             true\n\
+             _remux_precmd\n\
+             false\n\
+             _remux_precmd\n"
+        );
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&driver)
+            .status();
+        let status = match status {
+            Ok(s) => s,
+            Err(_) => {
+                std::fs::remove_dir_all(&dir).ok();
+                return; // no bash available — skip
+            }
+        };
+        assert!(status.success(), "driver bash exited non-zero");
+
+        // The `( remux & )` emits are backgrounded, so poll (best-effort) until
+        // all four REQUIRED emits have landed. We assert their presence and
+        // correlation by command-id — not an exact line count, since a detached
+        // process can't guarantee the absence of a late stray write. cmd 1 =
+        // `true` → exit 0; cmd 2 = `false` → exit 1.
+        let required: [&[&str]; 4] = [
+            &["emit command-start", "--command true", "--command-id 1"],
+            &["emit command-end", "--command-id 1", "--exit 0"],
+            &["emit command-start", "--command false", "--command-id 2"],
+            &["emit command-end", "--command-id 2", "--exit 1"],
+        ];
+        let present = |lines: &[String], needles: &[&str]| {
+            lines.iter().any(|l| needles.iter().all(|n| l.contains(n)))
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..60 {
+            if let Ok(s) = std::fs::read_to_string(&log) {
+                lines = s.lines().map(str::to_string).collect();
+                if required.iter().all(|r| present(&lines, r)) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        for r in required {
+            assert!(present(&lines, r), "missing {r:?} in {lines:?}");
+        }
+    }
+
+    #[test]
+    fn bash_hook_appends_to_existing_prompt_command() {
+        use std::os::unix::fs::PermissionsExt;
+        // The append (not prepend) is load-bearing: an existing PROMPT_COMMAND
+        // must run FIRST so it still sees the real $?. Verify the composed value.
+        let dir = scratch_dir("bashpc");
+        let fake = dir.join("remux");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rc = dir.join("bashrc");
+        std::fs::write(&rc, bash_hook_block()).unwrap();
+
+        let driver = format!(
+            "export TMUX_PANE=%1\n\
+             export PATH={dir:?}:$PATH\n\
+             PROMPT_COMMAND='__existing'\n\
+             source {rc:?}\n\
+             printf '%s' \"$PROMPT_COMMAND\"\n"
+        );
+        let out = match std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&driver)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => {
+                std::fs::remove_dir_all(&dir).ok();
+                return; // no bash — skip
+            }
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        let pc = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            pc.trim(),
+            "__existing;_remux_precmd",
+            "existing hook must run first, ours appended: {pc:?}"
+        );
+    }
+
+    #[test]
+    fn install_then_uninstall_through_the_filesystem_restores_exactly() {
+        let dir = scratch_dir("roundtrip");
+        let rc = dir.join("bashrc");
+        let original = "# bashrc\nexport EDITOR=vim\n";
+        std::fs::write(&rc, original).unwrap();
+
+        // Install via the SAME composition helper setup_shell uses + the real
+        // atomic write (so this can't drift from production).
+        let existing = std::fs::read_to_string(&rc).unwrap();
+        assert!(!existing.contains(SHELL_HOOK_BEGIN), "not installed yet");
+        atomic_write_rc(&rc, &rc_with_block_appended(&existing, &bash_hook_block())).unwrap();
+
+        // Idempotency guard now trips (already installed).
+        let after = std::fs::read_to_string(&rc).unwrap();
+        assert!(after.contains(SHELL_HOOK_BEGIN));
+
+        // Uninstall via strip → the original file is restored byte-for-byte.
+        let stripped = strip_all_hook_blocks(&after).unwrap();
+        atomic_write_rc(&rc, &stripped).unwrap();
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), original);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -539,6 +539,43 @@ mod tests {
         assert_eq!(sanitize(&"x".repeat(1000)).len(), MAX_MESSAGE);
     }
 
+    #[tokio::test]
+    async fn eof_wins_the_tie_with_a_ready_decision() {
+        use tokio::sync::oneshot;
+        // The exact race `biased` exists for: the hook's socket is closed (the
+        // Mac answered and Claude SIGTERM'd the hook) AND a phone decision is
+        // already queued. EOF must win, or we'd write an allow/deny the hook
+        // will never read while the Mac already decided.
+        let (hook, server) = tokio::net::UnixStream::pair().unwrap();
+        drop(hook); // hook gone
+                    // Rigorously establish the tie: confirm the peer-close is
+                    // *actually* readable as EOF (readable() alone can report a
+                    // false positive) BEFORE the decision is made ready, so both
+                    // select branches are genuinely ready. EOF is level-triggered,
+                    // so a confirmed Ok(0) here means the real read will be too.
+        loop {
+            server.readable().await.unwrap();
+            let mut probe = [0u8; 1];
+            match server.try_read(&mut probe) {
+                Ok(0) => break, // EOF confirmed
+                Ok(_) => unreachable!("peer wrote nothing"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // spurious wake — retry
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        let (server_read, _server_write) = server.into_split();
+
+        let (tx, rx) = oneshot::channel();
+        let (conf_tx, conf_rx) = oneshot::channel();
+        tx.send((Decision::Allow, conf_tx)).unwrap(); // decision already ready
+
+        let out = wait_for_decision(rx, server_read).await;
+        assert!(out.is_none(), "EOF must win the tie over a ready decision");
+        // The confirmation sender was dropped unfired → the deciding device sees
+        // no delivery (409), never a false "approved".
+        assert!(conf_rx.await.is_err());
+    }
+
     #[test]
     fn prompt_id_shape() {
         assert!(valid_prompt_id("9bf86345-4606-4072-86e8-c3a969332e11"));

@@ -797,6 +797,7 @@ function toggleFeed(): void {
 
 function clearFeed(): void {
   feedCommands = [];
+  endRecall(); // recall list is per-session; reset on switch
   if (feedOpen) paintFeed();
 }
 
@@ -1106,8 +1107,65 @@ renderNotifyBtn();
 /// field that sends a full line. Submitting as an observer requests control
 /// (the line is buffered and flushed by the existing take-control path).
 const HISTORY_MAX = 50;
-let cmdHistory: string[] = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
-let historyIdx: number | null = null;
+// Composer recall (↑ / ▴) draws from this session's real command history: the
+// feed (every command run in the session, from the Mac or the phone) plus
+// commands typed from the composer. Only the *typed* ones are persisted, and
+// per session; feed-derived commands stay in memory (M4c) — they can contain
+// secrets and aren't ours to write to localStorage.
+// Recall is anchored to a snapshot frozen when it starts, so a feed frame
+// arriving mid-recall can't shift the positional index under the user.
+let recallIdx: number | null = null; // index into recallSnapshot; 0 = newest
+let recallSnapshot: string[] = [];
+// True while the composer holds a value that originated from the feed (or an
+// edit of one) — such commands are never persisted to localStorage, since the
+// feed can contain secrets and is memory-only by design.
+let composerFromFeed = false;
+
+function typedHistory(): string[] {
+  if (!sessionTitle) return [];
+  try {
+    const v = JSON.parse(localStorage.getItem(HISTORY_KEY + ":" + sessionTitle) ?? "[]");
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+/// Persist a *typed* command for this session. Never called for feed-derived
+/// text (secrets) and never before a session identity exists.
+function recordTyped(cmd: string): void {
+  if (!sessionTitle || composerFromFeed) return;
+  const h = typedHistory();
+  if (h[h.length - 1] === cmd) return;
+  const next = [...h, cmd].slice(-HISTORY_MAX);
+  localStorage.setItem(HISTORY_KEY + ":" + sessionTitle, JSON.stringify(next));
+}
+
+function feedCommandSet(): Set<string> {
+  return new Set(feedCommands.map((c) => c.command).filter(Boolean));
+}
+
+/// Newest-first recall list: the session's feed commands first (the actual
+/// shell history, Mac or phone), then typed commands not already present.
+function recallList(): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = feedCommands.length - 1; i >= 0; i--) {
+    const c = feedCommands[i].command;
+    if (c && !seen.has(c)) {
+      seen.add(c);
+      out.push(c);
+    }
+  }
+  const typed = typedHistory();
+  for (let i = typed.length - 1; i >= 0; i--) {
+    if (!seen.has(typed[i])) {
+      seen.add(typed[i]);
+      out.push(typed[i]);
+    }
+  }
+  return out;
+}
 
 /// True after a Tab flushed a draft to the shell: the real command line
 /// lives in the terminal now, partially completed there.
@@ -1125,13 +1183,17 @@ function composerSubmit(): void {
   sendInput(text + "\r");
   // After a tab-flush the field only holds the suffix — recording it would
   // pollute history with an invalid partial command.
-  if (!shellLinePending && cmdHistory[cmdHistory.length - 1] !== text) {
-    cmdHistory = [...cmdHistory, text].slice(-HISTORY_MAX);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(cmdHistory));
-  }
+  if (!shellLinePending) recordTyped(text);
   shellLinePending = false;
-  historyIdx = null;
+  endRecall();
   composerInput.value = "";
+}
+
+/// End an in-progress recall and clear its provenance.
+function endRecall(): void {
+  recallIdx = null;
+  recallSnapshot = [];
+  composerFromFeed = false;
 }
 
 /// Shell completion from the composer: the draft must live in the shell's
@@ -1142,7 +1204,7 @@ function composerTabComplete(): void {
   sendInput(composerInput.value + "\t");
   shellLinePending = true;
   composerInput.value = "";
-  historyIdx = null;
+  endRecall();
 }
 
 composerInput.addEventListener("keydown", (ev) => {
@@ -1166,34 +1228,52 @@ composerInput.addEventListener("keydown", (ev) => {
   } else if (ev.key === "Enter") {
     ev.preventDefault();
     composerSubmit();
-  } else if (ev.key === "ArrowUp" && cmdHistory.length > 0) {
+  } else if (ev.key === "ArrowUp") {
     ev.preventDefault();
     composerHistoryPrev(false);
-  } else if (ev.key === "ArrowDown" && historyIdx !== null) {
+  } else if (ev.key === "ArrowDown" && recallIdx !== null) {
     ev.preventDefault();
-    historyIdx = historyIdx >= cmdHistory.length - 1 ? null : historyIdx + 1;
-    composerInput.value = historyIdx === null ? "" : cmdHistory[historyIdx];
+    recallIdx = recallIdx <= 0 ? null : recallIdx - 1;
+    if (recallIdx === null) {
+      composerInput.value = "";
+      composerFromFeed = false;
+    } else {
+      const val = recallSnapshot[recallIdx] ?? "";
+      composerFromFeed = feedCommandSet().has(val);
+      composerInput.value = val;
+    }
   }
+});
+
+// Manually clearing the field drops feed provenance, so a fresh command typed
+// from scratch persists normally.
+composerInput.addEventListener("input", () => {
+  if (composerInput.value === "") composerFromFeed = false;
 });
 
 /// Step back through composer history into the (editable) field. The ▴
 /// button wraps from oldest to newest — one button must never dead-end.
 function composerHistoryPrev(wrap: boolean): void {
-  if (cmdHistory.length === 0) {
-    // Silence reads as "broken" — say why there's nothing to recall.
-    const prev = composerInput.placeholder;
-    composerInput.placeholder = "history is empty — send a command from here first";
-    window.setTimeout(() => (composerInput.placeholder = prev), 2500);
-    return;
-  }
-  if (historyIdx === null) {
-    historyIdx = cmdHistory.length - 1;
-  } else if (historyIdx === 0) {
-    if (wrap) historyIdx = cmdHistory.length - 1;
+  if (recallIdx === null) {
+    // Freeze the list for this recall so an incoming feed frame can't shift
+    // the index mid-recall.
+    recallSnapshot = recallList();
+    if (recallSnapshot.length === 0) {
+      // Silence reads as "broken" — say why there's nothing to recall.
+      const prev = composerInput.placeholder;
+      composerInput.placeholder = "no command history yet for this session";
+      window.setTimeout(() => (composerInput.placeholder = prev), 2500);
+      return;
+    }
+    recallIdx = 0; // newest
+  } else if (recallIdx >= recallSnapshot.length - 1) {
+    if (wrap) recallIdx = 0; // oldest → wrap to newest (▴ never dead-ends)
   } else {
-    historyIdx -= 1;
+    recallIdx += 1; // older
   }
-  composerInput.value = cmdHistory[historyIdx];
+  const val = recallSnapshot[recallIdx];
+  composerFromFeed = feedCommandSet().has(val);
+  composerInput.value = val;
 }
 
 // pointerdown + preventDefault keeps focus (and the keyboard) in the input.

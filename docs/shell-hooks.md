@@ -1,4 +1,4 @@
-# Shell command feed (M4c) — zsh hooks
+# Shell command feed (M4c) — shell hooks (bash + zsh)
 
 Installing these hooks gives your phone a live **command feed** for a session
 (what ran, exit code, duration, running state) and precise **failure
@@ -25,15 +25,23 @@ remux is running will report commands.
 
 ## Install (zsh)
 
-The easy way — describes what it does, asks first, and writes an idempotent,
-clearly-marked block to `~/.zshrc` (it also sets `REMUX_CAPTURE=1` for you):
+The easy way — it detects your shell (`$SHELL`, or pass `--shell bash|zsh`),
+describes what it does, asks first, and writes an idempotent, clearly-marked
+block to the right rc file (`~/.bashrc` or `~/.zshrc`; it also sets
+`REMUX_CAPTURE=1` for you):
 
 ```
 remux setup shell
 ```
 
-`remux setup shell --uninstall` removes it; `--print` just prints the snippet
-(for another shell or a manual install); `--yes` skips the prompt.
+`remux setup shell --uninstall` removes it; `--print` just prints the snippet;
+`--yes` skips the prompt.
+
+**bash notes.** bash has no native preexec/precmd, so the hook uses a `DEBUG`
+trap + `PROMPT_COMMAND`. Two caveats: (1) it won't install its trap if you
+already have a `DEBUG` trap (bash-preexec, a debugger) — it leaves yours alone
+and prints a note; (2) for a compound line (`a | b`, `a && b`, `a; b`) the feed
+records the first segment, not the whole line. zsh has none of these limits.
 
 Or add it by hand. Every call is fire-and-forget over a local datagram
 socket — a stopped daemon is a no-op, and the emits are backgrounded and

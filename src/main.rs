@@ -293,10 +293,10 @@ async fn main() -> Result<()> {
 const SHELL_HOOK_BEGIN: &str = "# >>> remux command feed >>>";
 const SHELL_HOOK_END: &str = "# <<< remux command feed <<<";
 
-/// The zsh block installed into ~/.zshrc. Fire-and-forget (backgrounded and
-/// disowned), guarded to only run inside a remux tmux, and self-documenting so
-/// a reader of their rc file knows what it is and how to remove it.
-fn shell_hook_block() -> String {
+/// The zsh block. Fire-and-forget (backgrounded and disowned), guarded to only
+/// run inside a remux tmux, and self-documenting so a reader of their rc file
+/// knows what it is and how to remove it.
+fn zsh_hook_block() -> String {
     format!(
         "{SHELL_HOOK_BEGIN}
 # Reports each command's start/finish to remux for a phone command feed +
@@ -326,10 +326,74 @@ fi
     )
 }
 
-const SHELL_HOOK_WHY: &str = "\
-remux command feed (zsh) — what this installs and why
+/// The bash block. bash has no native preexec/precmd, so this uses a DEBUG trap
+/// (before each command) + PROMPT_COMMAND (after). Crucially the trap action
+/// captures `$?` and `$BASH_COMMAND` *at fire time* and passes them as args —
+/// reading `$BASH_COMMAND` inside the trap body is unreliable (the trap's own
+/// commands overwrite it), and reading `$?` in PROMPT_COMMAND would see the
+/// trap's exit, not the user's. The exit is stashed in a global for
+/// PROMPT_COMMAND, avoiding the `extdebug` pitfall of restoring `$?` via the
+/// trap's return value. Emits run in a backgrounded subshell so no job-control
+/// noise reaches the prompt.
+fn bash_hook_block() -> String {
+    format!(
+        "{SHELL_HOOK_BEGIN}
+# Reports each command's start/finish to remux for a phone command feed +
+# precise failure notifications (M4c). Informational only; command lines go to
+# your paired devices over the authed connection (never the lock screen / push)
+# and are kept in daemon memory only. Remove with: remux setup shell --uninstall
+export REMUX_CAPTURE=1
+if [[ -n $TMUX_PANE && -n $REMUX_CAPTURE && -n $BASH_VERSION ]] && command -v remux >/dev/null 2>&1; then
+  _REMUX_SHELL_ID=\"$$-${{RANDOM}}${{RANDOM}}\"
+  _REMUX_CMD_ID=0
+  _remux_active=\"\"
+  _remux_got=\"\"
+  _remux_ready=\"\"
+  _remux_ret=0
+  _remux_pre() {{
+    # $1=$? and $2=$BASH_COMMAND, both captured in the trap action at FIRE time
+    # (reading them in the body is unreliable). Record the finished command's
+    # exit exactly once — the first DEBUG after it — so PROMPT_COMMAND's own
+    # commands can't overwrite it.
+    if [[ -n $_remux_active && -z $_remux_got ]]; then _remux_ret=$1; _remux_got=1; fi
+    # Only the first command after a prompt counts. `_remux_ready` is armed by
+    # precmd, so startup and PROMPT_COMMAND's own commands are ignored.
+    [[ -z $_remux_ready ]] && return
+    [[ -n ${{COMP_LINE-}} ]] && return          # tab completion, not a command
+    case \"$2\" in _remux_precmd*) return ;; esac
+    _remux_ready=\"\"
+    _remux_active=1
+    _remux_got=\"\"
+    _REMUX_CMD_ID=$(( _REMUX_CMD_ID + 1 ))
+    ( remux emit command-start --shell-id \"$_REMUX_SHELL_ID\" --command-id \"$_REMUX_CMD_ID\" --command \"$2\" --cwd \"$PWD\" >/dev/null 2>&1 & )
+  }}
+  _remux_precmd() {{
+    if [[ -n $_remux_active ]]; then
+      ( remux emit command-end --shell-id \"$_REMUX_SHELL_ID\" --command-id \"$_REMUX_CMD_ID\" --exit \"$_remux_ret\" >/dev/null 2>&1 & )
+      _remux_active=\"\"
+    fi
+    _remux_ready=1   # arm for the next user command
+  }}
+  # Append: any existing PROMPT_COMMAND runs first (sees the real $?, and its
+  # commands are ignored by the once-per-prompt guard); we finalize last.
+  PROMPT_COMMAND=\"${{PROMPT_COMMAND:+$PROMPT_COMMAND;}}_remux_precmd\"
+  # Never clobber an existing DEBUG trap (bash-preexec, debuggers, editor
+  # integrations); if one is set, leave the feed off rather than break it.
+  if [[ -z $(trap -p DEBUG) ]]; then
+    trap '_remux_pre \"$?\" \"$BASH_COMMAND\"' DEBUG
+  else
+    echo \"remux: existing DEBUG trap detected — command feed left off (unset it to enable)\" >&2
+  fi
+fi
+{SHELL_HOOK_END}"
+    )
+}
 
-A zsh hook that tells remux when each command starts and finishes, giving you:
+fn zsh_hook_why() -> &'static str {
+    "\
+remux command feed — what this installs and why
+
+A shell hook that tells remux when each command starts and finishes, giving you:
   • precise lock-screen notifications — \"cargo test failed (1) after 6m\"
     instead of the vague \"a session went quiet\";
   • a command feed on your phone (aA -> Command feed): what ran, exit, duration;
@@ -338,26 +402,61 @@ A zsh hook that tells remux when each command starts and finishes, giving you:
 
 Informational and opt-in. Command lines can hold secrets, so they go only to
 your paired devices over the authenticated connection — never the lock screen,
-never Web Push — and live in daemon memory only, never on disk.
-";
+never Web Push — and live in daemon memory only, never on disk."
+}
 
-/// `remux setup shell` — describe, confirm, and install/remove the zsh hook.
-/// Only edits ~/.zshrc; does not need the daemon running.
+/// Resolve which shell to set up: an explicit `--shell`, else `$SHELL`.
+fn resolve_shell(flag: Option<String>) -> Result<&'static str> {
+    if let Some(s) = flag {
+        // clap already restricts to bash|zsh.
+        return Ok(if s == "zsh" { "zsh" } else { "bash" });
+    }
+    let sh = std::env::var("SHELL").unwrap_or_default();
+    match sh.rsplit('/').next().unwrap_or("") {
+        "zsh" => Ok("zsh"),
+        "bash" => Ok("bash"),
+        other => anyhow::bail!(
+            "couldn't detect your shell from $SHELL ({other:?}) — pass --shell bash|zsh"
+        ),
+    }
+}
+
+fn rc_file_for(shell: &str) -> &'static str {
+    if shell == "zsh" {
+        ".zshrc"
+    } else {
+        ".bashrc"
+    }
+}
+
+fn hook_block_for(shell: &str) -> String {
+    if shell == "zsh" {
+        zsh_hook_block()
+    } else {
+        bash_hook_block()
+    }
+}
+
+/// `remux setup shell` — describe, confirm, and install/remove the command-feed
+/// hook for the user's shell (bash or zsh). Only edits the rc file; does not
+/// need the daemon running.
 fn setup_shell(cmd: SetupCmd) -> Result<()> {
     use std::io::Write;
     let SetupCmd::Shell {
+        shell,
         yes,
         uninstall,
         print,
     } = cmd;
-    let block = shell_hook_block();
+    let shell = resolve_shell(shell)?;
+    let block = hook_block_for(shell);
     if print {
         println!("{block}");
         return Ok(());
     }
     let rc = dirs::home_dir()
         .context("no home directory")?
-        .join(".zshrc");
+        .join(rc_file_for(shell));
     // A read error other than "missing" must NEVER lead to overwriting the
     // file (a non-UTF-8 or transiently-unreadable rc would otherwise be
     // clobbered with just our block).
@@ -381,10 +480,13 @@ fn setup_shell(cmd: SetupCmd) -> Result<()> {
             println!("No remux hook found in {}.", rc.display());
             return Ok(());
         }
-        let stripped = strip_hook_block(&existing).context(
-            "the remux hook block in ~/.zshrc is malformed (unpaired markers) — \
-             refusing to edit it; remove it by hand",
-        )?;
+        let stripped = strip_hook_block(&existing).with_context(|| {
+            format!(
+                "the remux hook block in {} is malformed (unpaired markers) — \
+                 refusing to edit it; remove it by hand",
+                rc.display()
+            )
+        })?;
         atomic_write_rc(&rc, &stripped)?;
         println!(
             "Removed the remux command-feed hook from {}. Open a new shell to apply.",
@@ -401,9 +503,12 @@ fn setup_shell(cmd: SetupCmd) -> Result<()> {
         return Ok(());
     }
 
-    println!("{SHELL_HOOK_WHY}");
+    println!("{}", zsh_hook_why());
     if !yes {
-        print!("Add this hook to {}? [y/N] ", rc.display());
+        print!(
+            "\nAdd it to {} (detected shell: {shell})? [y/N] ",
+            rc.display()
+        );
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
@@ -422,8 +527,8 @@ fn setup_shell(cmd: SetupCmd) -> Result<()> {
     content.push('\n');
     atomic_write_rc(&rc, &content)?;
     println!(
-        "Installed into {}. Open a new shell (or `source ~/.zshrc`) inside your \
-         remux tmux, then check aA -> Command feed on your phone.",
+        "Installed into {}. Open a new shell (a new tmux window/pane, or `exec {shell}`) \
+         inside your remux tmux, then check aA -> Command feed on your phone.",
         rc.display()
     );
     Ok(())
@@ -633,7 +738,7 @@ mod tests {
             c.push('\n');
         }
         c.push('\n');
-        c.push_str(&shell_hook_block());
+        c.push_str(&zsh_hook_block());
         c.push('\n');
         c
     }
@@ -683,11 +788,43 @@ mod tests {
     }
 
     #[test]
-    fn generated_hook_carries_the_opt_in_and_pane_guard() {
-        let b = shell_hook_block();
-        assert!(b.contains("export REMUX_CAPTURE=1"));
-        assert!(b.contains("[[ -n $TMUX_PANE && -n $REMUX_CAPTURE ]]"));
-        assert!(b.contains("emit command-start"));
-        assert!(b.contains("emit command-end"));
+    fn both_hooks_carry_the_opt_in_guard_and_emits() {
+        for b in [zsh_hook_block(), bash_hook_block()] {
+            assert!(b.contains("export REMUX_CAPTURE=1"));
+            assert!(b.contains("$TMUX_PANE"));
+            assert!(b.contains("$REMUX_CAPTURE"));
+            assert!(b.contains("emit command-start"));
+            assert!(b.contains("emit command-end"));
+            assert!(b.contains(SHELL_HOOK_BEGIN) && b.contains(SHELL_HOOK_END));
+        }
+    }
+
+    #[test]
+    fn bash_hook_composes_and_captures_safely() {
+        let b = bash_hook_block();
+        // $? and $BASH_COMMAND captured in the trap ACTION (fire time).
+        assert!(b.contains(r#"trap '_remux_pre "$?" "$BASH_COMMAND"' DEBUG"#));
+        // Exit recorded once, guarded — PROMPT_COMMAND commands can't overwrite.
+        assert!(b.contains("-z $_remux_got ]]; then _remux_ret=$1"));
+        assert!(b.contains("--exit \"$_remux_ret\""));
+        // set -u safe.
+        assert!(b.contains("${COMP_LINE-}"));
+        // Appends to PROMPT_COMMAND (existing hooks run first, see real $?).
+        assert!(b.contains(r#"PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}_remux_precmd""#));
+        // Does not clobber an existing DEBUG trap.
+        assert!(b.contains("if [[ -z $(trap -p DEBUG) ]]; then"));
+    }
+
+    #[test]
+    fn bash_block_round_trips_through_strip() {
+        let original = "# bashrc\nexport A=1\n";
+        let installed = format!("{original}\n{}\n", bash_hook_block());
+        assert_eq!(strip_hook_block(&installed).as_deref(), Some(original));
+    }
+
+    #[test]
+    fn resolve_shell_honors_flag() {
+        assert_eq!(resolve_shell(Some("bash".into())).unwrap(), "bash");
+        assert_eq!(resolve_shell(Some("zsh".into())).unwrap(), "zsh");
     }
 }

@@ -139,16 +139,20 @@ pub enum EmitCmd {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum SetupCmd {
-    /// Install (or remove) the zsh command-feed hook in ~/.zshrc (M4c). Prints
-    /// what it does and why, and asks before writing anything (unless --yes).
+    /// Install (or remove) the command-feed hook (M4c) in your shell's rc file
+    /// (bash → ~/.bashrc, zsh → ~/.zshrc; auto-detected). Prints what it does
+    /// and why, and asks before writing anything (unless --yes).
     Shell {
+        /// Which shell to install for. Auto-detected from $SHELL if omitted.
+        #[arg(long, value_parser = ["bash", "zsh"])]
+        shell: Option<String>,
         /// Install without the interactive confirmation prompt.
         #[arg(long, conflicts_with_all = ["uninstall", "print"])]
         yes: bool,
-        /// Remove the remux hook block from ~/.zshrc.
+        /// Remove the remux hook block from the shell's rc file.
         #[arg(long, conflicts_with = "print")]
         uninstall: bool,
-        /// Print the snippet instead of touching ~/.zshrc (manual/other shells).
+        /// Print the snippet instead of touching the rc file (manual install).
         #[arg(long)]
         print: bool,
     },

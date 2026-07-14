@@ -1,16 +1,25 @@
-//! Local ingest interface (M4a): a Unix socket in the state dir where hook
+//! Local ingest interface (M4a/M4b): a Unix socket in the state dir where hook
 //! scripts report semantic events — "Claude Code is waiting for input in
-//! pane %3". Same filesystem authentication as the admin socket (0600 +
-//! peer-uid), but a deliberately separate surface: admin accepts *commands*
-//! from the owner, ingest accepts *data* from same-uid hook processes. An
-//! ingest event can raise attention; it can never act.
+//! pane %3" (M4a), or "Claude Code wants permission to run X; block until a
+//! device decides" (M4b). Same filesystem authentication as the admin socket
+//! (0600 + peer-uid), but a deliberately separate surface: admin accepts
+//! *commands* from the owner, ingest accepts *data* from same-uid hook
+//! processes. An ingest event can raise attention or open a permission card;
+//! it can never act — only a paired, approve-capable device decides a card.
 //!
-//! Protocol: one JSON line in, one JSON ack out, connection closed. The
-//! schema is strict (unknown fields and kinds are errors, fields are
-//! length-capped) and the socket is rate-limited — a confused or hostile
-//! same-uid process can at worst make notifications noisy, and even that
-//! is bounded.
+//! Connection lifecycle (kind-dependent, Codex-reviewed):
+//!
+//! ```text
+//! 1. bounded admission + read + parse (short deadline, fail-fast pool)
+//! 2. dispatch on `kind`
+//! 3a. fire-and-forget kinds ack immediately (M4a); or
+//! 3b. agent_permission holds the connection up to CARD_TTL, releasing the
+//!     admission slot and instead occupying a bounded registry slot, while
+//!     concurrently watching for a decision, expiry, and the client vanishing
+//!     (the Mac answered and Claude SIGTERM'd the hook).
+//! ```
 
+use crate::permit::{self, Card, Decision};
 use crate::App;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -19,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Cap on the bytes read from one connection; a document that large without
 /// its newline inside the cap fails parsing. Events are tiny; anything
@@ -26,28 +36,43 @@ use tokio::net::{UnixListener, UnixStream};
 const MAX_LINE: u64 = 4096;
 const MAX_SOURCE: usize = 32;
 const MAX_MESSAGE: usize = 256;
+const MAX_TOOL: usize = 32;
+const MAX_SUMMARY: usize = 256;
+const MAX_PROMPT_ID: usize = 64;
 const MAX_PANE: usize = 16;
 /// Rate limit: events *offered* per window, across all producers — charged
 /// before parsing, deliberately: malformed floods must not get free parse
 /// work, at the cost that one confused producer can starve the window.
 const RATE_MAX: u32 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-/// Concurrent connections; excess connects are dropped (hooks fail fast and
-/// exit non-zero — never queue a slow client).
+/// Concurrent connections in the read/parse phase; excess connects are dropped
+/// (hooks fail fast and exit non-zero — never queue a slow client). Held
+/// permission waits do NOT sit in this pool: they release their admission slot
+/// and are bounded instead by the permit registry.
 const MAX_CONNS: usize = 16;
-/// A connection must deliver its line and take its ack within this budget.
-const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for the short phases: reading the request line, and writing an ack.
+/// The held-wait uses CARD_TTL instead, via its own timer.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("ingest.sock")
 }
 
-/// Wire format. A plain struct + `kind` match (not an internally-tagged
-/// enum) so `deny_unknown_fields` applies reliably.
+/// Just enough to route by kind. No `deny_unknown_fields` — this only reads
+/// the envelope; the per-kind struct below is the strict schema.
+#[derive(Deserialize)]
+struct Envelope {
+    v: u32,
+    kind: String,
+}
+
+/// M4a attention event. Strict schema (a contract, not a hint).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Event {
+struct AttentionEvent {
+    #[allow(dead_code)]
     v: u32,
+    #[allow(dead_code)]
     kind: String,
     /// tmux pane id (`%N`) — `$TMUX_PANE` in the producer's environment.
     pane: String,
@@ -56,6 +81,28 @@ struct Event {
     /// Optional human-readable detail. Informational; sanitized and capped.
     #[serde(default)]
     message: Option<String>,
+}
+
+/// M4b permission event. Strict per-kind schema so the required fields can't be
+/// omitted and meaningless field combinations can't slip through a shared flat
+/// struct.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionEvent {
+    #[allow(dead_code)]
+    v: u32,
+    #[allow(dead_code)]
+    kind: String,
+    pane: String,
+    source: String,
+    /// Tool name from the hook payload ("Bash", "Edit", …).
+    tool: String,
+    /// One-line human summary (command / file path). Sanitized and capped;
+    /// never shown on the lock screen — fetched post-auth (secrets posture).
+    summary: String,
+    /// Claude Code's `prompt_id`, for dedup/correlation. Optional; validated.
+    #[serde(default)]
+    prompt_id: Option<String>,
 }
 
 struct RateLimiter {
@@ -104,8 +151,9 @@ pub fn spawn(app: Arc<App>, state_dir: &Path) -> Result<()> {
                 tracing::warn!("ingest socket: rejected connection from another uid");
                 continue;
             }
-            // Slow-client defence: bounded concurrency + a hard per-connection
-            // deadline. Excess or stalled producers are dropped, not queued.
+            // Slow-client defence: bounded admission concurrency. Excess or
+            // stalled producers are dropped, not queued. The permit is handed
+            // to the handler so the held-wait path can release it early.
             let Ok(permit) = conns.clone().try_acquire_owned() else {
                 tracing::warn!("ingest socket: connection limit reached, dropping");
                 continue;
@@ -113,11 +161,8 @@ pub fn spawn(app: Arc<App>, state_dir: &Path) -> Result<()> {
             let app = app.clone();
             let limiter = limiter.clone();
             tokio::spawn(async move {
-                let _permit = permit;
-                match tokio::time::timeout(CONN_TIMEOUT, handle(stream, app, limiter)).await {
-                    Ok(Err(e)) => tracing::debug!("ingest event failed: {e:#}"),
-                    Err(_) => tracing::debug!("ingest connection timed out"),
-                    Ok(Ok(())) => {}
+                if let Err(e) = handle(stream, app, limiter, permit).await {
+                    tracing::debug!("ingest connection failed: {e:#}");
                 }
             });
         }
@@ -125,35 +170,64 @@ pub fn spawn(app: Arc<App>, state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn write_ack<W: AsyncWriteExt + Unpin>(
+    write: &mut W,
+    resp: &serde_json::Value,
+) -> Result<()> {
+    write.write_all(format!("{resp}\n").as_bytes()).await?;
+    Ok(())
+}
+
 async fn handle(
     stream: UnixStream,
     app: Arc<App>,
     limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut line = String::new();
     // take() caps how much one connection can feed us; a line that hits the
     // cap can't have a trailing newline and fails parsing below.
     let mut reader = BufReader::new(read).take(MAX_LINE);
-    reader.read_line(&mut line).await?;
-    let response = if !limiter.lock().unwrap().allow() {
-        serde_json::json!({ "ok": false, "error": "rate limited" })
-    } else {
-        match serde_json::from_str::<Event>(line.trim()) {
-            Ok(ev) => process(&app, ev),
-            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-        }
+    let mut line = String::new();
+    tokio::time::timeout(IO_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .context("ingest read timed out")??;
+
+    // Rate limit charged pre-parse, before any per-kind work.
+    if !limiter.lock().unwrap().allow() {
+        return write_ack(&mut write, &json_err("rate limited")).await;
+    }
+
+    let line = line.trim();
+    let kind = match serde_json::from_str::<Envelope>(line) {
+        Ok(e) if e.v == 1 => e.kind,
+        Ok(_) => return write_ack(&mut write, &json_err("unsupported version")).await,
+        Err(e) => return write_ack(&mut write, &json_err(&e.to_string())).await,
     };
-    write.write_all(format!("{response}\n").as_bytes()).await?;
-    Ok(())
+
+    match kind.as_str() {
+        "agent_needs_input" => {
+            let resp = match serde_json::from_str::<AttentionEvent>(line) {
+                Ok(ev) => process_attention(&app, ev),
+                Err(e) => json_err(&e.to_string()),
+            };
+            write_ack(&mut write, &resp).await
+        }
+        "agent_permission" => match serde_json::from_str::<PermissionEvent>(line) {
+            Ok(ev) => handle_permission(app, ev, reader, write, permit).await,
+            Err(e) => write_ack(&mut write, &json_err(&e.to_string())).await,
+        },
+        _ => write_ack(&mut write, &json_err("unknown kind")).await,
+    }
 }
 
-fn process(app: &App, ev: Event) -> serde_json::Value {
-    if ev.v != 1 {
-        return serde_json::json!({ "ok": false, "error": "unsupported version" });
-    }
+fn json_err(msg: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": msg })
+}
+
+fn process_attention(app: &App, ev: AttentionEvent) -> serde_json::Value {
     if !valid_pane(&ev.pane) {
-        return serde_json::json!({ "ok": false, "error": "bad pane id (want %N)" });
+        return json_err("bad pane id (want %N)");
     }
     let message = ev.message.as_deref().map(sanitize).unwrap_or_default();
     // All producer strings are same-uid-controlled; sanitize, then validate
@@ -161,36 +235,142 @@ fn process(app: &App, ev: Event) -> serde_json::Value {
     // be rejected, not become "").
     let source = sanitize(&ev.source);
     if source.is_empty() || source.len() > MAX_SOURCE {
-        return serde_json::json!({ "ok": false, "error": "bad source" });
+        return json_err("bad source");
     }
-    match ev.kind.as_str() {
-        "agent_needs_input" => {
-            let session = match sessions_of_pane(app, &ev.pane).as_slice() {
-                [] => return serde_json::json!({ "ok": false, "error": "unknown pane" }),
-                [one] => one.clone(),
-                // Linked windows: the same pane can live in several sessions.
-                // Guessing the wrong one would notify for the wrong session.
-                _ => {
-                    return serde_json::json!({ "ok": false,
-                        "error": "pane is linked into multiple sessions" })
-                }
-            };
-            tracing::info!(
-                session = %session, pane = %ev.pane, source = %source,
-                message = %message, "ingest: agent needs input"
-            );
-            // The existing attention pipeline does the rest: push dispatch
-            // (with its suppression rules), in-band ws frames, and the
-            // /api/attention deep link.
-            let _ = app.attention.send(crate::Attention {
-                session: session.clone(),
-                kind: ev.kind,
-                reason: (!message.is_empty()).then_some(message),
-                source: Some(source),
-            });
-            serde_json::json!({ "ok": true, "session": session })
-        }
-        _ => serde_json::json!({ "ok": false, "error": "unknown kind" }),
+    let session = match sessions_of_pane(app, &ev.pane) {
+        Ok(s) => s,
+        Err(e) => return json_err(e),
+    };
+    tracing::info!(
+        session = %session, pane = %ev.pane, source = %source,
+        message = %message, "ingest: agent needs input"
+    );
+    // The existing attention pipeline does the rest: push dispatch (with its
+    // suppression rules), in-band ws frames, and the /api/attention deep link.
+    let _ = app.attention.send(crate::Attention {
+        session: session.clone(),
+        kind: "agent_needs_input".into(),
+        reason: (!message.is_empty()).then_some(message),
+        source: Some(source),
+    });
+    serde_json::json!({ "ok": true, "session": session })
+}
+
+/// Removes a card from the registry on any exit of the held-wait future,
+/// including task cancellation (the outer future being dropped) — so an
+/// aborted wait cannot orphan a registry slot. `resolve` may have already
+/// taken the entry; `remove` is idempotent.
+struct CardGuard {
+    app: Arc<App>,
+    id: String,
+}
+
+impl Drop for CardGuard {
+    fn drop(&mut self) {
+        self.app.perms.remove(&self.id);
+    }
+}
+
+async fn handle_permission(
+    app: Arc<App>,
+    ev: PermissionEvent,
+    reader: tokio::io::Take<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    permit: OwnedSemaphorePermit,
+) -> Result<()> {
+    if !valid_pane(&ev.pane) {
+        return write_ack(&mut write, &json_err("bad pane id (want %N)")).await;
+    }
+    let source = sanitize(&ev.source);
+    if source.is_empty() || source.len() > MAX_SOURCE {
+        return write_ack(&mut write, &json_err("bad source")).await;
+    }
+    let tool = sanitize(&ev.tool);
+    if tool.is_empty() || tool.len() > MAX_TOOL {
+        return write_ack(&mut write, &json_err("bad tool")).await;
+    }
+    let summary: String = sanitize(&ev.summary).chars().take(MAX_SUMMARY).collect();
+    // A present-but-malformed prompt_id is rejected, not silently dropped —
+    // dropping it to None would sever dedup/correlation and turn a retry into
+    // an unrelated card.
+    let prompt_id = match ev.prompt_id {
+        Some(p) if valid_prompt_id(&p) => Some(p),
+        Some(_) => return write_ack(&mut write, &json_err("bad prompt_id")).await,
+        None => None,
+    };
+    let session = match sessions_of_pane(&app, &ev.pane) {
+        Ok(s) => s,
+        Err(e) => return write_ack(&mut write, &json_err(e)).await,
+    };
+
+    let now = Instant::now();
+    let card = Card {
+        id: permit::mint_id(),
+        session: session.clone(),
+        pane: ev.pane.clone(),
+        source: source.clone(),
+        tool: tool.clone(),
+        summary,
+        prompt_id,
+        created: now,
+        deadline: now + permit::CARD_TTL,
+    };
+    let rx = match app.perms.insert(card.clone()) {
+        Ok(rx) => rx,
+        // Cap hit → immediate reject → the hook falls back to the Mac dialog.
+        Err(msg) => return write_ack(&mut write, &json_err(msg)).await,
+    };
+    let _guard = CardGuard {
+        app: app.clone(),
+        id: card.id.clone(),
+    };
+    // Past read/parse and now holding a bounded registry slot: release the
+    // admission permit so a burst of held waits can't exhaust the ingest pool.
+    drop(permit);
+    tracing::info!(
+        id = %card.id, session = %card.session, pane = %card.pane,
+        source = %card.source, tool = %card.tool, "ingest: permission card opened"
+    );
+
+    // Recover the raw read half for EOF detection. Our protocol has the client
+    // send exactly one line then wait, so the BufReader holds nothing more; the
+    // Take limit is irrelevant here.
+    let read_half = reader.into_inner().into_inner();
+    let decision = wait_for_decision(rx, read_half).await;
+
+    let resp = match decision {
+        Some(d) => serde_json::json!({ "ok": true, "decision": d.as_str() }),
+        // No decision (expiry / client gone). Never fabricated — the hook exits
+        // non-zero and Claude Code asks on the Mac.
+        None => json_err("expired"),
+    };
+    // Bounded final write — a wedged client must not hold the task open.
+    let _ = tokio::time::timeout(IO_TIMEOUT, write_ack(&mut write, &resp)).await;
+    Ok(())
+    // _guard drops here → app.perms.remove(card.id) (no-op if resolve took it).
+}
+
+/// Await whichever comes first: a device decision, expiry, or the client
+/// disappearing. A broken/closed connection means the Mac already answered (or
+/// the hook died) — treated as "no decision", never a fabricated allow/deny.
+async fn wait_for_decision(
+    rx: tokio::sync::oneshot::Receiver<Decision>,
+    mut read_half: tokio::net::unix::OwnedReadHalf,
+) -> Option<Decision> {
+    let mut buf = [0u8; 64];
+    tokio::select! {
+        // `biased`: poll the socket first so a closed connection wins any tie
+        // with a simultaneously-ready decision. That keeps the invariant that a
+        // broken wait (the Mac answered, Claude SIGTERM'd the hook) is never
+        // overridden by a late phone decision — on this branch `rx` is dropped,
+        // so a racing resolve()'s send fails and reports Unknown.
+        biased;
+        // Ok(0) = EOF, Ok(n) = unexpected trailing bytes, Err = reset. All mean
+        // the waiting client is effectively gone.
+        _ = read_half.read(&mut buf) => None,
+        // Resolved by a device (Ok) or the sender was dropped by cleanup (Err).
+        d = rx => d.ok(),
+        _ = tokio::time::sleep(permit::CARD_TTL) => None,
     }
 }
 
@@ -209,24 +389,58 @@ fn valid_pane(s: &str) -> bool {
         && s[1..].chars().all(|c| c.is_ascii_digit())
 }
 
-/// Sessions containing pane `%N` per the latest topology snapshot. More than
-/// one is possible with linked windows.
-fn sessions_of_pane(app: &App, pane: &str) -> Vec<String> {
+/// Claude Code prompt ids are uuid-ish; accept a conservative shape and cap.
+fn valid_prompt_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PROMPT_ID
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The single session containing pane `%N` per the latest topology snapshot.
+/// More than one is possible with linked windows — ambiguous, so refused
+/// (guessing would notify/act for the wrong session).
+fn sessions_of_pane(app: &App, pane: &str) -> Result<String, &'static str> {
     let snap = app.topology.borrow();
-    snap.iter()
-        .filter(|s| {
-            s.windows
-                .iter()
-                .any(|w| w.panes.iter().any(|p| p.id == pane))
-        })
-        .map(|s| s.name.clone())
-        .collect()
+    let mut matches = snap.iter().filter(|s| {
+        s.windows
+            .iter()
+            .any(|w| w.panes.iter().any(|p| p.id == pane))
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => Err("unknown pane"),
+        (Some(s), None) => Ok(s.name.clone()),
+        (Some(_), Some(_)) => Err("pane is linked into multiple sessions"),
+    }
 }
 
 /// CLI side (`remux emit`): one line-JSON event, one ack. Deadlined — a
 /// wedged daemon must fail the hook fast, not hang it (connect on a local
 /// Unix socket never blocks meaningfully; read/write can).
 pub fn request(state_dir: &Path, body: serde_json::Value) -> Result<serde_json::Value> {
+    let v = request_raw(state_dir, body, IO_TIMEOUT)?;
+    if v["ok"] != serde_json::json!(true) {
+        anyhow::bail!("daemon refused event: {}", v["error"]);
+    }
+    Ok(v)
+}
+
+/// CLI side for `remux emit permission --wait`: like `request`, but the read
+/// deadline outlasts the daemon's own card expiry (the daemon decides first;
+/// this timeout is only a backstop against a wedged daemon). Returns the raw
+/// response — the caller distinguishes a decision from an `expired` ack.
+pub fn request_wait(state_dir: &Path, body: serde_json::Value) -> Result<serde_json::Value> {
+    // CARD_TTL plus slack: the daemon answers at CARD_TTL, so this must be
+    // comfortably longer or a slow ack would look like a daemon hang.
+    let deadline = permit::CARD_TTL + Duration::from_secs(30);
+    request_raw(state_dir, body, deadline)
+}
+
+fn request_raw(
+    state_dir: &Path,
+    body: serde_json::Value,
+    read_timeout: Duration,
+) -> Result<serde_json::Value> {
     use std::io::{BufRead, BufReader, Write};
     let path = socket_path(state_dir);
     let stream = std::os::unix::net::UnixStream::connect(&path).with_context(|| {
@@ -235,17 +449,13 @@ pub fn request(state_dir: &Path, body: serde_json::Value) -> Result<serde_json::
             path.display()
         )
     })?;
-    stream.set_read_timeout(Some(CONN_TIMEOUT))?;
-    stream.set_write_timeout(Some(CONN_TIMEOUT))?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut stream = stream;
     stream.write_all(format!("{body}\n").as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    let v: serde_json::Value = serde_json::from_str(line.trim()).context("bad ingest response")?;
-    if v["ok"] != serde_json::json!(true) {
-        anyhow::bail!("daemon refused event: {}", v["error"]);
-    }
-    Ok(v)
+    serde_json::from_str(line.trim()).context("bad ingest response")
 }
 
 #[cfg(test)]
@@ -255,18 +465,41 @@ mod tests {
     #[test]
     fn strict_schema() {
         let ok = r#"{"v":1,"kind":"agent_needs_input","pane":"%1","source":"claude-code"}"#;
-        assert!(serde_json::from_str::<Event>(ok).is_ok());
+        assert!(serde_json::from_str::<AttentionEvent>(ok).is_ok());
         // Unknown fields are errors — the schema is a contract, not a hint.
         let extra = r#"{"v":1,"kind":"x","pane":"%1","source":"s","cmd":"revoke"}"#;
-        assert!(serde_json::from_str::<Event>(extra).is_err());
+        assert!(serde_json::from_str::<AttentionEvent>(extra).is_err());
         let missing = r#"{"v":1,"kind":"agent_needs_input"}"#;
-        assert!(serde_json::from_str::<Event>(missing).is_err());
+        assert!(serde_json::from_str::<AttentionEvent>(missing).is_err());
+    }
+
+    #[test]
+    fn permission_schema_requires_tool_and_summary() {
+        let ok = r#"{"v":1,"kind":"agent_permission","pane":"%1","source":"claude-code",
+            "tool":"Bash","summary":"touch x"}"#;
+        assert!(serde_json::from_str::<PermissionEvent>(ok).is_ok());
+        // Missing required fields.
+        let no_tool = r#"{"v":1,"kind":"agent_permission","pane":"%1","source":"s","summary":"x"}"#;
+        assert!(serde_json::from_str::<PermissionEvent>(no_tool).is_err());
+        // Unknown field rejected.
+        let extra = r#"{"v":1,"kind":"agent_permission","pane":"%1","source":"s",
+            "tool":"Bash","summary":"x","behavior":"allow"}"#;
+        assert!(serde_json::from_str::<PermissionEvent>(extra).is_err());
     }
 
     #[test]
     fn sanitize_strips_and_caps() {
         assert_eq!(sanitize("a\x1b[31mb\nc"), "a[31mbc");
         assert_eq!(sanitize(&"x".repeat(1000)).len(), MAX_MESSAGE);
+    }
+
+    #[test]
+    fn prompt_id_shape() {
+        assert!(valid_prompt_id("9bf86345-4606-4072-86e8-c3a969332e11"));
+        assert!(!valid_prompt_id(""));
+        assert!(!valid_prompt_id(&"a".repeat(65)));
+        assert!(!valid_prompt_id("has space"));
+        assert!(!valid_prompt_id("semi;colon"));
     }
 
     #[test]

@@ -389,15 +389,26 @@ PermissionRequest doesn't fire in `-p` mode and that swapping in PreToolUse
 would change the fallback from "ask on Mac" to "hard block".
 
 **Build increments** (each: tests + Codex review + commit):
-1. Ingest lifecycle refactor + registry + `resolve` + held-wait path with
-   EOF monitoring + `emit permission --wait` + `Device.approve` +
-   grant/revoke CLI. Tested via a **test-only resolver**, not a shipped
-   host approve-bypass command (Codex minor). Update all `App` test
-   constructors for the new fields.
+1. **DONE (2026-07-14).** Ingest lifecycle refactor + `permit::Registry`
+   (single-winner `resolve` with the capability check evaluated *under the
+   registry lock*, prompt_id dedup, global/per-pane caps, 128-bit ids) +
+   held-wait path (biased select: socket-EOF wins ties, so a broken wait is
+   never overridden by a late decision) + RAII `CardGuard` cleanup on abort
+   + `emit permission --wait` (stdin parse, stdout is decision-JSON-only,
+   logs forced to stderr) + `Device.approve` + grant/revoke CLI. Resolved
+   via a test-only resolver (no shipped approve-bypass). Codex-reviewed
+   (1 blocker, 4 major — all fixed).
 2. Broadcast channel + reconcile-on-subscribe + HTTP decide/list endpoints
    (approve-gated) + WS card frame + generic permission attention with its
-   own retention. Delivery tests: setup race, backgrounded live socket,
-   socket on another session, non-approve socket.
+   own retention. ⚑ **Delivery confirmation (from the increment-1 review):**
+   the decision endpoint's response to the phone must reflect *actual
+   delivery to the waiting hook*, not merely that `resolve` consumed the
+   card — otherwise a decision racing a socket-close could show the phone
+   "approved" while the biased select discarded it. `resolve` returns the
+   `Card`, but the waiter owns the write; wire the endpoint to await that
+   outcome (e.g. a confirmation channel) before reporting success. Delivery
+   tests: setup race, backgrounded live socket, socket on another session,
+   non-approve socket.
 3. PWA card UI (notification → post-auth fetch → Approve/Deny; disabled
    past deadline via a returned remaining-TTL). Non-approve = no details.
 4. On-device integration test.

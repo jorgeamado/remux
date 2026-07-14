@@ -27,6 +27,7 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
     });
     remux::attention::spawn(app.clone());
 

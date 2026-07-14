@@ -4,9 +4,10 @@
 mod common;
 
 use clap::Parser;
-use remux::{auth::Auth, tmux, App, Args};
+use remux::{auth::Auth, permit::Decision, tmux, App, Args};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
@@ -22,6 +23,7 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
     })
 }
 
@@ -152,6 +154,128 @@ async fn pane_linked_into_two_sessions_is_ambiguous() {
     .unwrap();
     assert_eq!(v["ok"], false);
     assert!(attention.try_recv().is_err());
+}
+
+/// Wait (bounded) until the registry snapshot satisfies `pred`, returning it.
+async fn await_perms<F: Fn(&[remux::permit::Card]) -> bool>(
+    app: &Arc<App>,
+    pred: F,
+) -> Vec<remux::permit::Card> {
+    for _ in 0..200 {
+        let snap = app.perms.snapshot();
+        if pred(&snap) {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("registry predicate not satisfied within 2s");
+}
+
+#[tokio::test]
+async fn permission_card_resolves_and_wakes_the_blocked_hook() {
+    let dir = std::env::temp_dir().join(format!("remux-ingest-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "perm1");
+    app.topology.send_replace(snapshot("perm1"));
+    remux::ingest::spawn(app.clone(), &dir).unwrap();
+
+    // The "hook": send the permission event and block reading the ack.
+    let dir2 = dir.clone();
+    let client = tokio::task::spawn_blocking(move || {
+        send(
+            &dir2,
+            serde_json::json!({
+                "v": 1, "kind": "agent_permission", "pane": "%1",
+                "source": "claude-code", "tool": "Bash", "summary": "touch x"
+            }),
+        )
+    });
+
+    // The card appears; the device (here, the test) approves it.
+    let snap = await_perms(&app, |s| s.len() == 1).await;
+    let card = &snap[0];
+    assert_eq!(card.session, "perm1");
+    assert_eq!(card.tool, "Bash");
+    assert_eq!(card.summary, "touch x");
+    assert_eq!(
+        app.perms
+            .resolve(&card.id, Decision::Allow, || true)
+            .map(|c| c.id),
+        Ok(card.id.clone())
+    );
+
+    // The blocked hook wakes with the decision, and the card is consumed.
+    let v = client.await.unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["decision"], "allow");
+    assert_eq!(app.perms.snapshot().len(), 0);
+}
+
+#[tokio::test]
+async fn permission_card_dropped_when_the_hook_disconnects() {
+    // The Mac-answered case: Claude SIGTERMs the hook, its socket closes; the
+    // daemon must notice the EOF and drop the card so no late device decision
+    // can resolve it. (See docs/spikes/M4.0-protocol.md.)
+    let dir = std::env::temp_dir().join(format!("remux-ingest-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "perm2");
+    app.topology.send_replace(snapshot("perm2"));
+    remux::ingest::spawn(app.clone(), &dir).unwrap();
+
+    let path = remux::ingest::socket_path(&dir);
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+    let hook = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let body = serde_json::json!({
+            "v": 1, "kind": "agent_permission", "pane": "%1",
+            "source": "claude-code", "tool": "Bash", "summary": "rm -rf /"
+        });
+        s.write_all(format!("{body}\n").as_bytes()).unwrap();
+        // Hold the connection open until told to drop it (simulating the hook
+        // being alive), then close without ever reading a decision.
+        drop_rx.recv().unwrap();
+        drop(s);
+    });
+
+    // Card is open while the hook is connected.
+    let snap = await_perms(&app, |s| s.len() == 1).await;
+    let id = snap[0].id.clone();
+
+    // Hook dies (connection closes) → EOF → daemon drops the card.
+    drop_tx.send(()).unwrap();
+    hook.await.unwrap();
+    await_perms(&app, |s| s.is_empty()).await;
+
+    // A decision arriving after the drop resolves nothing.
+    assert_eq!(
+        app.perms.resolve(&id, Decision::Allow, || true),
+        Err(remux::permit::ResolveError::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn permission_for_unknown_pane_opens_no_card() {
+    let dir = std::env::temp_dir().join(format!("remux-ingest-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = test_app(&dir, "perm3");
+    app.topology.send_replace(snapshot("perm3"));
+    remux::ingest::spawn(app.clone(), &dir).unwrap();
+
+    let dir2 = dir.clone();
+    let v = tokio::task::spawn_blocking(move || {
+        send(
+            &dir2,
+            serde_json::json!({
+                "v": 1, "kind": "agent_permission", "pane": "%99",
+                "source": "claude-code", "tool": "Bash", "summary": "x"
+            }),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(app.perms.snapshot().len(), 0);
 }
 
 #[tokio::test]

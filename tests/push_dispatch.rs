@@ -60,6 +60,7 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
     });
     app.push
         .subscribe(Subscription {

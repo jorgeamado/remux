@@ -2,6 +2,7 @@ pub mod admin;
 pub mod attention;
 pub mod auth;
 pub mod ingest;
+pub mod permit;
 pub mod push;
 pub mod server;
 pub mod tmux;
@@ -63,6 +64,26 @@ pub enum EmitCmd {
         /// Short human-readable detail (sanitized and capped by the daemon).
         #[arg(long)]
         message: Option<String>,
+    },
+    /// An agent permission prompt: block until a device approves/denies, then
+    /// print Claude Code's decision JSON on stdout. Reads the hook's
+    /// PermissionRequest payload (tool_name, tool_input, prompt_id) from stdin
+    /// — the install snippet pipes it straight through, so no fragile shell
+    /// extraction. On any failure (no decision, expiry, daemon down) prints a
+    /// diagnostic to stderr and exits non-zero, which makes Claude Code fall
+    /// back to its own dialog on the Mac.
+    Permission {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE (read here, not from the
+        /// hook payload, which doesn't carry it).
+        #[arg(long)]
+        pane: Option<String>,
+        /// Producer label.
+        #[arg(long, default_value = "claude-code")]
+        source: String,
+        /// Present for symmetry with the docs; the wait is implied for this
+        /// subcommand (a permission prompt with no blocking makes no sense).
+        #[arg(long, default_value_t = true)]
+        wait: bool,
     },
 }
 
@@ -168,6 +189,8 @@ pub struct App {
     pub revoked: tokio::sync::broadcast::Sender<String>,
     /// Latest tmux topology (sessions → windows), streamed to every client.
     pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
+    /// Open agent permission cards (M4b) awaiting a decision from a device.
+    pub perms: permit::Registry,
 }
 
 /// Select the process-wide rustls crypto provider. Both axum-server and

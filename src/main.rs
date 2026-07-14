@@ -9,7 +9,11 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     remux::init_crypto();
+    // Logs go to stderr, unconditionally. `remux emit permission` prints
+    // Claude Code's decision JSON to stdout and the hook parses it, so a stray
+    // tracing line on stdout would corrupt the contract.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "remux=info,warn".into()),
@@ -113,28 +117,34 @@ async fn main() -> Result<()> {
             );
             return Ok(());
         }
-        Cmd::Emit { cmd } => {
-            let EmitCmd::NeedsInput {
+        Cmd::Emit { cmd } => match cmd {
+            EmitCmd::NeedsInput {
                 pane,
                 source,
                 message,
-            } = cmd;
-            let pane = pane
-                .or_else(|| std::env::var("TMUX_PANE").ok())
-                .context("no --pane and no $TMUX_PANE in the environment")?;
-            let v = ingest::request(
-                &state_dir,
-                serde_json::json!({
-                    "v": 1, "kind": "agent_needs_input",
-                    "pane": pane, "source": source, "message": message,
-                }),
-            )?;
-            println!(
-                "ok: event accepted for session {}",
-                v["session"].as_str().unwrap_or("?")
-            );
-            return Ok(());
-        }
+            } => {
+                let pane = pane
+                    .or_else(|| std::env::var("TMUX_PANE").ok())
+                    .context("no --pane and no $TMUX_PANE in the environment")?;
+                let v = ingest::request(
+                    &state_dir,
+                    serde_json::json!({
+                        "v": 1, "kind": "agent_needs_input",
+                        "pane": pane, "source": source, "message": message,
+                    }),
+                )?;
+                println!(
+                    "ok: event accepted for session {}",
+                    v["session"].as_str().unwrap_or("?")
+                );
+                return Ok(());
+            }
+            EmitCmd::Permission {
+                pane,
+                source,
+                wait: _,
+            } => return emit_permission(&state_dir, pane, source),
+        },
     };
 
     std::fs::create_dir_all(&state_dir)?;
@@ -186,6 +196,7 @@ async fn main() -> Result<()> {
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
     });
 
     if !app.args.no_pair {
@@ -201,6 +212,87 @@ async fn main() -> Result<()> {
     // the dispatcher must be subscribed (and topology publishing) first.
     ingest::spawn(app.clone(), &state_dir)?;
     server::run(app).await
+}
+
+/// `remux emit permission` — the blocking Claude Code PermissionRequest hook.
+/// Reads the hook's JSON payload from stdin (so there's no fragile shell-arg
+/// extraction in the install snippet), blocks on the ingest socket until a
+/// device decides or the card expires, then prints *only* Claude Code's exact
+/// decision JSON on stdout. Any failure returns an error (→ stderr, non-zero
+/// exit, no stdout), which makes Claude Code fall back to its own Mac dialog —
+/// never a fabricated allow/deny.
+fn emit_permission(
+    state_dir: &std::path::Path,
+    pane: Option<String>,
+    source: String,
+) -> Result<()> {
+    use std::io::Read;
+    let pane = pane
+        .or_else(|| std::env::var("TMUX_PANE").ok())
+        .context("no --pane and no $TMUX_PANE in the environment")?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("reading the hook payload from stdin")?;
+    let payload: serde_json::Value =
+        serde_json::from_str(input.trim()).context("hook stdin was not valid JSON")?;
+    let tool = payload["tool_name"].as_str().unwrap_or_default();
+    if tool.is_empty() {
+        anyhow::bail!("hook payload missing tool_name");
+    }
+    let summary = summarize_tool(&payload["tool_input"]);
+    let mut body = serde_json::json!({
+        "v": 1, "kind": "agent_permission",
+        "pane": pane, "source": source, "tool": tool, "summary": summary,
+    });
+    if let Some(pid) = payload["prompt_id"].as_str() {
+        body["prompt_id"] = pid.into();
+    }
+
+    let v = ingest::request_wait(state_dir, body)?;
+    // Require an explicit success: an inconsistent ack (ok:false with a stray
+    // decision field) must never be treated as a decision.
+    match v["decision"]
+        .as_str()
+        .filter(|_| v["ok"] == serde_json::json!(true))
+    {
+        Some(b @ ("allow" | "deny")) => {
+            // The exact shape Claude Code expects (verified in the M4.0 spike).
+            let out = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": { "behavior": b }
+                }
+            });
+            println!("{out}");
+            Ok(())
+        }
+        // ok:false / "expired" / anything unexpected → no decision → fall back.
+        _ => anyhow::bail!(
+            "no remote decision ({}); falling back to the Mac dialog",
+            v["error"].as_str().unwrap_or("unknown")
+        ),
+    }
+}
+
+/// A one-line human summary of a tool_input for the card. Never shown on the
+/// lock screen (fetched post-auth); capped here, sanitized again daemon-side.
+fn summarize_tool(input: &serde_json::Value) -> String {
+    for key in [
+        "command",
+        "file_path",
+        "path",
+        "url",
+        "pattern",
+        "description",
+    ] {
+        if let Some(s) = input[key].as_str() {
+            if !s.is_empty() {
+                return s.chars().take(200).collect();
+            }
+        }
+    }
+    input.to_string().chars().take(200).collect()
 }
 
 /// Let's Encrypt certificates live ~90 days; nudge before it bites. (The

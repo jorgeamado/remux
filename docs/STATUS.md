@@ -71,9 +71,21 @@ from IndexedDB, fetches /api/attention (8s deadline, generic fallback)
 → named lock-screen text. Field gotchas learned: the PWA must be
 force-quit + relaunched to pick up a new service worker, and the first
 generic-text round was exactly that; /api/attention hits are now logged
-at info to make this diagnosable. Next: M4b approval decisions (day 1:
-the ~90s blocking PermissionRequest-hook empirical test), or the PWA
-input backlog (Tab key, Ctrl+letter) — see PLAN.
+at info to make this diagnosable.
+
+**PWA input backlog DONE (2026-07-14, `66db6ca`):** Tab completion and
+Ctrl+letter now work from the composer (the phone's real typing surface
+— both were only wired on the direct-terminal path). Tab flushes the
+draft un-submitted so the shell completes the real line; empty-composer
+Enter finishes it; sticky-⌃/hardware Ctrl send control codes to the pty.
+Deployed; awaiting on-device feel feedback.
+
+Next: **M4b approval decisions** (day 1: the ~90s blocking
+PermissionRequest-hook empirical test — needs Claude Code installed in
+the container or a daemon serving a host tmux; user hasn't chosen).
+Housekeeping owed: 6 stale iPhone device rows to revoke (user go-ahead
+needed); local e2e assumes a "$" prompt (fails under the user's zsh
+theme, fine in CI); v0.1.0 publish + brew tap still user-only.
 
 
 Plan drafted, Codex-reviewed (20 findings, 4 blockers), and rewritten

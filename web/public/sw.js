@@ -77,8 +77,9 @@ async function attentionBody() {
 self.addEventListener("push", (event) => {
   // A stalled fetch/IndexedDB must never starve showNotification — iOS
   // revokes push permission for pushes that surface nothing. Hard deadline,
-  // generic text on any failure or timeout.
-  const deadline = new Promise((resolve) => setTimeout(() => resolve(null), 2500));
+  // generic text on any failure or timeout. 8s: a locked phone's tailnet
+  // needs a few seconds to wake before /api/attention is reachable.
+  const deadline = new Promise((resolve) => setTimeout(() => resolve(null), 8000));
   event.waitUntil(
     Promise.race([attentionBody().catch(() => null), deadline]).then((body) =>
       self.registration.showNotification("remux", {

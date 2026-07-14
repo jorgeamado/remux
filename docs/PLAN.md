@@ -341,6 +341,15 @@ feature (remote approvals) on the most trustworthy signal (agent hooks);
 M4c adds breadth for every plain shell; M4d only if metadata cards leave
 a real gap.
 
+## PWA input backlog (reported from daily use)
+
+- **Tab key** (2026-07-14): no way to send Tab from the phone — needed for
+  shell completion. Make the on-screen key panel's Tab actionable for the
+  terminal input field.
+- **Ctrl+letter broken** (2026-07-14): the ⌃ modifier + letter combos do
+  not reach the terminal. Diagnose whether the keypanel modifier state or
+  the iOS keyboard event path drops them.
+
 ## Cross-cutting
 
 - e2e suite stays fast (<5s) and deterministic; every milestone adds its

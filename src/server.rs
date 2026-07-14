@@ -117,6 +117,9 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
     let mut pending = app.pending_attention.lock().unwrap();
     let now = std::time::Instant::now();
     pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_TTL);
+    // Info on purpose: this is how we tell "service worker never asked"
+    // from "asked but showed generic text" when debugging notifications.
+    tracing::info!(pending = pending.len(), "attention details served");
     let mut sessions: Vec<&String> = pending.keys().collect();
     sessions.sort();
     // `details` is additive; `sessions` stays for older clients. Freshest

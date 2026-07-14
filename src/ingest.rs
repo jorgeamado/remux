@@ -331,21 +331,41 @@ async fn handle_permission(
         id = %card.id, session = %card.session, pane = %card.pane,
         source = %card.source, tool = %card.tool, "ingest: permission card opened"
     );
+    // Wake the phone. Kind only — no command (secrets posture) and no source
+    // either, so the in-band attention frame doesn't leak *which* agent asked
+    // to a non-approve device; the card itself (source/tool/command) reaches
+    // only approve-capable devices via the permission_cards frame. The
+    // dispatcher pushes this but does not file it in the 600s attention
+    // retention (the card registry's own TTL is the source of truth).
+    let _ = app.attention.send(crate::Attention {
+        session: card.session.clone(),
+        kind: "agent_permission".into(),
+        reason: None,
+        source: None,
+    });
 
     // Recover the raw read half for EOF detection. Our protocol has the client
     // send exactly one line then wait, so the BufReader holds nothing more; the
     // Take limit is irrelevant here.
     let read_half = reader.into_inner().into_inner();
-    let decision = wait_for_decision(rx, read_half).await;
-
-    let resp = match decision {
-        Some(d) => serde_json::json!({ "ok": true, "decision": d.as_str() }),
+    match wait_for_decision(rx, read_half).await {
+        Some((decision, confirm)) => {
+            let resp = serde_json::json!({ "ok": true, "decision": decision.as_str() });
+            // The write IS the delivery. Only if it succeeds do we confirm to
+            // the deciding device that the hook actually got the decision;
+            // otherwise `confirm` drops and the device sees "not delivered".
+            if let Ok(Ok(())) = tokio::time::timeout(IO_TIMEOUT, write_ack(&mut write, &resp)).await
+            {
+                let _ = confirm.send(());
+            }
+        }
         // No decision (expiry / client gone). Never fabricated — the hook exits
         // non-zero and Claude Code asks on the Mac.
-        None => json_err("expired"),
-    };
-    // Bounded final write — a wedged client must not hold the task open.
-    let _ = tokio::time::timeout(IO_TIMEOUT, write_ack(&mut write, &resp)).await;
+        None => {
+            let _ =
+                tokio::time::timeout(IO_TIMEOUT, write_ack(&mut write, &json_err("expired"))).await;
+        }
+    }
     Ok(())
     // _guard drops here → app.perms.remove(card.id) (no-op if resolve took it).
 }
@@ -353,10 +373,12 @@ async fn handle_permission(
 /// Await whichever comes first: a device decision, expiry, or the client
 /// disappearing. A broken/closed connection means the Mac already answered (or
 /// the hook died) — treated as "no decision", never a fabricated allow/deny.
+/// On a decision, yields the confirmation sender the caller fires after it has
+/// written the decision back to the (live) hook socket.
 async fn wait_for_decision(
-    rx: tokio::sync::oneshot::Receiver<Decision>,
+    rx: tokio::sync::oneshot::Receiver<(Decision, tokio::sync::oneshot::Sender<()>)>,
     mut read_half: tokio::net::unix::OwnedReadHalf,
-) -> Option<Decision> {
+) -> Option<(Decision, tokio::sync::oneshot::Sender<()>)> {
     let mut buf = [0u8; 64];
     tokio::select! {
         // `biased`: poll the socket first so a closed connection wins any tie

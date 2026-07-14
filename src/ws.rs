@@ -346,6 +346,49 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Push open permission cards (M4b) to approve-capable devices, and keep
+    // them reconciled. Broadcast is a hint only: on every change (and once at
+    // start, and on lag) we re-read the registry snapshot — a lagged receiver
+    // can't miss state. Capability is re-checked by id each time, so a
+    // grant/revoke takes effect on this live socket. Non-approve devices get an
+    // empty list (details are privileged), never the cards.
+    let permits_task = tokio::spawn({
+        let mut rx = app.perms.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let device_id = device.id.clone();
+        async move {
+            // Skip empty frames until we've actually sent cards, so a fresh
+            // connection with no open cards stays quiet (like topology) — but
+            // once a set was sent, an empty frame is meaningful: it clears the
+            // resolved/expired cards from the UI.
+            let mut sent_nonempty = false;
+            loop {
+                let cards: Vec<serde_json::Value> = if app.auth.can_approve(&device_id) {
+                    app.perms.snapshot().iter().map(|c| c.view()).collect()
+                } else {
+                    Vec::new()
+                };
+                if !cards.is_empty() || sent_nonempty {
+                    sent_nonempty = !cards.is_empty();
+                    let msg = Message::Text(
+                        serde_json::json!({ "type": "permission_cards", "cards": cards })
+                            .to_string()
+                            .into(),
+                    );
+                    if out.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                match rx.recv().await {
+                    Ok(()) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -493,6 +536,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // remaining clients (e.g. the Mac) immediately get their dimensions back.
     let _ = child.kill();
     attention_task.abort();
+    permits_task.abort();
     revoke_task.abort();
     topology_task.abort();
     sender.abort();

@@ -197,18 +197,22 @@ async fn permission_card_resolves_and_wakes_the_blocked_hook() {
     assert_eq!(card.session, "perm1");
     assert_eq!(card.tool, "Bash");
     assert_eq!(card.summary, "touch x");
-    assert_eq!(
-        app.perms
-            .resolve(&card.id, Decision::Allow, || true)
-            .map(|c| c.id),
-        Ok(card.id.clone())
-    );
+    let (resolved, confirm) = app
+        .perms
+        .resolve(&card.id, Decision::Allow, || true)
+        .unwrap();
+    assert_eq!(resolved.id, card.id);
 
     // The blocked hook wakes with the decision, and the card is consumed.
     let v = client.await.unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["decision"], "allow");
     assert_eq!(app.perms.snapshot().len(), 0);
+    // Delivery is confirmed: the waiter wrote the decision to a live socket.
+    assert!(tokio::time::timeout(Duration::from_secs(2), confirm)
+        .await
+        .unwrap()
+        .is_ok());
 }
 
 #[tokio::test]
@@ -249,8 +253,8 @@ async fn permission_card_dropped_when_the_hook_disconnects() {
 
     // A decision arriving after the drop resolves nothing.
     assert_eq!(
-        app.perms.resolve(&id, Decision::Allow, || true),
-        Err(remux::permit::ResolveError::Unknown)
+        app.perms.resolve(&id, Decision::Allow, || true).err(),
+        Some(remux::permit::ResolveError::Unknown)
     );
 }
 

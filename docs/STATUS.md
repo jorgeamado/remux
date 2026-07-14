@@ -116,10 +116,26 @@ side of approvals, minus the phone-facing delivery:
   logs forced to stderr), `Device.approve` + grant/revoke CLI.
 Code review found 1 blocker + 4 major, all fixed (resolve/EOF tie via
 `biased`; capability coupled into resolve; prompt_id dedup + strict reject;
-stdout hygiene). One residual is recorded for increment 2: the phone's
-decision response must reflect *actual delivery* to the hook, not just that
-resolve consumed the card. Next: **increment 2** — broadcast channel + WS
-card frame + approve-gated HTTP decide/list + generic permission attention.
+stdout hygiene).
+
+**M4b increment 2 DONE + Codex-reviewed (2026-07-14).** The phone-facing
+daemon surface (PWA UI is increment 3):
+- registry change-hint broadcast (reconcile against snapshot) fired on
+  open/resolve/remove/sweep and on capability change;
+- WS `permission_cards` frame — reconcile-on-subscribe/lag, approve-gated by
+  current id, quiet until a card exists;
+- approve-gated `GET /api/permissions` (list) + `POST
+  /api/permissions/{id}/decide` (canonical decision op);
+- **delivery confirmation**: `resolve` → `(Card, Receiver)`, the held-wait
+  fires it only after a successful socket write, the decide handler awaits it
+  (8s) → `delivered:true` or 409 — so the phone is never told "approved" when
+  the hook didn't get it;
+- generic wake (kind only, no command/source) pushed but not filed in the
+  600s attention retention; permission pushes bypass the busy→quiet throttle.
+Codex review: 0 blockers, 4 major, 1 minor — all fixed (capability-change
+wake, sweep-fires-hint, throttle bypass, confirm-timeout margin, source leak).
+Not yet deployed (deploy with increment 3, since web assets are compile-time
+embedded). Next: **increment 3** — the PWA Approve/Deny card UI + SW.
 
 Note on where Claude Code runs: the day-1 test needed no container decision
 (ran on the host). For real use the hook's `remux emit` must reach the

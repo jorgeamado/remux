@@ -1,7 +1,7 @@
 use crate::{auth::PairError, ws, App};
 use anyhow::Result;
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, HeaderMap, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,6 +26,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/attention", get(attention_pending))
+        .route("/api/permissions", get(permissions_pending))
+        .route("/api/permissions/{id}/decide", post(permission_decide))
         .route("/api/devices", get(devices))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
@@ -139,6 +141,86 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
         })
         .collect();
     Json(serde_json::json!({ "sessions": sessions, "details": details })).into_response()
+}
+
+/// Open agent permission cards (M4b), for the PWA to render Approve/Deny.
+/// Approve-capable devices only — the command/path in a card is sensitive, so
+/// a non-approve device gets an empty list (no details, no existence leak),
+/// mirroring what its websocket receives.
+async fn permissions_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    let cards = if app.auth.can_approve(&device.id) {
+        app.perms
+            .snapshot()
+            .iter()
+            .map(|c| c.view())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::json!({ "cards": cards })).into_response()
+}
+
+#[derive(Deserialize)]
+struct DecideRequest {
+    decision: String,
+}
+
+/// Resolve a permission card. The canonical decision op (the websocket only
+/// *delivers* cards). Approve-gated; the capability is re-checked under the
+/// registry lock at the moment of decision. Reports success only once the
+/// waiting hook has actually received the decision — a decision that raced the
+/// hook's socket closing returns 409, not a false "approved".
+async fn permission_decide(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<DecideRequest>,
+) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    if !app.auth.can_approve(&device.id) {
+        return (StatusCode::FORBIDDEN, "approve capability required").into_response();
+    }
+    let Some(decision) = crate::permit::Decision::parse(&req.decision) else {
+        return (StatusCode::BAD_REQUEST, "decision must be allow or deny").into_response();
+    };
+    let device_id = device.id.clone();
+    match app
+        .perms
+        .resolve(&id, decision, || app.auth.can_approve(&device_id))
+    {
+        Ok((card, confirm)) => {
+            // Wait for the held-wait to confirm it wrote the decision to a live
+            // hook. No confirmation → the hook vanished (the Mac answered)
+            // between consume and delivery. The deadline must exceed the
+            // ingest write timeout (5s) with margin, or a slow-but-successful
+            // write could be reported as a false 409.
+            match tokio::time::timeout(std::time::Duration::from_secs(8), confirm).await {
+                Ok(Ok(())) => Json(serde_json::json!({
+                    "ok": true, "delivered": true, "session": card.session,
+                }))
+                .into_response(),
+                _ => (
+                    StatusCode::CONFLICT,
+                    "decision recorded but the agent was no longer waiting",
+                )
+                    .into_response(),
+            }
+        }
+        Err(crate::permit::ResolveError::Forbidden) => {
+            (StatusCode::FORBIDDEN, "approve capability required").into_response()
+        }
+        Err(crate::permit::ResolveError::Expired) => {
+            (StatusCode::GONE, "this request expired").into_response()
+        }
+        Err(crate::permit::ResolveError::Unknown) => {
+            (StatusCode::NOT_FOUND, "no such pending request").into_response()
+        }
+    }
 }
 
 /// Read-only device list for the PWA sheet. Management (revoke/rename) is

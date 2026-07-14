@@ -124,6 +124,11 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
         }
         Ok(Request::SetApprove { id, grant }) => match app.auth.set_approve(&id, grant) {
             Ok(changed) => {
+                if changed {
+                    // Wake live sockets so a grant reveals open cards / a revoke
+                    // hides them without waiting for the next card change.
+                    app.perms.notify_watchers();
+                }
                 tracing::info!(device = %id, grant, "approve capability set via admin socket");
                 serde_json::json!({ "ok": true, "changed": changed })
             }

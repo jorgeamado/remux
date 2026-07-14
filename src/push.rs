@@ -157,8 +157,11 @@ impl Push {
 
     /// Push "attention" for `session` to every subscription except devices in
     /// `skip` (devices with a live socket on that session get the in-band
-    /// frame instead). Throttled per (endpoint, session).
-    pub async fn notify(&self, session: &str, skip: &[String]) {
+    /// frame instead). Throttled per (endpoint, session) unless `throttle` is
+    /// false — permission cards bypass it, since each is a distinct decision
+    /// the user must see and a recent busy→quiet push must not swallow it (nor
+    /// vice versa), all within the card's 100s life.
+    pub async fn notify(&self, session: &str, skip: &[String], throttle: bool) {
         let targets: Vec<Subscription> = {
             let subs = self.subs.lock().unwrap();
             let mut recent = self.recent.lock().unwrap();
@@ -166,15 +169,18 @@ impl Push {
             recent.retain(|_, t| now.duration_since(*t) < THROTTLE);
             subs.iter()
                 .filter(|s| !skip.contains(&s.device_id))
-                .filter(
-                    |s| match recent.entry((s.endpoint.clone(), session.to_string())) {
+                .filter(|s| {
+                    if !throttle {
+                        return true;
+                    }
+                    match recent.entry((s.endpoint.clone(), session.to_string())) {
                         std::collections::hash_map::Entry::Occupied(_) => false,
                         std::collections::hash_map::Entry::Vacant(e) => {
                             e.insert(now);
                             true
                         }
-                    },
-                )
+                    }
+                })
                 .cloned()
                 .collect()
         };
@@ -253,10 +259,18 @@ pub fn spawn_dispatcher(app: std::sync::Arc<crate::App>) {
             match rx.recv().await {
                 Ok(att) => {
                     let session = att.session.clone();
-                    app.pending_attention
-                        .lock()
-                        .unwrap()
-                        .insert(session.clone(), (Instant::now(), att));
+                    let is_permission = att.kind == "agent_permission";
+                    // Permission cards have their own registry (100s TTL) as the
+                    // deep-link source of truth; do NOT also file them in the
+                    // 600s attention retention, or a tap could land on a card
+                    // that expired 8 minutes ago. Still pushed below to wake the
+                    // phone.
+                    if !is_permission {
+                        app.pending_attention
+                            .lock()
+                            .unwrap()
+                            .insert(session.clone(), (Instant::now(), att));
+                    }
                     let at_keyboard = tokio::task::spawn_blocking(|| {
                         crate::tmux::any_client_active_within(KEYBOARD_GRACE_SECS)
                     })
@@ -274,7 +288,8 @@ pub fn spawn_dispatcher(app: std::sync::Arc<crate::App>) {
                         .filter(|(_, s)| s == &session)
                         .map(|(d, _)| d.clone())
                         .collect();
-                    app.push.notify(&session, &skip).await;
+                    // Permission pushes bypass the busy→quiet throttle.
+                    app.push.notify(&session, &skip, !is_permission).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

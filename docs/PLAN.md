@@ -398,17 +398,20 @@ would change the fallback from "ask on Mac" to "hard block".
    logs forced to stderr) + `Device.approve` + grant/revoke CLI. Resolved
    via a test-only resolver (no shipped approve-bypass). Codex-reviewed
    (1 blocker, 4 major — all fixed).
-2. Broadcast channel + reconcile-on-subscribe + HTTP decide/list endpoints
-   (approve-gated) + WS card frame + generic permission attention with its
-   own retention. ⚑ **Delivery confirmation (from the increment-1 review):**
-   the decision endpoint's response to the phone must reflect *actual
-   delivery to the waiting hook*, not merely that `resolve` consumed the
-   card — otherwise a decision racing a socket-close could show the phone
-   "approved" while the biased select discarded it. `resolve` returns the
-   `Card`, but the waiter owns the write; wire the endpoint to await that
-   outcome (e.g. a confirmation channel) before reporting success. Delivery
-   tests: setup race, backgrounded live socket, socket on another session,
-   non-approve socket.
+2. **DONE (2026-07-14).** Registry change-hint broadcast (payload-less;
+   receivers reconcile against `snapshot()`) fired on open/resolve/remove/
+   sweep and on capability change (`notify_watchers`); WS `permission_cards`
+   frame (reconcile-on-subscribe + on-lag, approve-gated by *current* id, only
+   sends when non-empty or clearing); approve-gated `GET /api/permissions` +
+   `POST /api/permissions/{id}/decide` (the canonical decision op — the WS
+   only delivers). **Delivery confirmation** implemented: `resolve` returns
+   `(Card, Receiver<()>)`; the held-wait fires it only after a successful
+   socket write, and the decide handler awaits it (8s > the 5s write timeout)
+   → `delivered:true` or 409. Generic wake (kind only, no command/source)
+   pushed but kept out of the 600s attention retention; permission pushes
+   bypass the busy→quiet throttle. Codex-reviewed (0 blockers, 4 major, 1
+   minor — all fixed). Tests: registry hints, http auth/visibility/validation/
+   delivery.
 3. PWA card UI (notification → post-auth fetch → Approve/Deny; disabled
    past deadline via a returned remaining-TTL). Non-approve = no details.
 4. On-device integration test.

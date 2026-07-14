@@ -18,7 +18,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+
+/// What a held-wait receives when its card is resolved: the decision, plus a
+/// one-shot the waiter fires once it has actually written the decision back to
+/// the (live) hook socket. That fired signal is what tells the deciding device
+/// "the hook got it" — distinct from "the registry consumed the card".
+type DecisionMsg = (Decision, oneshot::Sender<()>);
 
 /// How long a card stays open. Must sit comfortably below the Claude Code
 /// hook `timeout` (the install snippet uses 120s) so the fallback is the hook
@@ -78,11 +84,27 @@ impl Card {
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
+
+    /// The client-facing view: card metadata plus a *relative* remaining-TTL
+    /// (never the absolute deadline the client can't interpret) so the UI can
+    /// disable the buttons when it runs out.
+    pub fn view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "session": self.session,
+            "pane": self.pane,
+            "source": self.source,
+            "tool": self.tool,
+            "summary": self.summary,
+            "prompt_id": self.prompt_id,
+            "remaining_secs": self.remaining().as_secs(),
+        })
+    }
 }
 
 struct Entry {
     card: Card,
-    decide_tx: oneshot::Sender<Decision>,
+    decide_tx: oneshot::Sender<DecisionMsg>,
 }
 
 /// Why a resolve did not decide a card. `Expired` vs `Unknown` lets the UI say
@@ -99,47 +121,79 @@ pub enum ResolveError {
     Forbidden,
 }
 
-#[derive(Default)]
 pub struct Registry {
     inner: Mutex<HashMap<String, Entry>>,
+    /// A hint fired whenever the set of open cards changes (opened / resolved /
+    /// expired). Deliberately payload-less: receivers reconcile against
+    /// `snapshot()`, so a lagged receiver just re-reads — it can't miss state.
+    events: broadcast::Sender<()>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            events: broadcast::channel(16).0,
+        }
+    }
 }
 
 impl Registry {
+    /// Subscribe to change hints. Pair with `snapshot()` to reconcile.
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.events.subscribe()
+    }
+
+    /// Fire a change hint without touching the card set — used when *who may
+    /// see* the cards changes (a device's `approve` capability was granted or
+    /// revoked), so live sockets re-evaluate their capability and reconcile.
+    pub fn notify_watchers(&self) {
+        let _ = self.events.send(());
+    }
+
     /// Insert a new card, returning the receiver the held-wait awaits. Rejects
     /// when the global or per-pane cap is hit so the hook falls back to the Mac
     /// dialog rather than queueing. Sweeps expired entries first so a waiter
     /// that hasn't cleaned up yet can't hold a slot hostage.
-    pub fn insert(&self, card: Card) -> Result<oneshot::Receiver<Decision>, &'static str> {
-        let mut map = self.inner.lock().unwrap();
-        let now = Instant::now();
-        map.retain(|_, e| e.card.deadline > now);
-        // Dedup by prompt_id: a Claude retry (same prompt_id) while the first
-        // card is still open must not open a second independently-resolvable
-        // card for one operation. The first card's waiter is still blocking;
-        // reject the duplicate (the retrying hook falls back to the Mac).
-        if let Some(pid) = &card.prompt_id {
-            if map
-                .values()
-                .any(|e| e.card.prompt_id.as_deref() == Some(pid.as_str()))
-            {
-                return Err("duplicate permission request (same prompt_id)");
+    pub fn insert(&self, card: Card) -> Result<oneshot::Receiver<DecisionMsg>, &'static str> {
+        // A rejection that still swept expired entries must fire a hint too, or
+        // the swept cards linger on connected clients until the next change.
+        let (result, changed) = {
+            let mut map = self.inner.lock().unwrap();
+            let now = Instant::now();
+            let before = map.len();
+            map.retain(|_, e| e.card.deadline > now);
+            let swept = map.len() != before;
+            // Dedup by prompt_id: a Claude retry (same prompt_id) while the
+            // first card is still open must not open a second independently-
+            // resolvable card for one operation. The first card's waiter is
+            // still blocking; reject the duplicate (the retry falls back to Mac).
+            let dup = card.prompt_id.as_deref().is_some_and(|pid| {
+                map.values()
+                    .any(|e| e.card.prompt_id.as_deref() == Some(pid))
+            });
+            if dup {
+                (Err("duplicate permission request (same prompt_id)"), swept)
+            } else if map.len() >= MAX_PENDING {
+                (Err("too many pending permission requests"), swept)
+            } else if map.values().filter(|e| e.card.pane == card.pane).count() >= MAX_PER_PANE {
+                (Err("too many pending requests for this pane"), swept)
+            } else {
+                let (tx, rx) = oneshot::channel();
+                map.insert(
+                    card.id.clone(),
+                    Entry {
+                        card,
+                        decide_tx: tx,
+                    },
+                );
+                (Ok(rx), true)
             }
+        };
+        if changed {
+            let _ = self.events.send(());
         }
-        if map.len() >= MAX_PENDING {
-            return Err("too many pending permission requests");
-        }
-        if map.values().filter(|e| e.card.pane == card.pane).count() >= MAX_PER_PANE {
-            return Err("too many pending requests for this pane");
-        }
-        let (tx, rx) = oneshot::channel();
-        map.insert(
-            card.id.clone(),
-            Entry {
-                card,
-                decide_tx: tx,
-            },
-        );
-        Ok(rx)
+        result
     }
 
     /// Atomically consume a card and wake its waiter. Single-winner: the mutex
@@ -153,36 +207,51 @@ impl Registry {
     /// authorization through (Codex review). It runs only for a live,
     /// unexpired card; if it returns false the card is left open for a device
     /// that is capable, and the caller gets `Forbidden`.
+    /// On success returns the `Card` and a receiver that fires once the waiting
+    /// hook has actually received the decision (see [`DecisionMsg`]). The
+    /// deciding device should await it before reporting success, so a decision
+    /// that raced a socket-close isn't reported as delivered.
     pub fn resolve(
         &self,
         id: &str,
         decision: Decision,
         authorized: impl FnOnce() -> bool,
-    ) -> Result<Card, ResolveError> {
-        let mut map = self.inner.lock().unwrap();
-        let Some(entry) = map.get(id) else {
-            return Err(ResolveError::Unknown);
+    ) -> Result<(Card, oneshot::Receiver<()>), ResolveError> {
+        let outcome = {
+            let mut map = self.inner.lock().unwrap();
+            // Copy the deadline out so the immutable borrow ends before remove.
+            let Some(deadline) = map.get(id).map(|e| e.card.deadline) else {
+                return Err(ResolveError::Unknown); // nothing changed
+            };
+            if deadline <= Instant::now() {
+                map.remove(id);
+                Err(ResolveError::Expired)
+            } else if !authorized() {
+                return Err(ResolveError::Forbidden); // card left open, nothing changed
+            } else {
+                let entry = map.remove(id).expect("present under the same lock");
+                let (conf_tx, conf_rx) = oneshot::channel();
+                match entry.decide_tx.send((decision, conf_tx)) {
+                    Ok(()) => Ok((entry.card, conf_rx)),
+                    // Waiter already gone (EOF/expiry) — the card was consumed
+                    // but nothing was decided.
+                    Err(_) => Err(ResolveError::Unknown),
+                }
+            }
         };
-        if entry.card.deadline <= Instant::now() {
-            map.remove(id);
-            return Err(ResolveError::Expired);
-        }
-        if !authorized() {
-            return Err(ResolveError::Forbidden);
-        }
-        // Authorized and live — now consume it.
-        let entry = map.remove(id).expect("present under the same lock");
-        match entry.decide_tx.send(decision) {
-            Ok(()) => Ok(entry.card),
-            Err(_) => Err(ResolveError::Unknown),
-        }
+        // Every branch that reached here removed an entry (Unknown-from-get and
+        // Forbidden returned early). Signal the change so views reconcile.
+        let _ = self.events.send(());
+        outcome
     }
 
     /// Remove a card without deciding it — the waiter's own cleanup on EOF,
     /// expiry, or task abort. Idempotent; safe to call after `resolve` already
-    /// took the entry.
+    /// took the entry. Fires a change hint only when it actually removed one.
     pub fn remove(&self, id: &str) {
-        self.inner.lock().unwrap().remove(id);
+        if self.inner.lock().unwrap().remove(id).is_some() {
+            let _ = self.events.send(());
+        }
     }
 
     /// Live (non-expired) cards, for a listing / reconcile-on-subscribe.
@@ -240,15 +309,15 @@ mod tests {
     async fn resolve_wakes_the_waiter_once() {
         let reg = Registry::default();
         let mut rx = reg.insert(card("a", "%1")).unwrap();
-        assert_eq!(
-            reg.resolve("a", Decision::Allow, || true).map(|c| c.id),
-            Ok("a".into())
-        );
-        assert_eq!(rx.try_recv(), Ok(Decision::Allow));
+        let (card, _conf_rx) = reg.resolve("a", Decision::Allow, || true).unwrap();
+        assert_eq!(card.id, "a");
+        // The waiter receives the decision + a confirmation sender.
+        let (decision, _conf_tx) = rx.try_recv().unwrap();
+        assert_eq!(decision, Decision::Allow);
         // Second resolve of the same id finds nothing.
         assert_eq!(
-            reg.resolve("a", Decision::Deny, || true),
-            Err(ResolveError::Unknown)
+            reg.resolve("a", Decision::Deny, || true).err(),
+            Some(ResolveError::Unknown)
         );
         assert_eq!(reg.len(), 0);
     }
@@ -258,12 +327,45 @@ mod tests {
         let reg = Registry::default();
         let _rx = reg.insert(card("a", "%1")).unwrap();
         assert_eq!(
-            reg.resolve("a", Decision::Allow, || false),
-            Err(ResolveError::Forbidden)
+            reg.resolve("a", Decision::Allow, || false).err(),
+            Some(ResolveError::Forbidden)
         );
         // Card is left open for a device that is capable.
         assert_eq!(reg.len(), 1);
         assert!(reg.resolve("a", Decision::Allow, || true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn notify_watchers_wakes_subscribers() {
+        let reg = Registry::default();
+        let mut sub = reg.subscribe();
+        reg.notify_watchers();
+        assert!(sub.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_insert_still_fires_when_it_swept_expired() {
+        let reg = Registry::default();
+        // A: live, prompt "p".
+        let mut a = card("a", "%1");
+        a.prompt_id = Some("p".into());
+        let _rxa = reg.insert(a).unwrap();
+        // B: already expired, distinct pane.
+        let mut b = card("b", "%2");
+        b.deadline = Instant::now() - Duration::from_secs(1);
+        let _rxb = reg.insert(b).unwrap();
+
+        let mut sub = reg.subscribe();
+        // C: duplicate prompt "p" → rejected, but it sweeps the expired B, so a
+        // reconcile hint must still fire (else B lingers on clients).
+        let mut c = card("c", "%3");
+        c.prompt_id = Some("p".into());
+        assert!(reg.insert(c).is_err());
+        assert!(
+            sub.try_recv().is_ok(),
+            "a rejected insert that swept an expired card must still fire a hint"
+        );
+        assert_eq!(reg.len(), 1); // only A remains
     }
 
     #[test]
@@ -281,8 +383,8 @@ mod tests {
     fn unknown_id_is_unknown_not_a_panic() {
         let reg = Registry::default();
         assert_eq!(
-            reg.resolve("ghost", Decision::Allow, || true),
-            Err(ResolveError::Unknown)
+            reg.resolve("ghost", Decision::Allow, || true).err(),
+            Some(ResolveError::Unknown)
         );
     }
 
@@ -292,8 +394,8 @@ mod tests {
         let rx = reg.insert(card("a", "%1")).unwrap();
         drop(rx); // hook died / Mac answered
         assert_eq!(
-            reg.resolve("a", Decision::Allow, || true),
-            Err(ResolveError::Unknown)
+            reg.resolve("a", Decision::Allow, || true).err(),
+            Some(ResolveError::Unknown)
         );
     }
 
@@ -306,8 +408,8 @@ mod tests {
         c.deadline = Instant::now() - Duration::from_secs(1);
         let _rx = reg.insert(c).unwrap();
         assert_eq!(
-            reg.resolve("a", Decision::Allow, || true),
-            Err(ResolveError::Expired)
+            reg.resolve("a", Decision::Allow, || true).err(),
+            Some(ResolveError::Expired)
         );
     }
 

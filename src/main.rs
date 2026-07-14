@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
-    admin, attention, auth, host_of_url, ingest, push, server, tmux, topology, App, Cli, Cmd,
-    DevicesCmd, EmitCmd,
+    admin, attention, auth, host_of_url, ingest, push, server, shell, tmux, topology, App, Cli,
+    Cmd, DevicesCmd, EmitCmd,
 };
 use std::sync::Arc;
 
@@ -175,6 +175,46 @@ async fn main() -> Result<()> {
                 source,
                 wait: _,
             } => return emit_permission(&state_dir, pane, source),
+            EmitCmd::CommandStart {
+                pane,
+                shell_id,
+                command_id,
+                command,
+                cwd,
+            } => {
+                // Best-effort, non-blocking: resolve the pane, fire, exit. A
+                // missing pane just means "not in a remux session" → no-op.
+                if let Some(pane) = pane.or_else(|| std::env::var("TMUX_PANE").ok()) {
+                    // Cap here, before serializing: the datagram must stay well
+                    // under the receive buffer or an over-long command's line
+                    // would be truncated on the wire and silently dropped.
+                    shell::emit(
+                        &state_dir,
+                        &serde_json::json!({
+                            "v": 1, "kind": "command_started", "pane": pane,
+                            "source": "shell", "shell_id": shell_id,
+                            "command_id": command_id,
+                            "command": truncate_bytes(&command, 512),
+                            "cwd": truncate_bytes(&cwd, 256),
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            EmitCmd::CommandEnd {
+                shell_id,
+                command_id,
+                exit,
+            } => {
+                shell::emit(
+                    &state_dir,
+                    &serde_json::json!({
+                        "v": 1, "kind": "command_finished", "source": "shell",
+                        "shell_id": shell_id, "command_id": command_id, "exit": exit,
+                    }),
+                );
+                return Ok(());
+            }
         },
     };
 
@@ -228,6 +268,7 @@ async fn main() -> Result<()> {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        feed: Default::default(),
     });
 
     if !app.args.no_pair {
@@ -242,6 +283,8 @@ async fn main() -> Result<()> {
     // Ingest last: its acks promise the attention pipeline saw the event, so
     // the dispatcher must be subscribed (and topology publishing) first.
     ingest::spawn(app.clone(), &state_dir)?;
+    // Shell command feed (M4c): its own datagram socket + a sweeper task.
+    shell::spawn(app.clone(), &state_dir)?;
     server::run(app).await
 }
 
@@ -304,6 +347,19 @@ fn emit_permission(
             v["error"].as_str().unwrap_or("unknown")
         ),
     }
+}
+
+/// Truncate to a byte budget at a char boundary (keeps the shell-event
+/// datagram small enough to never be truncated on the wire).
+fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// A one-line human summary of a tool_input for the card. Never shown on the

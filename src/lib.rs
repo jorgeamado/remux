@@ -1,10 +1,12 @@
 pub mod admin;
 pub mod attention;
 pub mod auth;
+pub mod feed;
 pub mod ingest;
 pub mod permit;
 pub mod push;
 pub mod server;
+pub mod shell;
 pub mod tmux;
 pub mod topology;
 pub mod ws;
@@ -96,6 +98,37 @@ pub enum EmitCmd {
         /// subcommand (a permission prompt with no blocking makes no sense).
         #[arg(long, default_value_t = true)]
         wait: bool,
+    },
+    /// A shell command is starting (zsh preexec). Fire-and-forget, non-blocking
+    /// (M4c) — for the shell-hook one-liners. Informational only.
+    CommandStart {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Random id, stable for this interactive shell's lifetime.
+        #[arg(long)]
+        shell_id: String,
+        /// Per-shell monotonic counter for this command.
+        #[arg(long)]
+        command_id: u64,
+        /// The command line (capped/sanitized by the daemon).
+        #[arg(long)]
+        command: String,
+        /// Working directory when the command started.
+        #[arg(long, default_value = "")]
+        cwd: String,
+    },
+    /// A shell command finished (zsh precmd). Fire-and-forget, non-blocking.
+    CommandEnd {
+        /// Random id, stable for this interactive shell's lifetime.
+        #[arg(long)]
+        shell_id: String,
+        /// Must match the `command_id` of the paired start.
+        #[arg(long)]
+        command_id: u64,
+        /// The command's exit status.
+        #[arg(long)]
+        exit: i32,
     },
 }
 
@@ -203,6 +236,8 @@ pub struct App {
     pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
     /// Open agent permission cards (M4b) awaiting a decision from a device.
     pub perms: permit::Registry,
+    /// Per-session shell command feed (M4c), fed by the shell datagram socket.
+    pub feed: feed::Feed,
 }
 
 /// Select the process-wide rustls crypto provider. Both axum-server and

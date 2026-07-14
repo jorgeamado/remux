@@ -404,7 +404,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn valid_pane(s: &str) -> bool {
+pub(crate) fn valid_pane(s: &str) -> bool {
     s.len() >= 2
         && s.len() <= MAX_PANE
         && s.starts_with('%')
@@ -422,7 +422,7 @@ fn valid_prompt_id(s: &str) -> bool {
 /// The single session containing pane `%N` per the latest topology snapshot.
 /// More than one is possible with linked windows — ambiguous, so refused
 /// (guessing would notify/act for the wrong session).
-fn sessions_of_pane(app: &App, pane: &str) -> Result<String, &'static str> {
+pub(crate) fn sessions_of_pane(app: &App, pane: &str) -> Result<String, &'static str> {
     let snap = app.topology.borrow();
     let mut matches = snap.iter().filter(|s| {
         s.windows

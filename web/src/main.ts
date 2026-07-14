@@ -864,8 +864,7 @@ composerInput.addEventListener("keydown", (ev) => {
     composerSubmit();
   } else if (ev.key === "ArrowUp" && cmdHistory.length > 0) {
     ev.preventDefault();
-    historyIdx = historyIdx === null ? cmdHistory.length - 1 : Math.max(0, historyIdx - 1);
-    composerInput.value = cmdHistory[historyIdx];
+    composerHistoryPrev(false);
   } else if (ev.key === "ArrowDown" && historyIdx !== null) {
     ev.preventDefault();
     historyIdx = historyIdx >= cmdHistory.length - 1 ? null : historyIdx + 1;
@@ -873,10 +872,28 @@ composerInput.addEventListener("keydown", (ev) => {
   }
 });
 
+/// Step back through composer history into the (editable) field. The ▴
+/// button wraps from oldest to newest — one button must never dead-end.
+function composerHistoryPrev(wrap: boolean): void {
+  if (cmdHistory.length === 0) return;
+  if (historyIdx === null) {
+    historyIdx = cmdHistory.length - 1;
+  } else if (historyIdx === 0) {
+    if (wrap) historyIdx = cmdHistory.length - 1;
+  } else {
+    historyIdx -= 1;
+  }
+  composerInput.value = cmdHistory[historyIdx];
+}
+
 // pointerdown + preventDefault keeps focus (and the keyboard) in the input.
 $("composer-send").addEventListener("pointerdown", (ev) => {
   ev.preventDefault();
   composerSubmit();
+});
+$("composer-hist").addEventListener("pointerdown", (ev) => {
+  ev.preventDefault();
+  composerHistoryPrev(true);
 });
 
 const keysToggle = $<HTMLButtonElement>("keys-toggle");

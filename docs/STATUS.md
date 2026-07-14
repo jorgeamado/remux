@@ -73,12 +73,14 @@ force-quit + relaunched to pick up a new service worker, and the first
 generic-text round was exactly that; /api/attention hits are now logged
 at info to make this diagnosable.
 
-**PWA input backlog DONE (2026-07-14, `66db6ca`):** Tab completion and
-Ctrl+letter now work from the composer (the phone's real typing surface
-— both were only wired on the direct-terminal path). Tab flushes the
-draft un-submitted so the shell completes the real line; empty-composer
-Enter finishes it; sticky-⌃/hardware Ctrl send control codes to the pty.
-Deployed; awaiting on-device feel feedback.
+**PWA input backlog DONE (2026-07-14):** Tab completion, Ctrl+letter,
+composer ▴ history (editable recall, wraps, hints when empty), and
+composer-first routing for key-row punctuation / cursor keys /
+single-line paste. All verified on-device by the user; shell-history
+mirroring into the composer is recorded as an M4c deliverable (needs
+OSC 133 prompt/command boundaries). Field notes: "direct typing" is a
+deliberate off-by-default phone setting (aA menu), and a hard reload
+resets it + wipes composer history — both read as bugs until explained.
 
 Next: **M4b approval decisions** (day 1: the ~90s blocking
 PermissionRequest-hook empirical test — needs Claude Code installed in

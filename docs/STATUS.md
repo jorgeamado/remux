@@ -63,6 +63,22 @@ control-mode arc is done and deployed.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 
+**M4c IN PROGRESS — command feed (increments 1–3 done, deployed 2026-07-14).**
+Shell commands (zsh preexec/precmd hooks, opt-in via REMUX_CAPTURE) flow over
+a separate non-blocking datagram socket into a bounded, order-tolerant
+per-session feed; a notable finish (failure or ≥30s) raises a secrets-safe
+notification (exit+duration+session, never the command); the PWA shows a
+command-feed panel (aA → Command feed) with exit badges, durations, and
+running state. Each increment Codex-reviewed (plan: 6 blockers; inc1: 1+3;
+inc2: 2 major; inc3: 3 major — all fixed) and CI-green. Deployed to the
+container. **Left: increment 4** (shell-history mirroring — composer ↑
+recalls the session's actual commands from the feed, with session-scoped
+composer history) and **increment 5** (on-device test — install the zsh hook,
+run commands, watch the feed + a failure notification). To test the feed now:
+add the `docs/shell-hooks.md` zsh block, `export REMUX_CAPTURE=1`, run a few
+commands, open aA → Command feed on the phone.
+
+
 **M4b VERIFIED ON DEVICE (2026-07-14): remote agent approvals work.**
 Approved a permission card from the iPhone (`remux test-permission` → tap
 Approve → the blocked command got `decision: allow`). All four increments

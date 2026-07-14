@@ -63,20 +63,29 @@ control-mode arc is done and deployed.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 
-**M4c IN PROGRESS — command feed (increments 1–3 done, deployed 2026-07-14).**
-Shell commands (zsh preexec/precmd hooks, opt-in via REMUX_CAPTURE) flow over
-a separate non-blocking datagram socket into a bounded, order-tolerant
-per-session feed; a notable finish (failure or ≥30s) raises a secrets-safe
-notification (exit+duration+session, never the command); the PWA shows a
-command-feed panel (aA → Command feed) with exit badges, durations, and
-running state. Each increment Codex-reviewed (plan: 6 blockers; inc1: 1+3;
-inc2: 2 major; inc3: 3 major — all fixed) and CI-green. Deployed to the
-container. **Left: increment 4** (shell-history mirroring — composer ↑
-recalls the session's actual commands from the feed, with session-scoped
-composer history) and **increment 5** (on-device test — install the zsh hook,
-run commands, watch the feed + a failure notification). To test the feed now:
-add the `docs/shell-hooks.md` zsh block, `export REMUX_CAPTURE=1`, run a few
-commands, open aA → Command feed on the phone.
+**M4c VERIFIED ON DEVICE (2026-07-14) — command feed works end to end.**
+Shell commands (zsh/bash hooks, opt-in) flow over a separate non-blocking
+datagram socket into a bounded, order-tolerant per-session feed; a notable
+finish (failure or ≥30s) raises a secrets-safe notification
+(exit+duration+session, never the command); the PWA shows a command-feed
+panel (aA → Command feed) with exit badges/durations/running-state; the
+composer ↑ (and key-row ↑/↓, at a prompt only) recalls the session's real
+commands. Shipped and deployed:
+- inc1: datagram socket + order-tolerant feed + timer sweeper + zsh hook;
+- inc2: precise secrets-safe attention + detector-reset coordination;
+- inc3: WS command_feed frame + PWA feed panel;
+- inc4: shell-history mirroring + session-scoped composer history;
+- `remux setup shell`: guided, shell-aware install (bash + zsh), safe
+  ~/.bashrc/~/.zshrc editing (atomic, marker-guarded);
+- bash hook (DEBUG trap + PROMPT_COMMAND, verified in bash 5.2 via PTY);
+- key-row ↑/↓ → composer recall at a prompt, passthrough for TUIs (keyed off
+  the feed's running-state, not the stale pane command).
+Every increment Codex-reviewed (real bugs caught each round — event
+reordering, feed secrets, stale-topology arrow-hijack, bash $?/BASH_COMMAND
+capture) and CI-green. On-device: feed shows commands, key-row ↑ recalls.
+
+**M4d stays gated** (see PLAN §M4d) — build output-streaming only on repeated
+real evidence that metadata isn't enough.
 
 
 **M4b VERIFIED ON DEVICE (2026-07-14): remote agent approvals work.**

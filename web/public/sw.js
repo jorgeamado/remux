@@ -18,15 +18,75 @@ self.addEventListener("activate", (event) => {
 });
 
 // Payload-less by design: the daemon never sends terminal content or session
-// names through the push service. iOS requires every push to surface a
-// notification — no conditional logic here, ever.
+// names through the push service. Detail is fetched from the daemon itself,
+// post-auth, after the push wakes us. iOS requires every push to surface a
+// notification — every path below ends in showNotification, always.
+
+function idbToken() {
+  return new Promise((resolve) => {
+    try {
+      const open = indexedDB.open("remux", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("kv");
+      open.onerror = () => resolve(null);
+      open.onsuccess = () => {
+        const get = open.result.transaction("kv").objectStore("kv").get("device_token");
+        get.onerror = () => resolve(null);
+        get.onsuccess = () => {
+          open.result.close();
+          resolve(typeof get.result === "string" ? get.result : null);
+        };
+      };
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function idbTokenClear() {
+  try {
+    const open = indexedDB.open("remux", 1);
+    open.onsuccess = () => {
+      open.result.transaction("kv", "readwrite").objectStore("kv").delete("device_token");
+    };
+  } catch {
+    /* best effort */
+  }
+}
+
+async function attentionBody() {
+  const token = await idbToken();
+  if (!token) return null;
+  const resp = await fetch("/api/attention", {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (resp.status === 401) {
+    idbTokenClear(); // revoked/re-paired elsewhere: stop sending it
+    return null;
+  }
+  if (!resp.ok) return null;
+  const { details } = await resp.json();
+  if (!Array.isArray(details) || details.length === 0) return null;
+  const d = details[0]; // freshest first, per the API
+  const what = d.source
+    ? `${d.source}: ${d.reason || "needs input"}`
+    : "may need your attention";
+  const more = details.length > 1 ? ` (+${details.length - 1} more)` : "";
+  return `${d.session} — ${what}${more}`.slice(0, 180);
+}
+
 self.addEventListener("push", (event) => {
+  // A stalled fetch/IndexedDB must never starve showNotification — iOS
+  // revokes push permission for pushes that surface nothing. Hard deadline,
+  // generic text on any failure or timeout.
+  const deadline = new Promise((resolve) => setTimeout(() => resolve(null), 2500));
   event.waitUntil(
-    self.registration.showNotification("remux", {
-      body: "A session may need your attention",
-      tag: "remux-attention",
-      icon: "/icon-512.png",
-    })
+    Promise.race([attentionBody().catch(() => null), deadline]).then((body) =>
+      self.registration.showNotification("remux", {
+        body: body || "A session may need your attention",
+        tag: "remux-attention",
+        icon: "/icon-512.png",
+      })
+    )
   );
 });
 

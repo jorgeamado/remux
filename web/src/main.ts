@@ -4,6 +4,40 @@ import { setupKeyRow, applyCtrl } from "./keys";
 import { setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
+
+// ---------- token mirror for the service worker ----------
+// The SW cannot read localStorage; it needs the device token to ask
+// /api/attention for notification detail after a (payload-less) push.
+// IndexedDB is the only storage both contexts share.
+function idbTokenWrite(token: string | null): void {
+  try {
+    const open = indexedDB.open("remux", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("kv");
+    open.onsuccess = () => {
+      const tx = open.result.transaction("kv", "readwrite");
+      if (token === null) {
+        tx.objectStore("kv").delete("device_token");
+      } else {
+        tx.objectStore("kv").put(token, "device_token");
+      }
+      tx.oncomplete = () => open.result.close();
+    };
+  } catch {
+    /* private mode etc. — SW falls back to the generic notification */
+  }
+}
+
+function setDeviceToken(token: string | null): void {
+  if (token === null) {
+    localStorage.removeItem(TOKEN_KEY);
+  } else {
+    localStorage.setItem(TOKEN_KEY, token);
+  }
+  idbTokenWrite(token);
+}
+
+// Devices paired before the mirror existed: sync on every startup.
+idbTokenWrite(localStorage.getItem(TOKEN_KEY));
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
 const SESSION_KEY = "remux.session";
@@ -89,7 +123,7 @@ async function pairWith(token: string): Promise<void> {
     throw new Error(await resp.text());
   }
   const body = (await resp.json()) as { device_token: string };
-  localStorage.setItem(TOKEN_KEY, body.device_token);
+  setDeviceToken(body.device_token);
 }
 
 function showSetup(message?: string): void {
@@ -358,12 +392,12 @@ function handleControl(msg: ControlMsg): void {
     }
     case "error":
       if (msg.code === "auth_failed") {
-        localStorage.removeItem(TOKEN_KEY);
+        setDeviceToken(null);
         intentionalClose = true;
         ws?.close();
         showSetup("This device is no longer paired. Pair it again.");
       } else if (msg.code === "revoked") {
-        localStorage.removeItem(TOKEN_KEY);
+        setDeviceToken(null);
         intentionalClose = true;
         ws?.close();
         showSetup("This device was revoked. Pair it again if that was a mistake.");

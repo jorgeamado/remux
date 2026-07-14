@@ -119,9 +119,22 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
     pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_TTL);
     let mut sessions: Vec<&String> = pending.keys().collect();
     sessions.sort();
-    // `details` is additive; `sessions` stays for older clients.
-    let mut details: Vec<&crate::Attention> = pending.values().map(|(_, a)| a).collect();
-    details.sort_by(|a, b| a.session.cmp(&b.session));
+    // `details` is additive; `sessions` stays for older clients. Freshest
+    // first — the service worker names the most recent event in the
+    // notification it shows for a payload-less push.
+    // Sort by the Instant, not by whole-second age: same-second events would
+    // otherwise inherit HashMap iteration order and "freshest" would lie.
+    let mut by_time: Vec<(&std::time::Instant, &crate::Attention)> =
+        pending.values().map(|(t, a)| (t, a)).collect();
+    by_time.sort_by(|(a, _), (b, _)| b.cmp(a));
+    let details: Vec<serde_json::Value> = by_time
+        .iter()
+        .map(|(t, a)| {
+            let mut v = serde_json::to_value(a).unwrap_or_default();
+            v["age_secs"] = now.duration_since(**t).as_secs().into();
+            v
+        })
+        .collect();
     Json(serde_json::json!({ "sessions": sessions, "details": details })).into_response()
 }
 

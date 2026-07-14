@@ -63,6 +63,19 @@ control-mode arc is done and deployed.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 
+**M4a VERIFIED ON DEVICE (2026-07-14):** locked iPhone shows the named
+notification ("main — test: test notification — it works!") from a
+`remux test-attention` run. Full path proven: ingest socket → typed
+attention event → payload-less push → SW wakes, reads the device token
+from IndexedDB, fetches /api/attention (8s deadline, generic fallback)
+→ named lock-screen text. Field gotchas learned: the PWA must be
+force-quit + relaunched to pick up a new service worker, and the first
+generic-text round was exactly that; /api/attention hits are now logged
+at info to make this diagnosable. Next: M4b approval decisions (day 1:
+the ~90s blocking PermissionRequest-hook empirical test), or the PWA
+input backlog (Tab key, Ctrl+letter) — see PLAN.
+
+
 Plan drafted, Codex-reviewed (20 findings, 4 blockers), and rewritten
 before any code — see PLAN.md §M4. The review killed in-band OSC 133
 parsing (per-connection PTY = no byte source while the phone is locked;

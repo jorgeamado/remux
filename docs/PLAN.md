@@ -433,27 +433,124 @@ granting/revoking `approve` takes effect on already-connected sockets.
 
 ### M4c — shell command events + metadata cards (medium)
 
-zsh/bash hook snippets (installed via a documented one-liner, idempotent,
-narrow supported matrix — nested shells/ssh/fish explicitly degrade to
-busy→quiet) emitting `command_started`/`command_finished {exit, duration,
-cwd}` through `remux emit`. Attention v2 for plain shells ("`cargo build`
-failed (101) after 4m"). PWA gets the first feed: **metadata-only command
-cards** (command, exit badge, duration, running-state) with tap-through to
-the terminal — ⚑ no output streaming: OSC boundaries don't make arbitrary
-terminal bytes safely re-renderable outside xterm, so output stays in the
-real terminal.
+Plan Codex-reviewed 2026-07-14 (6 blockers + majors) before code — design
+below reflects it. **zsh first** (bash deferred: macOS bash 3.2 lacks
+`EPOCHREALTIME` and `trap DEBUG` fires too broadly — needs a proven preexec
+shim + a recursion-guarded state machine, its own increment). Hooks emit
+correlated command events; the daemon keeps a bounded per-session metadata
+feed and raises precise failure notifications; the PWA shows metadata-only
+command cards. ⚑ **No output streaming** (that's the gated M4d).
 
-Acceptance: long command fails while phone is locked → named notification;
-feed shows the day's command history for a session; forged events can at
-worst pollute the informational feed, never trigger actions.
+**Delivery must be non-blocking + isolated (Codex blockers 1, 3).** The
+current `remux emit` blocks on an ack (5s, no connect deadline) and shares
+the 60/min global ingest limiter — calling it from `preexec`/`precmd` would
+stall every prompt, and shell volume would starve *actionable*
+`agent_permission` events. So shell events get a **separate surface**: a
+dedicated non-blocking, lossy delivery (a `SOCK_DGRAM` ingest, or a
+write-and-close with no ack) on its own socket/queue with its own budget
+(~120/pane/min, ~600/min global, overflow drops silently). The agent socket
+and its 16 slots stay untouched. The hook must never hang the shell: dead
+daemon → the emit is a no-op, prompt returns instantly.
 
-### M4d — streamed-output feed (large, gated)
+**Correlated events (Codex blocker 2).** The shell mints a `shell_id` (once
+per interactive shell) and a per-shell monotonic `command_id`; both ride
+start and finish. `command_started {shell_id, command_id, pane, command,
+cwd}` on preexec; `command_finished {shell_id, command_id, pane, exit}` on
+precmd (daemon-observed elapsed from the matched start is canonical duration;
+the shell's own timing is diagnostic only). Semantics: duplicate start/finish
+= no-op; finish-without-start = ignored + counted; a new start superseding an
+unfinished one on the same shell marks the predecessor aborted; nested shells
+stay independent (distinct `shell_id`). Model name is "interactive shell
+submission", not process lifecycle — `job &` reports prompt-return, not job
+exit. Cap `command`/`cwd` in bytes (line stays < 4096) and clamp exit/elapsed.
+
+**Feed store + sweeper (Codex blocker 5).** `feed::Feed` mirrors the
+`permit::Registry` hint+snapshot pattern, but a reconcile-on-hint model has
+no wake for stale/expired entries — so a **timer sweeper** marks running
+commands stale after a cap (~6h), evicts by age (~6–12h) and by count, and
+**fires the change hint** so views update. Bounds are global, not just
+per-session (abandoned sessions must not leak): separate running-command map
+so completed pressure can't evict an active command; global cap (~5000);
+dead-session bucket cleanup. Memory-only (no disk); restart loss is
+acceptable and documented. Snapshot serializes `started_age_ms`/wall-clock,
+never a Rust `Instant`.
+
+**Precise attention without double-firing (Codex blocker 6).** The busy→quiet
+`Detector` map is private to the attention monitor task; ingest can't reach
+it. Add a coordination channel: a matched `command_finished` sends
+`(session)` to the monitor, which **resets that session's busy epoch** (all
+matched finishes consume it, including quick successes), then the finish
+handler raises attention only if policy says so (`exit != 0` OR elapsed ≥
+~30s). Keep the anti-spam per-(endpoint,session) throttle, but let a real
+failure supersede a prior heuristic event from the same busy cycle.
+
+**Secrets (Codex Q5, hard rule).** Command lines carry tokens. Never copy
+`command`/`cwd` into `Attention` (the SW renders `reason` on the lock
+screen). Shell attention text is built only from validated **exit + elapsed +
+session** ("a command failed (101) in <session>"), never the command — this
+overrides the old "`cargo build` failed" example. The full command lives only
+in the post-auth feed (memory-only, over the authenticated WS, never push).
+Add a test asserting no command reaches `/api/attention`/the SW. Never log raw
+commands. Feed history must **not** be persisted to `localStorage`.
+
+**PWA feed (Codex majors).** A `command_feed` frame, but — unlike the tiny
+permission frame — a ≤200-entry snapshot shares the bounded PTY-byte outgoing
+queue, so repeated snapshots could delay terminal output: **filter to the
+connection's session**, coalesce/debounce the hint (~100–250ms, trailing),
+clone the snapshot outside the mutex, always send one initial snapshot (even
+empty) to clear stale client state. Feed panel shows metadata cards (command
+via `textContent`, exit badge ✓/✗code, elapsed, relative time, running
+spinner) newest-first. Tap-through: define it — a tap navigates to the card's
+session and to the current topology location of its stable pane id (handle
+moved/deleted panes); switching sessions alone isn't enough, and selecting a
+pane needs controller status. No new device capability (paired already
+observes the session), but document that the feed adds *retrospective* command
+history; offer a **host-level "disable command capture"** switch rather than
+per-device gating.
+
+**Shell-history mirroring (Codex major).** Composer ↑ recalls the session's
+actual recent commands from the feed — but keep that recall list in
+**per-session memory only**; never merge captured desktop commands into the
+`localStorage` composer history (that would persist them indefinitely, across
+sessions, beyond feed retention). Make the existing global composer history
+session-scoped as part of this.
+
+**Build increments** (each: tests + Codex review + commit):
+1. Non-blocking shell ingest surface + correlated `command_started/finished`
+   + `feed::Feed` (pairing, global+per-session bounds, running map) + timer
+   sweeper + zsh hook snippet + non-blocking `remux emit command`. Tests:
+   pairing/dupe/out-of-order, bounds+sweep, ambiguous pane, forgery-inert,
+   budget isolation.
+2. Precise attention (matched finish → epoch reset + secrets-safe
+   notification) + the no-command-leak test.
+3. `command_feed` WS frame (session-filtered, debounced, initial snapshot) +
+   PWA feed panel + tap-through.
+4. Shell-history mirroring + session-scoped composer history.
+5. On-device test.
+
+Acceptance: a long/failed command on the Mac tmux → a secrets-safe named
+notification on the locked phone; the feed shows the session's recent
+commands with exit/duration; ↑ in the composer recalls actual session
+commands; forged events can at worst pollute the informational feed, never
+trigger an action, and never leak a command to the lock screen; a busy build
+session never starves permission events.
+
+### M4d — streamed-output feed (large, gated — do NOT build on spec)
 
 The full chat-timeline with output in the blocks. Explicitly gated on M4c
 proving insufficient — rendering command output outside the terminal means
-real VT handling per block (progress bars, cursor rewrites, color) and a
-capture path that doesn't exist today. Decide with usage data, like the
-custom renderer.
+real VT handling per block (progress bars, cursor rewrites, color, alternate
+screen) and a per-block capture path that doesn't exist today, plus new
+background-process, retention, and secret-exposure problems M4c's shell
+tokens do NOT solve. Codex-reviewed gate (Q8): M4c metadata is enough for
+awareness, navigation, exit/duration diagnosis, and history recall. **Build
+M4d only after repeated real evidence of needing a command's *output* once
+it's no longer recoverable from tmux scrollback** — e.g. "which tests
+failed?", "what URL/artifact did it print?", "what was the final error after
+scrollback scrolled off?", "a command ran in another pane while the phone was
+disconnected and exit metadata can't explain the outcome". One-off curiosity
+doesn't count; a recurring workflow gap does. Decide with usage data, like
+the custom renderer.
 
 Sequencing: M4.0 → M4a → M4b is the shortest path to the differentiating
 feature (remote approvals) on the most trustworthy signal (agent hooks);

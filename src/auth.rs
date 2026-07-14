@@ -19,6 +19,13 @@ pub struct Device {
     /// Unix seconds of the last successful websocket auth.
     #[serde(default)]
     pub last_seen_unix: u64,
+    /// May this device resolve agent permission cards (M4b)? Off by default;
+    /// granted host-side via `remux devices grant-approve`. Remotely
+    /// authorizing an agent's tool-use is more than "view and type", so it is
+    /// a separate opt-in capability. `#[serde(default)]` keeps older
+    /// devices.json files (no field) loading as non-approvers.
+    #[serde(default)]
+    pub approve: bool,
 }
 
 struct Inner {
@@ -114,6 +121,7 @@ impl Auth {
                 .unwrap_or_default()
                 .as_secs(),
             last_seen_unix: 0,
+            approve: false,
         };
         inner.devices.push(device);
         // Persist under the lock: concurrent mutators (pair/touch) must not
@@ -187,6 +195,43 @@ impl Auth {
             .devices
             .iter()
             .any(|d| d.id == device_id)
+    }
+
+    /// May this device resolve permission cards *right now*? Checked by id at
+    /// decision time — never off a `Device` clone captured at WS auth — so a
+    /// `grant-approve`/`revoke-approve` (or a full revoke) takes effect on
+    /// already-connected sockets, not just new ones (M4b).
+    pub fn can_approve(&self, device_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .any(|d| d.id == device_id && d.approve)
+    }
+
+    /// Grant or revoke the `approve` capability. Persisted before returning;
+    /// a write failure rolls the change back and errors, so the capability
+    /// can never silently flip after a restart (mirrors `revoke`). Returns
+    /// whether the value actually changed.
+    pub fn set_approve(&self, device_id: &str, approve: bool) -> Result<bool> {
+        let inner = &mut *self.inner.lock().unwrap();
+        let Some(d) = inner.devices.iter_mut().find(|d| d.id == device_id) else {
+            anyhow::bail!("no such device");
+        };
+        if d.approve == approve {
+            return Ok(false);
+        }
+        d.approve = approve;
+        if let Err(e) = self.persist(&inner.devices) {
+            // Roll back the in-memory change so state matches disk.
+            if let Some(d) = inner.devices.iter_mut().find(|d| d.id == device_id) {
+                d.approve = !approve;
+            }
+            tracing::error!("failed to persist approve change: {e:#}");
+            anyhow::bail!("could not persist the capability change; NOT applied");
+        }
+        Ok(true)
     }
 
     /// Record websocket auth time for a device (best effort).
@@ -286,6 +331,30 @@ mod tests {
             auth.pair("wrong", "x"),
             Err(PairError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn approve_capability_off_by_default_and_persists() {
+        let auth = temp_auth();
+        let path = auth.path.clone();
+        let pairing = auth.new_pairing_token();
+        let _ = auth.pair(&pairing, "phone").unwrap();
+        let id = auth.devices()[0].id.clone();
+        // Off by default.
+        assert!(!auth.can_approve(&id));
+        // Grant is idempotent-aware: first grant changes, second is a no-op.
+        assert!(auth.set_approve(&id, true).unwrap());
+        assert!(!auth.set_approve(&id, true).unwrap());
+        assert!(auth.can_approve(&id));
+        // Unknown device errors, does not panic.
+        assert!(auth.set_approve("nope", true).is_err());
+        // Survives reload.
+        drop(auth);
+        let reloaded = Auth::load(path).unwrap();
+        assert!(reloaded.can_approve(&id));
+        // Revoking the whole device also drops the capability.
+        assert!(reloaded.revoke(&id).is_ok());
+        assert!(!reloaded.can_approve(&id));
     }
 
     #[test]

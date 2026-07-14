@@ -35,12 +35,18 @@ async fn main() -> Result<()> {
                         println!("no paired devices");
                     }
                     for d in devices {
+                        let approve = if d["approve"].as_bool().unwrap_or(false) {
+                            "  [approve]"
+                        } else {
+                            ""
+                        };
                         println!(
-                            "{}  {:<24} paired {}  last seen {}",
+                            "{}  {:<24} paired {}  last seen {}{}",
                             d["id"].as_str().unwrap_or("?"),
                             d["name"].as_str().unwrap_or("?"),
                             fmt_unix(d["created_unix"].as_u64()),
                             fmt_unix(d["last_seen_unix"].as_u64()),
+                            approve,
                         );
                     }
                 }
@@ -54,6 +60,28 @@ async fn main() -> Result<()> {
                         serde_json::json!({"cmd": "rename", "id": id, "name": name}),
                     )?;
                     println!("renamed");
+                }
+                DevicesCmd::GrantApprove { id } => {
+                    let v = admin::request(
+                        &state_dir,
+                        serde_json::json!({"cmd": "set_approve", "id": id, "grant": true}),
+                    )?;
+                    if v["changed"] == serde_json::json!(true) {
+                        println!("granted approve to {id}");
+                    } else {
+                        println!("{id} already had approve");
+                    }
+                }
+                DevicesCmd::RevokeApprove { id } => {
+                    let v = admin::request(
+                        &state_dir,
+                        serde_json::json!({"cmd": "set_approve", "id": id, "grant": false}),
+                    )?;
+                    if v["changed"] == serde_json::json!(true) {
+                        println!("revoked approve from {id}");
+                    } else {
+                        println!("{id} did not have approve");
+                    }
                 }
             }
             return Ok(());

@@ -27,6 +27,11 @@ enum Request {
         id: String,
         name: String,
     },
+    /// Grant/revoke the `approve` capability (M4b). `grant: true` grants.
+    SetApprove {
+        id: String,
+        grant: bool,
+    },
 }
 
 pub fn socket_path(state_dir: &Path) -> PathBuf {
@@ -117,6 +122,13 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
                 serde_json::json!({ "ok": false, "error": "no such device" })
             }
         }
+        Ok(Request::SetApprove { id, grant }) => match app.auth.set_approve(&id, grant) {
+            Ok(changed) => {
+                tracing::info!(device = %id, grant, "approve capability set via admin socket");
+                serde_json::json!({ "ok": true, "changed": changed })
+            }
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        },
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
     };
     write.write_all(format!("{response}\n").as_bytes()).await?;

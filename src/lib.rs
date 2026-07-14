@@ -75,6 +75,12 @@ pub enum DevicesCmd {
     Revoke { id: String },
     /// Rename a device.
     Rename { id: String, name: String },
+    /// Grant a device the `approve` capability: it may resolve agent
+    /// permission cards (M4b). Off by default; host-only.
+    GrantApprove { id: String },
+    /// Revoke a device's `approve` capability. Takes effect on live
+    /// connections immediately (checked by id at decision time).
+    RevokeApprove { id: String },
 }
 
 /// Options for `remux serve`.

@@ -389,6 +389,55 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Push this session's shell command feed (M4c) and keep it reconciled.
+    // Session-filtered (a feed snapshot is far larger than a permission frame,
+    // and it shares the PTY-byte outgoing queue — so it must not carry other
+    // sessions' commands) and debounced: a fast command loop fires many hints,
+    // but the client only needs the latest snapshot.
+    let feed_task = tokio::spawn({
+        let mut rx = app.feed.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let session = session.clone();
+        async move {
+            // The change hint is global (not per-session), so activity in any
+            // session wakes this task. Only actually send when *this* session's
+            // rendered snapshot changed — otherwise session B would resend its
+            // unchanged (up to 200-entry) feed every time session A ran a
+            // command, competing with PTY bytes on the shared outgoing queue.
+            let mut last_sent: Option<String> = None;
+            loop {
+                let commands = app.feed.snapshot(&session);
+                let is_empty = commands.is_empty();
+                let json =
+                    serde_json::json!({ "type": "command_feed", "commands": commands }).to_string();
+                // Send when it changed, and either non-empty or a clear of a
+                // previously-sent set (a fresh empty connection stays quiet so
+                // it can't race the status frame).
+                if last_sent.as_deref() != Some(json.as_str()) && (!is_empty || last_sent.is_some())
+                {
+                    if out.send(Message::Text(json.clone().into())).await.is_err() {
+                        break;
+                    }
+                    last_sent = Some(json);
+                }
+                // Block for the next change, then coalesce a burst: absorb
+                // further hints for a short window and send one fresh snapshot.
+                match rx.recv().await {
+                    Ok(()) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Drain buffered hints so the next recv() blocks until a genuine
+                // change. Bounded: on lag, stop — the fresh snapshot above
+                // reconciles regardless, so exhaustive draining is unnecessary
+                // (and a Lagged-continue loop could spin).
+                while matches!(rx.try_recv(), Ok(())) {}
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -537,6 +586,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     let _ = child.kill();
     attention_task.abort();
     permits_task.abort();
+    feed_task.abort();
     revoke_task.abort();
     topology_task.abort();
     sender.abort();

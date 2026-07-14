@@ -282,6 +282,7 @@ function connect(): void {
     windowTabs.hidden = true;
     paneTabs.hidden = true;
     clearPermissionCards();
+    clearFeed();
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -346,6 +347,22 @@ interface ControlMsg {
   source?: string;
   /** permission_cards frames (M4b) */
   cards?: PermissionCard[];
+  /** command_feed frames (M4c) */
+  commands?: FeedCommand[];
+}
+
+/** A shell command in the session feed (M4c). Mirrors the daemon's Cmd view. */
+interface FeedCommand {
+  id: number;
+  session: string;
+  pane: string;
+  command: string;
+  cwd: string;
+  state: "running" | "done" | "aborted";
+  exit: number | null;
+  elapsed_ms: number | null;
+  started_unix: number;
+  age_ms: number;
 }
 
 /** An open agent permission request (M4b). Mirrors the daemon's Card::view. */
@@ -399,6 +416,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "permission_cards":
       renderPermissionCards(msg.cards ?? []);
+      break;
+    case "command_feed":
+      onCommandFeed(msg.commands ?? []);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -481,6 +501,10 @@ function switchSession(name: string): void {
   // so no intentionalClose flag is needed (which could leak and suppress
   // the reconnect after an invalid_session rejection).
   ws?.close();
+  // The feed is per-session; clear it now. The old socket's close is ignored
+  // (superseded), so onclose won't, and the new session may have an empty feed
+  // the daemon stays silent about — leaving stale cards without this.
+  clearFeed();
   handle.term.reset(); // fresh grid; the new attach repaints everything
   connect();
 }
@@ -741,6 +765,126 @@ async function decidePermission(card: PermissionCard, decision: "allow" | "deny"
   }
 }
 
+// ---------- M4c command feed ----------
+
+const feedPanel = $("command-feed-panel");
+const feedBtn = $<HTMLButtonElement>("feed-btn");
+let feedCommands: FeedCommand[] = [];
+let feedOpen = false;
+// When the current snapshot arrived, so relative ages keep advancing between
+// frames (the daemon's age_ms is a point-in-time value).
+let feedReceivedAt = 0;
+let feedTicker: number | undefined;
+
+function onCommandFeed(commands: FeedCommand[]): void {
+  feedCommands = commands;
+  feedReceivedAt = performance.now();
+  if (feedOpen) paintFeed();
+}
+
+function toggleFeed(): void {
+  feedOpen = !feedOpen;
+  menu.hidden = true;
+  feedPanel.hidden = !feedOpen;
+  if (feedOpen) {
+    paintFeed();
+    if (feedTicker === undefined) feedTicker = window.setInterval(paintFeed, 15000);
+  } else if (feedTicker !== undefined) {
+    window.clearInterval(feedTicker);
+    feedTicker = undefined;
+  }
+}
+
+function clearFeed(): void {
+  feedCommands = [];
+  if (feedOpen) paintFeed();
+}
+
+function paintFeed(): void {
+  feedPanel.textContent = "";
+  if (feedCommands.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "feed-empty";
+    empty.textContent = "No commands yet. Install the zsh hook to see this session's command history.";
+    feedPanel.appendChild(empty);
+    return;
+  }
+  // Snapshot is oldest→newest; show newest first.
+  for (let i = feedCommands.length - 1; i >= 0; i--) {
+    feedPanel.appendChild(feedCardEl(feedCommands[i]));
+  }
+}
+
+function feedCardEl(c: FeedCommand): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "feed-card";
+
+  const badge = document.createElement("span");
+  if (c.state === "running") {
+    badge.className = "feed-badge running";
+    badge.textContent = "···";
+  } else if (c.state === "aborted") {
+    badge.className = "feed-badge aborted";
+    badge.textContent = "—";
+  } else if (c.exit === 0) {
+    badge.className = "feed-badge ok";
+    badge.textContent = "✓";
+  } else {
+    badge.className = "feed-badge fail";
+    badge.textContent = String(c.exit ?? "?");
+  }
+
+  const body = document.createElement("div");
+  body.className = "feed-body";
+  const cmd = document.createElement("div");
+  cmd.className = "feed-cmd";
+  cmd.textContent = c.command || "(no command)"; // textContent — never HTML
+  const meta = document.createElement("div");
+  meta.className = "feed-meta";
+  meta.textContent = feedMeta(c);
+  body.append(cmd, meta);
+
+  el.append(badge, body);
+
+  // The feed is this session's; tapping a card just returns to the terminal.
+  el.style.cursor = "pointer";
+  el.addEventListener("click", toggleFeed);
+  return el;
+}
+
+function feedMeta(c: FeedCommand): string {
+  const parts: string[] = [];
+  if (c.state === "running") parts.push("running");
+  else if (c.state === "aborted") parts.push("aborted");
+  else if (c.elapsed_ms != null) parts.push(humanMs(c.elapsed_ms));
+  parts.push(agoFrom(c.age_ms + (performance.now() - feedReceivedAt)));
+  const dir = shortCwd(c.cwd);
+  if (dir) parts.push(dir);
+  return parts.join(" · ");
+}
+
+/// Last two path segments of a cwd (~/… kept), for compact display.
+function shortCwd(cwd: string): string {
+  if (!cwd) return "";
+  const parts = cwd.split("/").filter(Boolean);
+  return parts.length <= 2 ? cwd : "…/" + parts.slice(-2).join("/");
+}
+
+function humanMs(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+}
+
+function agoFrom(ageMs: number): string {
+  const s = Math.round(ageMs / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 // ---------- attention notifications ----------
 
 /// The daemon says the session was busy and went quiet (job finished, or a
@@ -953,6 +1097,7 @@ $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
 $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
 $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
 notifyBtn.addEventListener("click", () => void toggleNotify());
+feedBtn.addEventListener("click", toggleFeed);
 renderNotifyBtn();
 
 // ---------- command composer ----------

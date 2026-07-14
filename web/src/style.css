@@ -577,3 +577,88 @@ button {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* ---------- M4c command feed ---------- */
+#command-feed-panel {
+  position: absolute;
+  top: 60px;
+  left: 8px;
+  right: 8px;
+  max-height: 70dvh;
+  overflow-y: auto;
+  z-index: 20;
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.feed-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+}
+
+.feed-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.feed-badge {
+  flex: none;
+  width: 40px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  border-radius: 6px;
+  padding: 3px 0;
+}
+
+.feed-badge.ok {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--ok);
+}
+
+.feed-badge.fail {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--danger);
+}
+
+.feed-badge.running {
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+
+.feed-badge.aborted {
+  color: var(--muted);
+}
+
+.feed-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.feed-cmd {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.feed-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}

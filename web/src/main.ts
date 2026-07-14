@@ -1,6 +1,6 @@
 import "./style.css";
 import { createTerminal } from "./term";
-import { setupKeyRow, applyCtrl } from "./keys";
+import { setupKeyRow, applyCtrl, disarmCtrl } from "./keys";
 import { setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
@@ -805,20 +805,61 @@ const HISTORY_MAX = 50;
 let cmdHistory: string[] = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
 let historyIdx: number | null = null;
 
+/// True after a Tab flushed a draft to the shell: the real command line
+/// lives in the terminal now, partially completed there.
+let shellLinePending = false;
+
 function composerSubmit(): void {
   const text = composerInput.value;
-  if (!text) return;
+  if (!text && !shellLinePending) return;
+  if (!text) {
+    // Empty submit finishes the tab-completed line already in the shell.
+    sendInput("\r");
+    shellLinePending = false;
+    return;
+  }
   sendInput(text + "\r");
-  if (cmdHistory[cmdHistory.length - 1] !== text) {
+  // After a tab-flush the field only holds the suffix — recording it would
+  // pollute history with an invalid partial command.
+  if (!shellLinePending && cmdHistory[cmdHistory.length - 1] !== text) {
     cmdHistory = [...cmdHistory, text].slice(-HISTORY_MAX);
     localStorage.setItem(HISTORY_KEY, JSON.stringify(cmdHistory));
   }
+  shellLinePending = false;
   historyIdx = null;
   composerInput.value = "";
 }
 
+/// Shell completion from the composer: the draft must live in the shell's
+/// input buffer for Tab to mean anything — flush it un-submitted, then Tab.
+/// The completed line continues in the terminal; the composer clears so a
+/// following submit appends to that same shell line.
+function composerTabComplete(): void {
+  sendInput(composerInput.value + "\t");
+  shellLinePending = true;
+  composerInput.value = "";
+  historyIdx = null;
+}
+
 composerInput.addEventListener("keydown", (ev) => {
-  if (ev.key === "Enter") {
+  // Armed ⌃ (key row) or a hardware Ctrl: the next letter is a control
+  // code for the terminal, not text for the field.
+  if (ev.key.length === 1 && /[a-z]/i.test(ev.key)) {
+    const viaHardware = ev.ctrlKey && !ev.metaKey && !ev.altKey;
+    const transformed = viaHardware
+      ? String.fromCharCode(ev.key.toLowerCase().charCodeAt(0) & 0x1f)
+      : applyCtrl(ev.key);
+    if (transformed !== ev.key) {
+      ev.preventDefault();
+      if (viaHardware) disarmCtrl(); // don't leave a stale sticky ⌃ armed
+      sendInput(transformed);
+      return;
+    }
+  }
+  if (ev.key === "Tab") {
+    ev.preventDefault();
+    composerTabComplete();
+  } else if (ev.key === "Enter") {
     ev.preventDefault();
     composerSubmit();
   } else if (ev.key === "ArrowUp" && cmdHistory.length > 0) {
@@ -952,7 +993,15 @@ applyDebug();
 (window as unknown as { __topology?: () => SessionTopo[] }).__topology = () =>
   topology;
 
-setupKeyRow(sendInput);
+// Key-row Tab completes the composer draft when there is one; every other
+// key goes straight to the terminal as before.
+setupKeyRow((data) => {
+  if (data === "\t" && composerInput.value) {
+    composerTabComplete();
+  } else {
+    sendInput(data);
+  }
+});
 composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>
   sendInput(data, { takeControl: false, silent: true, allowObserver: true })

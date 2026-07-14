@@ -101,8 +101,25 @@ captured clone); permission cards need their own broadcast+registry
 (App.connections holds counts, not senders) with reconcile-on-subscribe;
 held waits get their own small cap (never the shared 16-slot ingest pool);
 generic lock-screen text only (command fetched post-auth); HTTP POST is the
-canonical decision op. Next: build increment 1 (ingest lifecycle refactor
-+ registry + resolver + emit permission --wait + Device.approve).
+canonical decision op.
+
+**M4b increment 1 DONE + Codex-reviewed + CI (2026-07-14).** The daemon
+side of approvals, minus the phone-facing delivery:
+- `permit::Registry` — single-winner `resolve` with the `approve` check
+  under the registry lock, prompt_id dedup, global/per-pane caps, 128-bit
+  ids;
+- ingest lifecycle refactored into admission/parse → dispatch → held-wait;
+  the `agent_permission` wait releases its admission slot and does a biased
+  select of socket-EOF / decision / expiry (EOF wins ties, honoring "a
+  broken wait is never overridden by a late decision"), with RAII cleanup;
+- `remux emit permission --wait` (stdin parse, decision-JSON-only stdout,
+  logs forced to stderr), `Device.approve` + grant/revoke CLI.
+Code review found 1 blocker + 4 major, all fixed (resolve/EOF tie via
+`biased`; capability coupled into resolve; prompt_id dedup + strict reject;
+stdout hygiene). One residual is recorded for increment 2: the phone's
+decision response must reflect *actual delivery* to the hook, not just that
+resolve consumed the card. Next: **increment 2** — broadcast channel + WS
+card frame + approve-gated HTTP decide/list + generic permission attention.
 
 Note on where Claude Code runs: the day-1 test needed no container decision
 (ran on the host). For real use the hook's `remux emit` must reach the

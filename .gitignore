@@ -7,3 +7,5 @@
 /web/*.png
 /web/tabshot.mjs
 /target-linux
+/web/test-results
+test-results/

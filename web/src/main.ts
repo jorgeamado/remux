@@ -365,6 +365,17 @@ interface ControlMsg {
   cards?: PermissionCard[];
   /** command_feed frames (M4c) */
   commands?: FeedCommand[];
+  /** pane_views frames: structured per-pane state for custom renderers */
+  views?: PaneView[];
+}
+
+/** A pane's structured view state, rendered as a custom interface. */
+interface PaneView {
+  pane: string;
+  view: string;
+  rev: number;
+  // Shape depends on `view`; the renderer for that view id validates it.
+  state: Record<string, unknown>;
 }
 
 /** A shell command in the session feed (M4c). Mirrors the daemon's Cmd view. */
@@ -438,6 +449,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "command_feed":
       onCommandFeed(msg.commands ?? []);
+      break;
+    case "pane_views":
+      onPaneViews(msg.views ?? []);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -839,6 +853,138 @@ function clearFeed(): void {
   if (feedOpen) paintFeed();
 }
 
+// ---------- Pane views (custom dashboards) ----------
+
+const dashboardPanel = $("dashboard-panel");
+const viewToggleBtn = $<HTMLButtonElement>("view-toggle-btn");
+let paneViews: PaneView[] = [];
+let dashboardMode = false;
+
+/** The view to show: the active pane's if it has one, else the first available. */
+function currentView(): PaneView | undefined {
+  if (paneViews.length === 0) return undefined;
+  const active = activePaneId();
+  return paneViews.find((v) => v.pane === active) ?? paneViews[0];
+}
+
+function onPaneViews(views: PaneView[]): void {
+  paneViews = views;
+  const v = currentView();
+  // The toggle only exists while a source is streaming a view for this pane.
+  viewToggleBtn.hidden = v === undefined;
+  if (v === undefined && dashboardMode) {
+    setDashboard(false); // source went away → fall back to the terminal
+  } else if (dashboardMode) {
+    renderDashboard();
+  }
+}
+
+function setDashboard(on: boolean): void {
+  dashboardMode = on;
+  dashboardPanel.hidden = !on;
+  viewToggleBtn.textContent = on ? "Terminal" : "Dashboard";
+  viewToggleBtn.classList.toggle("primary", on);
+  if (on) {
+    // A dashboard is not a terminal view: stop driving tmux size. If we're the
+    // controller, hand control back so the now-hidden xterm can't keep shrinking
+    // the desktop layout (window-size latest).
+    if (isController) sendJson({ type: "release_control" });
+    renderDashboard();
+  } else {
+    handle.fit(); // terminal is visible again — remeasure the grid
+  }
+}
+
+function toggleDashboard(): void {
+  menu.hidden = true;
+  setDashboard(!dashboardMode);
+}
+
+function renderDashboard(): void {
+  const v = currentView();
+  dashboardPanel.textContent = "";
+  if (!v) return;
+  if (v.view === "taskscope.v1") {
+    dashboardPanel.appendChild(renderTaskscope(v.state));
+  } else {
+    const unknown = document.createElement("div");
+    unknown.className = "dash-empty";
+    unknown.textContent = `No renderer for “${v.view}”.`;
+    dashboardPanel.appendChild(unknown);
+  }
+}
+
+// --- taskscope.v1 renderer (hard-coded; one built-in view) ---
+
+function tsStatusClass(status: string): string {
+  switch (status) {
+    case "running":
+      return "run";
+    case "done":
+      return "done";
+    case "error":
+      return "err";
+    default:
+      return "idle";
+  }
+}
+
+function renderTaskscope(state: Record<string, unknown>): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "ts";
+  const workers = Array.isArray(state.workers) ? (state.workers as Record<string, unknown>[]) : [];
+
+  const head = document.createElement("div");
+  head.className = "ts-head";
+  head.textContent = `taskscope · ${workers.length} worker${workers.length === 1 ? "" : "s"}`;
+  root.appendChild(head);
+
+  if (workers.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "dash-empty";
+    empty.textContent = "No workers.";
+    root.appendChild(empty);
+    return root;
+  }
+  for (const w of workers) root.appendChild(taskscopeCard(w));
+  return root;
+}
+
+function taskscopeCard(w: Record<string, unknown>): HTMLElement {
+  const status = String(w.status ?? "");
+  const cls = tsStatusClass(status);
+  const cpu = Number(w.cpu ?? 0);
+  const mem = Number(w.mem ?? 0);
+  const progress = Math.max(0, Math.min(100, Number(w.progress ?? 0)));
+
+  const card = document.createElement("div");
+  card.className = "ts-card";
+
+  const row = document.createElement("div");
+  row.className = "ts-row";
+  const name = document.createElement("span");
+  name.className = "ts-name";
+  name.textContent = String(w.name ?? "?");
+  const badge = document.createElement("span");
+  badge.className = `ts-badge ${cls}`;
+  badge.textContent = status;
+  row.append(name, badge);
+
+  const meta = document.createElement("div");
+  meta.className = "ts-meta";
+  meta.textContent = `${cpu}% CPU · ${mem} MB`;
+
+  const bar = document.createElement("div");
+  bar.className = "ts-bar";
+  const fill = document.createElement("div");
+  fill.className = `ts-fill ${cls}`;
+  fill.style.width = `${progress}%`;
+  bar.appendChild(fill);
+
+  card.append(row, meta, bar);
+  return card;
+}
+
 function paintFeed(): void {
   feedPanel.textContent = "";
   if (feedCommands.length === 0) {
@@ -1136,6 +1282,7 @@ $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
 $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
 notifyBtn.addEventListener("click", () => void toggleNotify());
 feedBtn.addEventListener("click", toggleFeed);
+viewToggleBtn.addEventListener("click", toggleDashboard);
 renderNotifyBtn();
 
 // ---------- command composer ----------

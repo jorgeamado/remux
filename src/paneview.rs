@@ -425,7 +425,7 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
         .with_context(|| format!("is the daemon running? (no pane-view socket at {path:?})"))?;
 
     // Header, then read the ack.
-    let header = serde_json::json!({ "pane": pane, "view": view });
+    let header = serde_json::json!({ "pane": &pane, "view": &view });
     writeln!(sock, "{header}")?;
     sock.flush()?;
     let mut ackline = String::new();
@@ -438,6 +438,10 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
             ack["error"].as_str().unwrap_or("unknown")
         );
     }
+    // Feedback in the (otherwise silent, since stdout is piped in) pane.
+    eprintln!(
+        "remux: streaming '{view}' for pane {pane} — open the Dashboard on your phone (Ctrl-C to stop)"
+    );
 
     // Forward stdin lines until EOF; closing the socket signals the daemon to
     // drop the view.

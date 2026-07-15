@@ -33,6 +33,7 @@
         <span class="flex-spacer"></span>
         <button id="tmux-btn" class="btn">+</button>
         <button id="control-btn" class="btn primary">Take control</button>
+        <button id="view-toggle-btn" class="btn" hidden>Dashboard</button>
         <button id="menu-btn" class="btn" hidden>aA</button>
       </div>
 
@@ -72,7 +73,12 @@
         <button id="tip-close" class="btn">&#x2715;</button>
       </div>
 
-      <main id="terminal"></main>
+      <main id="terminal">
+        <!-- Pane views: a source (e.g. taskscope) streams structured state for
+             a pane; the PWA renders it as a custom interface over the terminal.
+             Nested so it overlays the terminal box exactly (inset:0). -->
+        <div id="dashboard-panel" hidden></div>
+      </main>
 
       <button id="hint" hidden></button>
 

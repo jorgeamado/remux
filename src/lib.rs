@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod agent;
 pub mod attention;
 pub mod auth;
 pub mod feed;
@@ -156,6 +157,56 @@ pub enum EmitCmd {
         #[arg(long)]
         exit: i32,
     },
+    /// A generic agent lifecycle event (fed to the `claude.v1` dashboard).
+    /// Fire-and-forget: the daemon updates in-memory status only — no secrets,
+    /// no blocking. An agent adapter (e.g. the Claude Code hooks) maps its own
+    /// events onto these; remux stays agent-agnostic.
+    AgentState {
+        /// The lifecycle transition.
+        #[arg(value_enum)]
+        kind: AgentStateKind,
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Agent session id (guards against stale events from an old session).
+        #[arg(long)]
+        session_id: String,
+        /// Operation id, for `operation-started`/`operation-ended` — correlated
+        /// with a permission card's prompt_id to surface the pending ask.
+        #[arg(long)]
+        operation_id: Option<String>,
+        /// Coarse tool name for `operation-started` (e.g. `Bash`) — the only
+        /// tool detail this event may carry; never the tool input.
+        #[arg(long)]
+        tool_name: Option<String>,
+    },
+}
+
+/// The lifecycle transitions an `agent-state` event can carry.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum AgentStateKind {
+    SessionStart,
+    PromptSubmitted,
+    OperationStarted,
+    OperationEnded,
+    Idle,
+    SessionEnded,
+    Touch,
+}
+
+impl AgentStateKind {
+    /// The wire `verb` string sent to the ingest socket.
+    pub fn verb(self) -> &'static str {
+        match self {
+            AgentStateKind::SessionStart => "session-start",
+            AgentStateKind::PromptSubmitted => "prompt-submitted",
+            AgentStateKind::OperationStarted => "operation-started",
+            AgentStateKind::OperationEnded => "operation-ended",
+            AgentStateKind::Idle => "idle",
+            AgentStateKind::SessionEnded => "session-ended",
+            AgentStateKind::Touch => "touch",
+        }
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -289,6 +340,9 @@ pub struct App {
     pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
     /// Open agent permission cards (M4b) awaiting a decision from a device.
     pub perms: permit::Registry,
+    /// Per-pane agent lifecycle state (fed by `remux emit agent-state`), projected
+    /// into a `claude.v1` pane view.
+    pub agents: agent::Registry,
     /// Latest structured "pane view" per pane, fed by the `remux stream` socket
     /// and rendered by the PWA as a custom interface for that pane.
     pub pane_views: paneview::Registry,

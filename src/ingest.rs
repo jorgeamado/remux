@@ -89,6 +89,26 @@ struct AttentionEvent {
     message: Option<String>,
 }
 
+/// Generic agent lifecycle event (feeds the `claude.v1` dashboard). Coarse status
+/// only — no secrets.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentStateEvent {
+    #[allow(dead_code)]
+    v: u32,
+    #[allow(dead_code)]
+    kind: String,
+    pane: String,
+    /// The lifecycle verb (see `AgentStateKind::verb`).
+    verb: String,
+    /// Agent session id — guards against stale events from a superseded session.
+    session_id: String,
+    #[serde(default)]
+    operation_id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
 /// M4b permission event. Strict per-kind schema so the required fields can't be
 /// omitted and meaningless field combinations can't slip through a shared flat
 /// struct.
@@ -229,6 +249,13 @@ async fn handle(
             Ok(ev) => handle_permission(app, ev, reader, write, permit).await,
             Err(e) => write_ack(&mut write, &json_err(&e.to_string())).await,
         },
+        "agent_state" => {
+            let resp = match serde_json::from_str::<AgentStateEvent>(line) {
+                Ok(ev) => process_agent_state(&app, ev),
+                Err(e) => json_err(&e.to_string()),
+            };
+            write_ack(&mut write, &resp).await
+        }
         _ => write_ack(&mut write, &json_err("unknown kind")).await,
     }
 }
@@ -267,6 +294,58 @@ fn process_attention(app: &App, ev: AttentionEvent) -> serde_json::Value {
         source: Some(source),
     });
     serde_json::json!({ "ok": true, "session": session })
+}
+
+/// Cap for agent-state identifier / tool-name fields.
+const MAX_AGENT_FIELD: usize = 128;
+
+/// Sanitize (strip control chars) then cap to a short field length.
+fn agent_field(s: &str) -> String {
+    sanitize(s).chars().take(MAX_AGENT_FIELD).collect()
+}
+
+fn process_agent_state(app: &App, ev: AgentStateEvent) -> serde_json::Value {
+    if !valid_pane(&ev.pane) {
+        return json_err("bad pane id (want %N)");
+    }
+    let sid = agent_field(&ev.session_id);
+    if sid.is_empty() {
+        return json_err("missing session_id");
+    }
+    let op = ev
+        .operation_id
+        .map(|o| agent_field(&o))
+        .filter(|o| !o.is_empty());
+    let tool = ev
+        .tool_name
+        .map(|t| agent_field(&t))
+        .filter(|t| !t.is_empty());
+    use crate::agent::Event;
+    let event = match ev.verb.as_str() {
+        "session-start" => Event::SessionStart { session_id: sid },
+        "prompt-submitted" => Event::PromptSubmitted { session_id: sid },
+        "operation-started" => match (op, tool) {
+            (Some(op_id), Some(tool)) if !op_id.is_empty() => Event::OperationStarted {
+                session_id: sid,
+                op_id,
+                tool,
+            },
+            _ => return json_err("operation-started needs operation_id + tool_name"),
+        },
+        "operation-ended" => match op {
+            Some(op_id) if !op_id.is_empty() => Event::OperationEnded {
+                session_id: sid,
+                op_id,
+            },
+            _ => return json_err("operation-ended needs operation_id"),
+        },
+        "idle" => Event::Idle { session_id: sid },
+        "session-ended" => Event::SessionEnded { session_id: sid },
+        "touch" => Event::Touch { session_id: sid },
+        _ => return json_err("unknown agent-state verb"),
+    };
+    app.agents.apply(&ev.pane, event);
+    serde_json::json!({ "ok": true })
 }
 
 /// Removes a card from the registry on any exit of the held-wait future,

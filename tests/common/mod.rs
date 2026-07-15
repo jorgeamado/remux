@@ -28,6 +28,7 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        agents: Default::default(),
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),

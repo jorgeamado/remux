@@ -182,6 +182,30 @@ async fn main() -> Result<()> {
                 source,
                 wait: _,
             } => return emit_permission(&state_dir, pane, source),
+            EmitCmd::AgentState {
+                kind,
+                pane,
+                session_id,
+                operation_id,
+                tool_name,
+            } => {
+                // Best-effort, non-blocking: a missing pane / down daemon is a
+                // no-op so the agent's hook never breaks.
+                if let Some(pane) = pane.or_else(|| std::env::var("TMUX_PANE").ok()) {
+                    let mut body = serde_json::json!({
+                        "v": 1, "kind": "agent_state", "pane": pane,
+                        "verb": kind.verb(), "session_id": session_id,
+                    });
+                    if let Some(op) = operation_id {
+                        body["operation_id"] = op.into();
+                    }
+                    if let Some(t) = tool_name {
+                        body["tool_name"] = t.into();
+                    }
+                    let _ = ingest::request(&state_dir, body);
+                }
+                return Ok(());
+            }
             EmitCmd::CommandStart {
                 pane,
                 shell_id,
@@ -280,6 +304,7 @@ async fn main() -> Result<()> {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        agents: Default::default(),
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),

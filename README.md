@@ -10,6 +10,23 @@ restarts, and the terminal resizes to whichever device is active.
 
 See [DESIGN.md](DESIGN.md) for the architecture and design review.
 
+## What you get
+
+- **The same tmux session on every device** — attach from your phone and your
+  desktop at once; the terminal resizes to whichever is driving, and locking
+  the phone hands the size straight back to the desktop.
+- **No history replay** — new connections get an instant full repaint from tmux.
+- **Lock-screen notifications** — when a session goes from busy to quiet (a
+  build finished, Claude Code is waiting on you), get a Web Push notification
+  even with the phone locked. Payload-less: no terminal content ever leaves.
+- **Approve agents from your phone** — Claude Code permission prompts can open
+  an Approve/Deny card on a trusted device; deny or approve without walking
+  back to the keyboard (opt-in, falls back to the on-host prompt).
+- **Command feed** — an opt-in shell hook streams each command's start/finish
+  (what ran, exit code, duration) to a per-session feed, with failure alerts.
+- **Yours only** — binds to your tailnet, runs as your user (never root), never
+  logs terminal I/O, and every request is Host/Origin-checked.
+
 ## How it works
 
 ```
@@ -197,9 +214,18 @@ waiting for your answer — remux notifies you.
   a card on your paired, approve-capable device (grant it with `remux devices
   grant-approve <id>`). Approve/Deny remotely; if the command is too long to
   show in full, remote Approve is disabled and you decide on the host, which
-  sees the whole command. The daemon/CLI path is done and drivable with `remux
-  test-permission`; the copy-paste Claude Code `PermissionRequest` hook config
-  is still to be published (tracked in `docs/STATUS.md`).
+  sees the whole command. Safe by construction: if the daemon is down, no
+  device can approve, or the card expires, the helper exits non-zero and Claude
+  Code simply falls back to its normal on-host prompt — it never auto-approves.
+  This is remote *authorization by a second human*, not a security boundary
+  (a same-user process can bypass it), and it is bypassed by
+  `--dangerously-skip-permissions`. The daemon/CLI + phone path is done and
+  drivable today with `remux test-permission`. Wiring a real Claude Code to it
+  is packaged as a small **Claude Code plugin** (a `PermissionRequest` command
+  hook that calls `remux emit permission`); see `docs/STATUS.md` for status.
+  If you have a Claude subscription, Anthropic's own **Remote Control** covers
+  the same need natively; remux's path is for self-hosted / API-key / non-
+  subscription setups that Remote Control doesn't reach.
 - **Command feed**: `remux setup shell` installs an opt-in hook (bash or zsh,
   auto-detected; it explains itself and asks first) that streams each command's
   start/finish — what ran, exit code, duration — to a per-session feed on your
@@ -214,7 +240,8 @@ V1.x: device management UI, launchd/systemd unit files.
 V2: tmux control-mode metadata (panes as tabs/cards), snapshot/delta sync with
 a custom renderer, server-paged scrollback.
 V3 (shipped): hook-based shell command feed, Web Push notifications, and the
-approval-card path (daemon + phone UI; the Claude Code `PermissionRequest` hook
-config is still to be published). Still exploratory: OSC 133 shell integration
-and streamed command *output* (built only if command metadata proves
-insufficient).
+approval-card path (daemon + phone UI). Wiring a real Claude Code to the
+approval cards ships as a small Claude Code plugin (a `PermissionRequest`
+command hook) — see `docs/STATUS.md`. Still exploratory: OSC 133 shell
+integration and streamed command *output* (built only if command metadata
+proves insufficient).

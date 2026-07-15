@@ -60,11 +60,19 @@ editing, M4b decision/EOF race) now have real tests.
   full-screen). WebGL renderer + debounced sizing underneath (font = tmux
   resolution). **M3 control-mode arc complete.**
 
-## Waiting on the user (both one-click, public-facing — I can't do these)
+## Publishing v0.2.0 (in progress 2026-07-15)
 
-1. Publish the draft **v0.1.0** GitHub release (built & verified).
+v0.1.0's draft release is 63 commits stale (predates the whole M4 layer + the
+three hardening tiers), so we're cutting a fresh **v0.2.0** from HEAD rather
+than publishing it. Version bumped, README/docs reconciled; tag `v0.2.0` drives
+release CI (4-platform tarballs/.debs, SHA256SUMS, filled Homebrew formula,
+sigstore attestations) into a new draft. Two public-facing flips left, held for
+the user's explicit go:
+
+1. Publish the draft **v0.2.0** GitHub release (after CI green + verify).
 2. Create the `jorgeamado/homebrew-remux` tap repo and drop the release's
    generated `remux.rb` into `Formula/` → makes `brew install` real.
+3. Bin the stale v0.1.0 draft.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 
@@ -102,9 +110,17 @@ write confirmation; (3) PWA Approve/Deny card + SW notification +
 `test-permission`; (4) on-device test. Field notes: the phone caches the
 PWA JS hard — a full force-quit (not background) is required to load new
 code; and grant `approve` to the device whose `last seen` is freshest (the
-one the PWA is actually using). Remaining to make it real-world: publish the
-Claude Code PermissionRequest hook install snippet (docs) so an actual
-Claude Code — not just `test-permission` — opens cards.
+one the PWA is actually using). Remaining to make it real-world: ship a small
+**Claude Code plugin** whose payload is a `PermissionRequest` command hook
+calling `remux emit permission`, so an actual Claude Code — not just
+`test-permission` — opens cards. Codex-reviewed the packaging (2026-07-15):
+a plugin bundling a `hooks/hooks.json` `PermissionRequest` command hook is the
+supported, current mechanism (not a workaround); matcher `*`, `timeout: 120`,
+card TTL kept under that; on daemon-down/no-approver/expiry the hook must exit
+non-zero → Claude falls back to its native prompt, never auto-allow. Anthropic's
+own Remote Control is the native alternative for Claude-subscription users;
+remux covers self-hosted / API-key setups it doesn't reach. Deferred by
+choice — not a near-term TODO.
 
 **M4a VERIFIED ON DEVICE (2026-07-14):** locked iPhone shows the named
 notification ("main — test: test notification — it works!") from a

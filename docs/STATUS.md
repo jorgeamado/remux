@@ -50,13 +50,32 @@ assets are immutable.
 
 On device (iPhone, `remux-mobile` container): taskscope dashboard, htop dashboard
 with command names (via capture-resolution), and sort/filter/kill all verified.
-Tree renders but is cosmetically rough at phone width (kept as-is). A final
-holistic Codex review (3 High + 2 Medium) has been addressed: every dashboard
-action now re-verifies htop still owns the pane before sending keys; the capture
-adapter is poll-driven and self-verifying (no stale tasks); kill is gated to
-approver devices AND a pid in the pane's captured view; ViewMode is gated to the
-client's own in-session pane with a live view; and the PWA re-sends `view_mode`
-and closes the kill sheet on any pane switch. Branch is merge-ready.
+Tree renders but is cosmetically rough at phone width (kept as-is).
+
+**Two Codex security rounds addressed** (fix → re-verify → fix). Final posture:
+- Command-execution path closed: `filter` types attacker-controlled literal text,
+  and check-then-send to a foreground tool is fundamentally non-atomic (if htop
+  exits mid-sequence the text can reach the shell for the user's next Enter). So
+  `filter` and `kill` now require the host-granted `approve` capability — a device
+  already trusted to approve arbitrary command execution — plus per-phase htop
+  re-verification. Fixed keys (sort/invert/tree) carry no attacker content and
+  stay open to any in-session device.
+- Capture lifecycle: poll-driven (independent 2 s `pane_current_command` poll,
+  not the structural topology feed), each task re-verifies ownership per 1.5 s
+  tick and drops its view the instant htop exits, and a task whose claim is pruned
+  out from under it (`guard.update` → `None`) now exits so the poller re-claims
+  (previously it could wedge capture permanently).
+- Kill: `approve`-gated AND restricted to a pid the pane's view is showing.
+- ViewMode sizing: gated to the client's own in-session pane with a live view.
+- PWA re-sends `view_mode` and closes the kill sheet on any pane switch.
+
+Accepted residuals (documented, within the same-uid / trusted-approver model):
+capture verification has a ≤1.5 s tick (a lingering htop.v1 view can only drive
+harmless fixed keys — filter/kill are approve-gated); kill-by-pid has an inherent
+PID-reuse window; a daemon crash mid-dashboard can leave a window at `manual`
+sizing (self-inflicted, same-uid, cleared by re-entering the dashboard — an
+earlier startup-sweep fix was reverted because it clobbered a user's deliberate
+`window-size manual`). Branch is merge-ready.
 Next options: `docker stats` (native-JSON command adapter — Codex's robust pick),
 the generic popup primitive, or an agent-window source.
 

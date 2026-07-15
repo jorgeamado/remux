@@ -741,9 +741,28 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                     .await;
                                 }
                             }
+                            Some(act @ paneview::HtopAction::Filter(_)) => {
+                                // Filter types attacker-controlled LITERAL text into
+                                // the pane. send-keys -l stops tmux key interpretation
+                                // but not shell syntax, and check-then-send is not
+                                // atomic: if htop exits mid-sequence the text can land
+                                // at the shell for the user's next Enter. So restrict
+                                // it — like kill — to a device holding the host-granted
+                                // `approve` capability, which is already trusted to
+                                // approve arbitrary command execution. exec_htop_action
+                                // additionally re-verifies htop owns the pane per phase.
+                                if app.auth.can_approve(&device.id) {
+                                    let p = pane.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        paneview::exec_htop_action(&p, &act)
+                                    })
+                                    .await;
+                                }
+                            }
                             Some(act) => {
-                                // exec re-verifies htop owns the pane right before
-                                // sending keys (a stale view must not type at a shell).
+                                // sort/invert/tree: fixed single keys, no attacker-
+                                // controlled content. exec re-verifies htop owns the
+                                // pane right before sending (no junk at a shell).
                                 let p = pane.clone();
                                 let _ = tokio::task::spawn_blocking(move || {
                                     paneview::exec_htop_action(&p, &act)

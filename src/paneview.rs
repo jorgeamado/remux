@@ -317,15 +317,31 @@ pub fn exec_htop_action(pane: &str, action: &HtopAction) -> Result<()> {
 
 /// Set (or clear, if empty) htop's incremental filter: F4, clear any existing
 /// text, type the query, Enter.
+///
+/// The sequence spans several tmux calls, so an upfront ownership check is not
+/// enough: if htop exits *between* calls, the remaining keys land at the shell
+/// underneath. `send-keys -l` stops tmux key-name interpretation but does NOT
+/// neutralize shell syntax, so `filter:; rm -rf ~` typed at a prompt and then
+/// Enter would execute. We therefore re-verify htop still owns the pane before
+/// the two dangerous phases — typing the literal query, and (tightest, since it
+/// is Enter that turns typed text into a command) sending the confirming Enter.
+/// F4 and BSpace are inert at a shell, so they need no gate. The residual window
+/// is the microseconds between the final check and the Enter syscall.
 fn htop_set_filter(pane: &str, query: &str) -> Result<()> {
-    crate::tmux::send_named(pane, &["F4"])?;
+    let owns = || tmux::pane_command(pane).as_deref() == Some("htop");
+    tmux::send_named(pane, &["F4"])?;
     let clear = vec!["BSpace"; 48];
-    crate::tmux::send_named(pane, &clear)?;
+    tmux::send_named(pane, &clear)?;
     if !query.is_empty() {
-        crate::tmux::send_keys(pane, query)?;
+        if !owns() {
+            return Ok(()); // htop gone — never type the query at a shell
+        }
+        tmux::send_keys(pane, query)?;
     }
-    crate::tmux::send_named(pane, &["Enter"])?;
-    Ok(())
+    if !owns() {
+        return Ok(()); // htop gone — never send the Enter that would execute it
+    }
+    tmux::send_named(pane, &["Enter"])
 }
 
 /// SIGTERM a process (graceful). Best-effort.
@@ -450,7 +466,14 @@ async fn capture_task(app: Arc<App>, pane: String) {
             Ok(Ok(Some(t))) => t,
             _ => continue,
         };
-        guard.update(parse_htop(&text));
+        // `None` means our claim was pruned out from under us (e.g. a transient
+        // empty-topology GC pass at startup, or a `remux stream` re-claim). Exit
+        // so the task handle finishes and `spawn_capture` re-claims on its next
+        // poll — otherwise we'd loop forever updating an entry we no longer own,
+        // and the still-"running" handle would block any restart.
+        if guard.update(parse_htop(&text)).is_none() {
+            break;
+        }
     }
 }
 

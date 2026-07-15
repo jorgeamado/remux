@@ -984,8 +984,9 @@ button {
   white-space: nowrap;
 }
 
-/* Kill confirmation sheet — deliberate, never one tap. */
-.ht-sheet-bg {
+/* Generic popup primitive — a bottom sheet any pane view can raise. Options
+   stack vertically so a menu of 2+ choices reads cleanly on a phone. */
+.rx-popup-bg {
   position: fixed;
   inset: 0;
   z-index: 60;
@@ -993,32 +994,37 @@ button {
   display: flex;
   align-items: flex-end;
 }
-.ht-sheet {
+.rx-popup {
   width: 100%;
   background: var(--card);
   border-top: 1px solid var(--card-border);
   border-radius: 16px 16px 0 0;
   padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
 }
-.ht-sheet-cmd {
+.rx-popup-title {
   font-size: 14px;
   word-break: break-all;
 }
-.ht-sheet-meta {
+.rx-popup-detail {
   color: var(--muted);
   font-size: 12px;
   margin: 6px 0 16px;
 }
-.ht-sheet-btns {
+.rx-popup-btns {
   display: flex;
+  flex-direction: column;
   gap: 10px;
 }
-.ht-sheet-btns .btn {
-  flex: 1;
+.rx-popup-btn {
+  width: 100%;
   padding: 12px;
+  text-align: center;
 }
-.ht-kill {
+.rx-popup-btn.rx-danger {
   background: var(--danger);
   border-color: var(--danger);
   color: #fff;
+}
+.rx-popup-btn.rx-cancel {
+  color: var(--muted);
 }

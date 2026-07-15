@@ -267,8 +267,27 @@ pub enum HtopAction {
     Named(&'static str),
     /// Set/replace the incremental filter to this already-sanitized text.
     Filter(String),
-    /// SIGTERM a process — gated against the pane's visible set by the caller.
-    Kill(u32),
+    /// Signal a process — gated against the pane's visible set (and the caller's
+    /// `approve` capability) by the caller.
+    Kill { pid: u32, signal: KillSignal },
+}
+
+/// The only signals a client may request — a tiny whitelist, so a popup option
+/// can never smuggle an arbitrary `kill -N`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum KillSignal {
+    Term,
+    Kill,
+}
+
+impl KillSignal {
+    /// The `kill(1)` flag.
+    fn flag(self) -> &'static str {
+        match self {
+            KillSignal::Term => "-TERM",
+            KillSignal::Kill => "-KILL",
+        }
+    }
 }
 
 /// Parse a client action string for the `htop.v1` view. `None` for anything not
@@ -286,8 +305,19 @@ pub fn parse_htop_action(action: &str) -> Option<HtopAction> {
                 Some(HtopAction::Filter(
                     q.chars().filter(|c| !c.is_control()).take(64).collect(),
                 ))
-            } else if let Some(pid) = action.strip_prefix("kill:") {
-                pid.parse::<u32>().ok().map(HtopAction::Kill)
+            } else if let Some(rest) = action.strip_prefix("kill:") {
+                // `kill:<pid>` (defaults to TERM) or `kill:<pid>:TERM|KILL`. The
+                // signal is a closed whitelist; any other suffix is rejected.
+                let (pid_s, signal) = match rest.split_once(':') {
+                    None => (rest, Some(KillSignal::Term)),
+                    Some((p, "TERM")) => (p, Some(KillSignal::Term)),
+                    Some((p, "KILL")) => (p, Some(KillSignal::Kill)),
+                    Some((p, _)) => (p, None),
+                };
+                match (pid_s.parse::<u32>(), signal) {
+                    (Ok(pid), Some(signal)) => Some(HtopAction::Kill { pid, signal }),
+                    _ => None,
+                }
             } else {
                 None
             }
@@ -311,7 +341,7 @@ pub fn exec_htop_action(pane: &str, action: &HtopAction) -> Result<()> {
         HtopAction::Key(k) => tmux::send_keys(pane, k),
         HtopAction::Named(k) => tmux::send_named(pane, &[k]),
         HtopAction::Filter(q) => htop_set_filter(pane, q),
-        HtopAction::Kill(_) => Ok(()),
+        HtopAction::Kill { .. } => Ok(()),
     }
 }
 
@@ -344,10 +374,11 @@ fn htop_set_filter(pane: &str, query: &str) -> Result<()> {
     tmux::send_named(pane, &["Enter"])
 }
 
-/// SIGTERM a process (graceful). Best-effort.
-pub fn kill_process(pid: u32) {
+/// Signal a process with one of the whitelisted signals. Best-effort. `kill`
+/// takes the pid via argv (no shell), so there is no injection surface.
+pub fn kill_process(pid: u32, signal: KillSignal) {
     let _ = std::process::Command::new("kill")
-        .arg("-TERM")
+        .arg(signal.flag())
         .arg(pid.to_string())
         .status();
 }
@@ -1083,15 +1114,38 @@ F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortBy";
             parse_htop_action("filter:remux"),
             Some(Filter("remux".into()))
         );
-        assert_eq!(parse_htop_action("kill:4702"), Some(Kill(4702)));
+        // kill defaults to TERM; the signal is an explicit whitelist.
+        assert_eq!(
+            parse_htop_action("kill:4702"),
+            Some(Kill {
+                pid: 4702,
+                signal: KillSignal::Term
+            })
+        );
+        assert_eq!(
+            parse_htop_action("kill:4702:TERM"),
+            Some(Kill {
+                pid: 4702,
+                signal: KillSignal::Term
+            })
+        );
+        assert_eq!(
+            parse_htop_action("kill:4702:KILL"),
+            Some(Kill {
+                pid: 4702,
+                signal: KillSignal::Kill
+            })
+        );
         // A filter strips control chars (no smuggling Enter/keys into htop).
         assert_eq!(
             parse_htop_action("filter:a\nb\tc"),
             Some(Filter("abc".into()))
         );
-        // Rejected: unknown, non-numeric kill, raw keystrokes.
+        // Rejected: unknown, non-numeric kill, non-whitelisted signal, raw keys.
         assert_eq!(parse_htop_action("sort:bogus"), None);
         assert_eq!(parse_htop_action("kill:; rm -rf"), None);
+        assert_eq!(parse_htop_action("kill:4702:HUP"), None);
+        assert_eq!(parse_htop_action("kill:4702:9"), None);
         assert_eq!(parse_htop_action("q"), None);
         assert_eq!(parse_htop_action("rm -rf /"), None);
     }

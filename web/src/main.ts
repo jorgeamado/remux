@@ -893,8 +893,8 @@ function refreshPaneView(): void {
   } else if (dashboardMode) {
     if (v && v.pane !== dashPane) {
       // The active pane changed while in the dashboard — move the capture-size
-      // hold to the new window, and drop a now-stale kill sheet.
-      closeKillSheet();
+      // hold to the new window, and drop any now-stale popup.
+      closePopup();
       dashPane = v.pane;
       sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
     }
@@ -911,7 +911,7 @@ function onPaneViews(views: PaneView[]): void {
 function clearPaneViews(): void {
   paneViews = [];
   viewToggleBtn.hidden = true;
-  closeKillSheet();
+  closePopup();
   if (dashboardMode) setDashboard(false);
 }
 
@@ -932,7 +932,7 @@ function setDashboard(on: boolean): void {
     sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
     renderDashboard();
   } else {
-    closeKillSheet();
+    closePopup();
     dashPane = null;
     sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
     handle.fit(); // terminal is visible again — remeasure the grid
@@ -1203,53 +1203,90 @@ function htRow(p: Record<string, unknown>, pane: string): HTMLElement {
   return row;
 }
 
-// The open kill confirmation sheet, so it can be dropped when the dashboard is
-// left or the pane changes (its pid/pane closure would otherwise go stale).
-let killSheet: HTMLElement | null = null;
-function closeKillSheet(): void {
-  killSheet?.remove();
-  killSheet = null;
+// ── Generic popup primitive ────────────────────────────────────────────────
+// A pane-view renderer (or, later, a plugin) declares a title + options; each
+// option maps to an ALREADY-WHITELISTED pane action string. The popup is pure
+// presentation over the action whitelist: it never sends raw input, and the
+// daemon re-validates every action on receipt. One popup at a time; it is
+// dropped when the dashboard is left or the pane changes (its action/pane
+// closure would otherwise go stale).
+
+interface PopupOption {
+  label: string;
+  /** A whitelisted pane-action string, or null for a pure dismiss (Cancel). */
+  action: string | null;
+  style?: "default" | "danger" | "cancel";
+}
+interface PopupSpec {
+  /** The pane whose view the chosen action targets. */
+  pane: string;
+  title: string;
+  detail?: string;
+  options: PopupOption[];
 }
 
-/** Deliberate, confirmed kill — never a one-tap action. */
+let popupEl: HTMLElement | null = null;
+function closePopup(): void {
+  popupEl?.remove();
+  popupEl = null;
+}
+
+function openPopup(spec: PopupSpec): void {
+  closePopup(); // only one at a time
+  const bg = document.createElement("div");
+  bg.className = "rx-popup-bg";
+  const sheet = document.createElement("div");
+  sheet.className = "rx-popup";
+  const title = document.createElement("div");
+  title.className = "rx-popup-title";
+  title.textContent = spec.title;
+  sheet.appendChild(title);
+  if (spec.detail) {
+    const detail = document.createElement("div");
+    detail.className = "rx-popup-detail";
+    detail.textContent = spec.detail;
+    sheet.appendChild(detail);
+  }
+  const btns = document.createElement("div");
+  btns.className = "rx-popup-btns";
+  for (const opt of spec.options) {
+    const b = document.createElement("button");
+    b.className = "btn rx-popup-btn";
+    if (opt.style === "danger") b.classList.add("rx-danger");
+    else if (opt.style === "cancel") b.classList.add("rx-cancel");
+    b.textContent = opt.label;
+    b.addEventListener("click", () => {
+      if (opt.action) htAction(spec.pane, opt.action);
+      closePopup();
+    });
+    btns.appendChild(b);
+  }
+  sheet.appendChild(btns);
+  bg.addEventListener("click", (e) => {
+    if (e.target === bg) closePopup();
+  });
+  bg.appendChild(sheet);
+  popupEl = bg;
+  $("app").appendChild(bg);
+}
+
+/** Deliberate, confirmed process signal — never a one-tap action. Built on the
+ * generic popup: SIGTERM (graceful) / SIGKILL (force) / Cancel. */
 function openKillSheet(p: Record<string, unknown>, pane: string): void {
   const pid = Number(p.pid ?? 0);
   if (!pid) return;
-  closeKillSheet(); // only one at a time
-  const bg = document.createElement("div");
-  bg.className = "ht-sheet-bg";
-  const sheet = document.createElement("div");
-  sheet.className = "ht-sheet";
-  const cmd = document.createElement("div");
-  cmd.className = "ht-sheet-cmd";
-  cmd.textContent = String(p.command || `pid ${pid}`);
-  const meta = document.createElement("div");
-  meta.className = "ht-sheet-meta";
-  meta.textContent = `pid ${pid} · ${String(p.user ?? "")} · cpu ${Number(p.cpu ?? 0).toFixed(
-    1
-  )}% · mem ${Number(p.mem ?? 0).toFixed(1)}%`;
-  const btns = document.createElement("div");
-  btns.className = "ht-sheet-btns";
-  const cancel = document.createElement("button");
-  cancel.className = "btn";
-  cancel.textContent = "Cancel";
-  const kill = document.createElement("button");
-  kill.className = "btn ht-kill";
-  kill.textContent = `Kill ${pid}`;
-  const close = (): void => closeKillSheet();
-  cancel.addEventListener("click", close);
-  bg.addEventListener("click", (e) => {
-    if (e.target === bg) close();
+  openPopup({
+    pane,
+    title: String(p.command || `pid ${pid}`),
+    detail: `pid ${pid} · ${String(p.user ?? "")} · cpu ${Number(p.cpu ?? 0).toFixed(
+      1
+    )}% · mem ${Number(p.mem ?? 0).toFixed(1)}%`,
+    options: [
+      { label: `SIGTERM ${pid} (graceful)`, action: `kill:${pid}:TERM`, style: "default" },
+      { label: `SIGKILL ${pid} (force)`, action: `kill:${pid}:KILL`, style: "danger" },
+      { label: "Cancel", action: null, style: "cancel" },
+    ],
   });
-  kill.addEventListener("click", () => {
-    htAction(pane, `kill:${pid}`);
-    close();
-  });
-  btns.append(cancel, kill);
-  sheet.append(cmd, meta, btns);
-  bg.appendChild(sheet);
-  killSheet = bg;
-  $("app").appendChild(bg);
 }
 
 // --- taskscope.v1 renderer (hard-coded; one built-in view) ---

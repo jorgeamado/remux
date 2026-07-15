@@ -728,7 +728,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     let is_htop = app.pane_views.view_of(&pane).as_deref() == Some("htop.v1");
                     if in_session && is_htop {
                         match paneview::parse_htop_action(&action) {
-                            Some(paneview::HtopAction::Kill(pid)) => {
+                            Some(paneview::HtopAction::Kill { pid, signal }) => {
                                 // Killing is destructive → require the host-granted
                                 // `approve` capability (not just any paired device),
                                 // and only a pid the dashboard is actually showing.
@@ -736,7 +736,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                     && app.pane_views.pane_has_pid(&pane, pid)
                                 {
                                     let _ = tokio::task::spawn_blocking(move || {
-                                        paneview::kill_process(pid)
+                                        paneview::kill_process(pid, signal)
                                     })
                                     .await;
                                 }

@@ -76,8 +76,20 @@ PID-reuse window; a daemon crash mid-dashboard can leave a window at `manual`
 sizing (self-inflicted, same-uid, cleared by re-entering the dashboard — an
 earlier startup-sweep fix was reverted because it clobbered a user's deliberate
 `window-size manual`). Branch is merge-ready.
-Next options: `docker stats` (native-JSON command adapter — Codex's robust pick),
-the generic popup primitive, or an agent-window source.
+**Generic popup primitive (slice 1 done).** A pane-view renderer (and, later, a
+plugin) declares a title + options; each option maps to an *already-whitelisted*
+pane action. The popup is pure presentation over the action whitelist — it never
+sends raw input, and the daemon re-validates every action on receipt, so the
+security model is untouched. Core PWA component `openPopup(spec)`/`closePopup()`
+(bottom sheet, `default`/`danger`/`cancel` styles, backdrop-dismiss, lifecycle
+tied to pane switch / dashboard exit / view clear). First consumer: the htop
+process-signal sheet, refactored onto it and now offering **SIGTERM / SIGKILL**
+(action whitelist extended to `kill:<pid>:TERM|KILL`, signal a closed whitelist,
+still `approve`-gated + `pane_has_pid`).
+Slice 2 (unlocks plugins): a declarative `popup` field in the view schema so a
+*source* can request a popup server-side, not just the compiled-in renderer.
+Other next options: `docker stats` (native-JSON command adapter — Codex's robust
+pick), or an agent-window source.
 
 Repo: `github.com/jorgeamado/remux` (public); `main` builds green on CI. The M3
 control-mode arc and the whole M4 semantic layer (M4a attention → M4b approvals

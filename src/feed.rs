@@ -1,0 +1,719 @@
+//! M4c command feed: a bounded, in-memory, per-session history of shell
+//! commands, fed by out-of-band zsh hooks (`command_started` on preexec,
+//! `command_finished` on precmd). **Informational only** — like all shell-hook
+//! events, any same-uid process can forge these, so they may never trigger an
+//! action; at worst they pollute this feed. No command output is ever stored
+//! (that would be the gated M4d); only metadata.
+//!
+//! Correlation and ordering: the shell mints a `shell_id` (once per interactive
+//! shell) and a per-shell monotonic `command_id`; both ride start and finish.
+//! The two events are delivered by *separate* fire-and-forget datagrams, so
+//! they can arrive **out of order** — the store is built to tolerate that
+//! (Codex review): a finish arriving before its start is held as `pending`; a
+//! delayed lower-id start cannot supersede a newer command (per-shell
+//! high-water mark). Pairing is by `(shell_id, command_id)`, never "newest on
+//! the pane".
+//!
+//! Lifecycle wakes: a reconcile-on-hint model never wakes for a shell that died
+//! mid-command or for age-based eviction — so a timer [`Feed::sweep`] marks
+//! stale-running entries aborted, evicts by age/count, and fires the hint.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+
+/// Max stored entries per session (enforced in the store, not just the view).
+pub const SESSION_MAX: usize = 200;
+/// Global entry cap across all sessions — abandoned sessions must not leak.
+const GLOBAL_MAX: usize = 5000;
+/// Max buffered finishes that arrived before their start.
+const PENDING_MAX: usize = 512;
+/// Drop an unmatched pending finish after this long (one sweep interval). Per
+/// entry, not wholesale — a finish that arrived just before a sweep must still
+/// get its full reorder window, not be cleared moments after landing.
+const PENDING_TTL: Duration = Duration::from_secs(300);
+/// Evict completed entries older than this.
+const AGE: Duration = Duration::from_secs(12 * 3600);
+/// A still-"running" entry older than this is marked aborted.
+const STALE_RUNNING: Duration = Duration::from_secs(6 * 3600);
+/// Forget a shell's high-water mark after this long without a new command. It
+/// only guards against a *delayed lower-id start* (a reorder window of
+/// milliseconds), so aging it out with the entries it protects is safe — and it
+/// stops a churn of short-lived shells from leaking the map forever.
+const SHELL_TTL: Duration = AGE;
+/// Backstop cap on tracked shells, in case a burst mints many within one TTL
+/// window: drop the least-recently-seen down to this.
+const SHELL_MAX_ENTRIES: usize = 4096;
+const MAX_COMMAND_BYTES: usize = 512;
+const MAX_CWD_BYTES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    Running,
+    Done {
+        exit: i32,
+        elapsed_ms: u64,
+    },
+    /// Superseded by a newer command on the same shell, or swept as stale.
+    Aborted,
+}
+
+#[derive(Clone, Debug)]
+struct Cmd {
+    id: u64, // daemon-minted, monotonic — the client keys/dedupes on this
+    shell_id: String,
+    command_id: u64,
+    session: String,
+    pane: String,
+    command: String,
+    cwd: String,
+    started: Instant,
+    started_unix: u64,
+    state: State,
+}
+
+impl Cmd {
+    fn view(&self, now: Instant) -> serde_json::Value {
+        let (state, exit, elapsed_ms) = match &self.state {
+            State::Running => ("running", serde_json::Value::Null, serde_json::Value::Null),
+            State::Done { exit, elapsed_ms } => ("done", (*exit).into(), (*elapsed_ms).into()),
+            State::Aborted => ("aborted", serde_json::Value::Null, serde_json::Value::Null),
+        };
+        serde_json::json!({
+            "id": self.id,
+            "session": self.session,
+            "pane": self.pane,
+            "command": self.command,
+            "cwd": self.cwd,
+            "state": state,
+            "exit": exit,
+            "elapsed_ms": elapsed_ms,
+            "started_unix": self.started_unix,
+            "age_ms": now.saturating_duration_since(self.started).as_millis() as u64,
+        })
+    }
+}
+
+/// A matched finish — the input to M4c's precise attention (increment 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finished {
+    pub session: String,
+    pub exit: i32,
+    pub elapsed_ms: u64,
+}
+
+struct Inner {
+    cmds: Vec<Cmd>, // insertion order == chronological (by daemon id)
+    next_id: u64,
+    /// (shell_id, command_id) -> index into `cmds`.
+    by_key: HashMap<(String, u64), usize>,
+    /// shell_id -> (highest command_id seen, last-seen instant). Survives
+    /// eviction of the entry, but is itself GC'd by [`Feed::sweep`] once the
+    /// shell has been idle past `SHELL_TTL` (else it would leak per shell_id).
+    shell_max: HashMap<String, (u64, Instant)>,
+    /// Finishes that arrived before their start:
+    /// (shell_id, command_id) -> (exit, received-at). The instant ages the entry
+    /// out per-TTL; the first finish for a key wins (idempotent).
+    pending: HashMap<(String, u64), (i32, Instant)>,
+}
+
+impl Inner {
+    /// Rebuild `by_key` after any structural change (eviction). O(n), only on
+    /// the rare eviction path — the common insert path updates it in place.
+    fn reindex(&mut self) {
+        self.by_key.clear();
+        for (i, c) in self.cmds.iter().enumerate() {
+            self.by_key.insert((c.shell_id.clone(), c.command_id), i);
+        }
+    }
+}
+
+pub struct Feed {
+    inner: Mutex<Inner>,
+    events: broadcast::Sender<()>,
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                cmds: Vec::new(),
+                next_id: 1,
+                by_key: HashMap::new(),
+                shell_max: HashMap::new(),
+                pending: HashMap::new(),
+            }),
+            events: broadcast::channel(16).0,
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Strip control chars, then truncate to a byte budget at a char boundary.
+fn cap_bytes(s: &str, max_bytes: usize) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    if clean.len() <= max_bytes {
+        return clean;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    clean[..end].to_string()
+}
+
+impl Feed {
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.events.subscribe()
+    }
+
+    /// Record a command start. Order-tolerant and idempotent:
+    /// - duplicate `(shell_id, command_id)` → no-op;
+    /// - a buffered pending finish for this key → the entry lands already Done,
+    ///   and the finish is **returned** so the caller can run the same
+    ///   reset/notification logic it would for an in-order finish (the finish
+    ///   raced ahead of its start);
+    /// - a start whose id is below the shell's high-water mark (a delayed start
+    ///   for an earlier command) is recorded Aborted, and never supersedes the
+    ///   newer command;
+    /// - the newest start aborts any still-running predecessor on the shell.
+    pub fn start(
+        &self,
+        session: &str,
+        pane: &str,
+        shell_id: &str,
+        command_id: u64,
+        command: &str,
+        cwd: &str,
+    ) -> Option<Finished> {
+        let applied = {
+            let inner = &mut *self.inner.lock().unwrap();
+            let key = (shell_id.to_string(), command_id);
+            if inner.by_key.contains_key(&key) {
+                return None; // duplicate start
+            }
+            let prev_max = inner.shell_max.get(shell_id).map(|(m, _)| *m);
+            // command_id is monotonic per shell. Past the by_key duplicate check
+            // above, a start whose id EQUALS the high-water is a replay of the
+            // (now-evicted) high-water command — drop it so it can't resurrect as
+            // a fresh Running entry (Codex). A genuinely new command is strictly
+            // greater; a lower id is a delayed older start (recorded Aborted).
+            if prev_max == Some(command_id) {
+                return None;
+            }
+            let is_latest = prev_max.is_none_or(|m| command_id > m);
+
+            // Newest start ends any still-running predecessor on this shell.
+            if is_latest {
+                for c in inner.cmds.iter_mut() {
+                    if c.shell_id == shell_id
+                        && c.state == State::Running
+                        && c.command_id < command_id
+                    {
+                        c.state = State::Aborted;
+                    }
+                }
+            }
+
+            // A finish that beat its start (elapsed unknown → 0).
+            let raced_finish = inner.pending.remove(&key).map(|(exit, _)| exit);
+            let state = match raced_finish {
+                Some(exit) => State::Done {
+                    exit,
+                    elapsed_ms: 0,
+                },
+                None if is_latest => State::Running,
+                None => State::Aborted, // a newer command already started
+            };
+
+            let id = inner.next_id;
+            inner.next_id += 1;
+            let now = Instant::now();
+            inner.cmds.push(Cmd {
+                id,
+                shell_id: shell_id.to_string(),
+                command_id,
+                session: session.to_string(),
+                pane: pane.to_string(),
+                command: cap_bytes(command, MAX_COMMAND_BYTES),
+                cwd: cap_bytes(cwd, MAX_CWD_BYTES),
+                started: now,
+                started_unix: now_unix(),
+                state,
+            });
+            let idx = inner.cmds.len() - 1;
+            inner.by_key.insert(key, idx);
+            inner
+                .shell_max
+                .entry(shell_id.to_string())
+                .and_modify(|(m, seen)| {
+                    *m = (*m).max(command_id);
+                    *seen = now;
+                })
+                .or_insert((command_id, now));
+
+            if self.enforce_bounds(inner, session) {
+                inner.reindex();
+            }
+            raced_finish.map(|exit| Finished {
+                session: session.to_string(),
+                exit,
+                elapsed_ms: 0,
+            })
+        };
+        let _ = self.events.send(());
+        applied
+    }
+
+    /// Record a command finish, paired by `(shell_id, command_id)`. A finish
+    /// with no matching start yet is buffered (bounded) and applied when the
+    /// start arrives. Returns the finished command's session/exit/elapsed when a
+    /// *running* start matched; `None` otherwise (duplicate, buffered, or a
+    /// finish for an already-aborted/superseded entry). Fires the hint on a real
+    /// transition.
+    pub fn finish(&self, shell_id: &str, command_id: u64, exit: i32) -> Option<Finished> {
+        let result = {
+            let inner = &mut *self.inner.lock().unwrap();
+            let key = (shell_id.to_string(), command_id);
+            match inner.by_key.get(&key).copied() {
+                Some(idx) => {
+                    let now = Instant::now();
+                    let cmd = &mut inner.cmds[idx];
+                    if cmd.state != State::Running {
+                        return None; // duplicate finish, or superseded entry
+                    }
+                    let elapsed_ms = now.saturating_duration_since(cmd.started).as_millis() as u64;
+                    cmd.state = State::Done { exit, elapsed_ms };
+                    Some(Finished {
+                        session: cmd.session.clone(),
+                        exit,
+                        elapsed_ms,
+                    })
+                }
+                None => {
+                    // Finish beat its start — buffer it (bounded) for the start.
+                    // First finish for a key wins (idempotent); a duplicate/forged
+                    // second finish must not overwrite the recorded exit (Codex).
+                    if !inner.pending.contains_key(&key) && inner.pending.len() < PENDING_MAX {
+                        inner.pending.insert(key, (exit, Instant::now()));
+                    }
+                    None
+                }
+            }
+        };
+        if result.is_some() {
+            let _ = self.events.send(());
+        }
+        result
+    }
+
+    /// The session's recent commands, newest last, capped to `SESSION_MAX`.
+    pub fn snapshot(&self, session: &str) -> Vec<serde_json::Value> {
+        let inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        inner
+            .cmds
+            .iter()
+            .filter(|c| c.session == session)
+            .map(|c| c.view(now))
+            .collect()
+    }
+
+    /// Recent command *strings* for this session, newest first, deduped — the
+    /// source for the composer's ↑ recall (increment 4). Memory-only; the
+    /// caller must never persist these.
+    pub fn recent_commands(&self, session: &str, max: usize) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<String> = Vec::new();
+        for c in inner.cmds.iter().rev() {
+            if c.session != session || c.command.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|s| s == &c.command) {
+                out.push(c.command.clone());
+                if out.len() >= max {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Timer maintenance: mark stale-running entries aborted, evict aged ones,
+    /// drop stale pending finishes. Fires the hint if anything changed.
+    pub fn sweep(&self) {
+        let changed = {
+            let inner = &mut *self.inner.lock().unwrap();
+            let now = Instant::now();
+            let before = inner.cmds.len();
+            let mut mutated = false;
+            for c in inner.cmds.iter_mut() {
+                if c.state == State::Running
+                    && now.saturating_duration_since(c.started) > STALE_RUNNING
+                {
+                    c.state = State::Aborted;
+                    mutated = true;
+                }
+            }
+            inner.cmds.retain(|c| {
+                c.state == State::Running || now.saturating_duration_since(c.started) <= AGE
+            });
+            if inner.cmds.len() != before {
+                mutated = true;
+            }
+            // A pending finish that never got a start is a leak — abandon it
+            // once it's older than PENDING_TTL. Per-entry (not a wholesale clear)
+            // so a finish that landed just before this sweep keeps its full
+            // reorder window instead of being dropped immediately (Codex).
+            let before_pending = inner.pending.len();
+            inner
+                .pending
+                .retain(|_, (_, recv)| now.saturating_duration_since(*recv) <= PENDING_TTL);
+            if inner.pending.len() != before_pending {
+                mutated = true;
+            }
+            // GC per-shell high-water marks for shells idle past the TTL, then
+            // hard-cap by least-recently-seen. Purely internal bookkeeping — it
+            // touches neither `cmds` nor `by_key`, so it needs no reindex and no
+            // client hint (it changes nothing the UI can see).
+            inner
+                .shell_max
+                .retain(|_, (_, seen)| now.saturating_duration_since(*seen) <= SHELL_TTL);
+            if inner.shell_max.len() > SHELL_MAX_ENTRIES {
+                let drop_n = inner.shell_max.len() - SHELL_MAX_ENTRIES;
+                // Only cap-prune ORPHANED marks — ones no retained command still
+                // references. Pruning a live shell's mark could let a delayed
+                // lower-id start look "latest" and abort its running command
+                // (Codex). If orphans are too few to reach the cap, we leave the
+                // rest: live marks are already bounded by GLOBAL_MAX commands.
+                let orphans: Vec<String> = {
+                    let live: std::collections::HashSet<&str> =
+                        inner.cmds.iter().map(|c| c.shell_id.as_str()).collect();
+                    let mut o: Vec<(&String, Instant)> = inner
+                        .shell_max
+                        .iter()
+                        .filter(|(k, _)| !live.contains(k.as_str()))
+                        .map(|(k, (_, seen))| (k, *seen))
+                        .collect();
+                    o.sort_by_key(|(_, seen)| *seen);
+                    o.into_iter().take(drop_n).map(|(k, _)| k.clone()).collect()
+                };
+                for k in orphans {
+                    inner.shell_max.remove(&k);
+                }
+            }
+            if mutated {
+                inner.reindex();
+            }
+            mutated
+        };
+        if changed {
+            let _ = self.events.send(());
+        }
+    }
+
+    /// Enforce per-session then global caps. Evicts the oldest *completed* entry
+    /// first (a running entry is an active command). Returns whether it removed
+    /// anything (caller reindexes). Runs under the lock.
+    fn enforce_bounds(&self, inner: &mut Inner, session: &str) -> bool {
+        let mut removed = false;
+        // Per-session cap.
+        loop {
+            let count = inner.cmds.iter().filter(|c| c.session == session).count();
+            if count <= SESSION_MAX {
+                break;
+            }
+            let pos = inner
+                .cmds
+                .iter()
+                .position(|c| c.session == session && c.state != State::Running)
+                .or_else(|| inner.cmds.iter().position(|c| c.session == session));
+            match pos {
+                Some(p) => {
+                    inner.cmds.remove(p);
+                    removed = true;
+                }
+                None => break,
+            }
+        }
+        // Global cap.
+        while inner.cmds.len() > GLOBAL_MAX {
+            let pos = inner
+                .cmds
+                .iter()
+                .position(|c| c.state != State::Running)
+                .unwrap_or(0);
+            inner.cmds.remove(pos);
+            removed = true;
+        }
+        removed
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().cmds.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().cmds.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn shell_count(&self) -> usize {
+        self.inner.lock().unwrap().shell_max.len()
+    }
+
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap().pending.len()
+    }
+
+    /// Test-only: age every buffered finish past PENDING_TTL so a sweep drops it.
+    #[cfg(test)]
+    pub fn age_pending(&self) {
+        let old = Instant::now() - (PENDING_TTL + Duration::from_secs(1));
+        for (_, recv) in self.inner.lock().unwrap().pending.values_mut() {
+            *recv = old;
+        }
+    }
+
+    /// Test-only: evict all command entries (as AGE-eviction would) while
+    /// keeping the shell high-water marks — the exact state in which a replayed
+    /// command_id could resurrect an entry.
+    #[cfg(test)]
+    pub fn drop_all_commands(&self) {
+        let inner = &mut *self.inner.lock().unwrap();
+        inner.cmds.clear();
+        inner.by_key.clear();
+    }
+
+    /// Test-only: force every shell's high-water mark to look ancient so a
+    /// following `sweep()` GCs it — exercises the TTL path without a 12h wait.
+    #[cfg(test)]
+    pub fn age_shell_marks(&self) {
+        let old = Instant::now() - (SHELL_TTL + Duration::from_secs(1));
+        for (_, seen) in self.inner.lock().unwrap().shell_max.values_mut() {
+            *seen = old;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_of(v: &serde_json::Value) -> &str {
+        v["state"].as_str().unwrap()
+    }
+
+    #[test]
+    fn start_then_finish_pairs_by_correlation() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 1, "cargo build", "/w");
+        let fin = f.finish("sh1", 1, 101).unwrap();
+        assert_eq!(fin.exit, 101);
+        let snap = f.snapshot("s");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0]["command"], "cargo build");
+        assert_eq!(state_of(&snap[0]), "done");
+        assert_eq!(snap[0]["exit"], 101);
+    }
+
+    #[test]
+    fn finish_before_start_is_buffered_then_applied() {
+        let f = Feed::default();
+        // The two datagrams raced; finish landed first.
+        assert!(f.finish("sh1", 1, 0).is_none());
+        assert!(f.is_empty());
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        let snap = f.snapshot("s");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(state_of(&snap[0]), "done"); // pending finish applied
+        assert_eq!(snap[0]["exit"], 0);
+    }
+
+    #[test]
+    fn delayed_lower_start_does_not_supersede_newer() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 2, "newer", "/w"); // #2 first
+        f.start("s", "%1", "sh1", 1, "delayed-older", "/w"); // #1 arrives late
+        let snap = f.snapshot("s");
+        // #2 must stay running; the late #1 is aborted, not the other way round.
+        let newer = snap.iter().find(|c| c["command"] == "newer").unwrap();
+        let older = snap
+            .iter()
+            .find(|c| c["command"] == "delayed-older")
+            .unwrap();
+        assert_eq!(state_of(newer), "running");
+        assert_eq!(state_of(older), "aborted");
+    }
+
+    #[test]
+    fn duplicate_start_and_finish_are_noops() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        f.start("s", "%1", "sh1", 1, "ls-again", "/w");
+        assert_eq!(f.len(), 1);
+        assert!(f.finish("sh1", 1, 0).is_some());
+        assert!(f.finish("sh1", 1, 0).is_none());
+    }
+
+    #[test]
+    fn new_start_supersedes_unfinished_on_same_shell() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 1, "sleep 100", "/w");
+        f.start("s", "%1", "sh1", 2, "ls", "/w");
+        let snap = f.snapshot("s");
+        assert_eq!(state_of(&snap[0]), "aborted");
+        assert_eq!(state_of(&snap[1]), "running");
+        assert!(f.finish("sh1", 1, 0).is_none());
+    }
+
+    #[test]
+    fn nested_shells_are_independent() {
+        let f = Feed::default();
+        f.start("s", "%1", "outer", 1, "bash", "/w");
+        f.start("s", "%1", "inner", 1, "ls", "/w");
+        let snap = f.snapshot("s");
+        assert_eq!(snap.iter().filter(|c| state_of(c) == "running").count(), 2);
+    }
+
+    #[test]
+    fn recent_commands_dedupes_newest_first_and_respects_zero() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        f.finish("sh1", 1, 0);
+        f.start("s", "%1", "sh1", 2, "cargo test", "/w");
+        f.finish("sh1", 2, 0);
+        f.start("s", "%1", "sh1", 3, "ls", "/w");
+        assert_eq!(
+            f.recent_commands("s", 10),
+            vec!["ls".to_string(), "cargo test".to_string()]
+        );
+        assert!(f.recent_commands("s", 0).is_empty());
+    }
+
+    #[test]
+    fn per_session_storage_is_bounded() {
+        let f = Feed::default();
+        for i in 0..(SESSION_MAX + 50) as u64 {
+            f.start("s", "%1", "sh1", i, &format!("cmd{i}"), "/w");
+            f.finish("sh1", i, 0);
+        }
+        // Stored (not just the view) is capped at SESSION_MAX.
+        assert!(f.len() <= SESSION_MAX);
+        assert_eq!(f.snapshot("s").len(), f.len());
+    }
+
+    #[test]
+    fn first_finish_before_start_wins_over_a_duplicate() {
+        let f = Feed::default();
+        // Two finishes race in before the start; the first exit must stick.
+        assert!(f.finish("sh1", 1, 2).is_none());
+        assert!(f.finish("sh1", 1, 9).is_none()); // duplicate/forged — ignored
+        f.start("s", "%1", "sh1", 1, "make", "/w");
+        let snap = f.snapshot("s");
+        assert_eq!(state_of(&snap[0]), "done");
+        assert_eq!(snap[0]["exit"], 2, "first finish's exit wins, not the last");
+    }
+
+    #[test]
+    fn pending_finish_survives_a_sweep_within_ttl_then_expires() {
+        let f = Feed::default();
+        f.finish("sh1", 1, 0); // finish beat its start
+        assert_eq!(f.pending_count(), 1);
+        f.sweep(); // fresh → retained (the old wholesale-clear would drop it)
+        assert_eq!(f.pending_count(), 1);
+        // The start still lands the finish, marked done.
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        assert_eq!(state_of(&f.snapshot("s")[0]), "done");
+        // But an unmatched finish aged past the TTL is abandoned.
+        f.finish("sh2", 1, 0);
+        assert_eq!(f.pending_count(), 1);
+        f.age_pending();
+        f.sweep();
+        assert_eq!(f.pending_count(), 0);
+    }
+
+    #[test]
+    fn replayed_high_water_start_does_not_resurrect_after_eviction() {
+        let f = Feed::default();
+        f.start("s", "%1", "sh1", 5, "deploy", "/w");
+        f.finish("sh1", 5, 0);
+        assert_eq!(f.len(), 1);
+        f.drop_all_commands(); // as AGE eviction would (shell_max survives)
+                               // A forged/replayed start with the same (high-water) id must be dropped,
+                               // not re-added as a fresh Running entry.
+        assert!(f.start("s", "%1", "sh1", 5, "deploy", "/w").is_none());
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn sweep_gcs_idle_shell_high_water_marks() {
+        let f = Feed::default();
+        // Many short-lived shells, each one command — the classic churn leak.
+        for s in 0..50u64 {
+            let sh = format!("sh{s}");
+            f.start("s", "%1", &sh, 1, "ls", "/w");
+            f.finish(&sh, 1, 0);
+        }
+        assert_eq!(f.shell_count(), 50);
+        // A sweep now keeps them (freshly seen)...
+        f.sweep();
+        assert_eq!(f.shell_count(), 50);
+        // ...but once idle past SHELL_TTL, a sweep forgets them.
+        f.age_shell_marks();
+        f.sweep();
+        assert_eq!(f.shell_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_is_session_scoped() {
+        let f = Feed::default();
+        f.start("a", "%1", "sh1", 1, "in-a", "/w");
+        f.start("b", "%2", "sh2", 1, "in-b", "/w");
+        assert_eq!(f.snapshot("a").len(), 1);
+        assert_eq!(f.snapshot("a")[0]["command"], "in-a");
+        assert_eq!(f.snapshot("b").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_and_finish_fire_hints() {
+        let f = Feed::default();
+        let mut rx = f.subscribe();
+        f.start("s", "%1", "sh1", 1, "ls", "/w");
+        assert!(rx.try_recv().is_ok());
+        f.finish("sh1", 1, 0);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn command_and_cwd_are_byte_capped_and_sanitized() {
+        let f = Feed::default();
+        let long = "x".repeat(1000);
+        f.start(
+            "s",
+            "%1",
+            "sh1",
+            1,
+            &format!("a\x1b[31m{long}"),
+            &"y".repeat(1000),
+        );
+        let snap = f.snapshot("s");
+        let cmd = snap[0]["command"].as_str().unwrap();
+        assert!(!cmd.contains('\x1b'));
+        assert!(cmd.len() <= MAX_COMMAND_BYTES);
+        assert!(snap[0]["cwd"].as_str().unwrap().len() <= MAX_CWD_BYTES);
+    }
+}

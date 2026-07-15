@@ -33,7 +33,7 @@ assets = [
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 bytes = "1"
 p256 = { version = "0.14", features = ["ecdsa"] }

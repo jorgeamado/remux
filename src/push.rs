@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,7 +66,7 @@ impl Push {
                 SigningKey::from_slice(&raw).context("bad VAPID key")?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = SigningKey::random(&mut rand_core());
+                let key = SigningKey::generate();
                 let encoded = URL_SAFE_NO_PAD.encode(key.to_bytes());
                 let tmp = key_path.with_extension("tmp");
                 std::fs::write(&tmp, serde_json::json!({ "private": encoded }).to_string())?;
@@ -81,7 +82,7 @@ impl Push {
         };
         let public_key_b64 = URL_SAFE_NO_PAD.encode(
             key.verifying_key()
-                .to_encoded_point(false /* uncompressed */)
+                .to_sec1_point(false /* uncompressed */)
                 .as_bytes(),
         );
 
@@ -229,10 +230,6 @@ impl Push {
             URL_SAFE_NO_PAD.encode(sig.to_bytes())
         ))
     }
-}
-
-fn rand_core() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
-    p256::elliptic_curve::rand_core::OsRng
 }
 
 /// Bridges attention events to pushes: records pending attention, skips

@@ -363,6 +363,9 @@ interface ControlMsg {
   pane?: string;
   reason?: string;
   source?: string;
+  /** pane_capture frames (copy overlay): captured text + truncation flag */
+  text?: string;
+  truncated?: boolean;
   /** permission_cards frames (M4b) */
   cards?: PermissionCard[];
   /** command_feed frames (M4c) */
@@ -456,6 +459,9 @@ function handleControl(msg: ControlMsg): void {
     case "pane_views":
       onPaneViews(msg.views ?? []);
       break;
+    case "pane_capture":
+      openCopyOverlay(msg.text ?? "", msg.truncated ?? false);
+      break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
       if (rtt < 10_000) {
@@ -486,6 +492,8 @@ function handleControl(msg: ControlMsg): void {
         // keep shrinking the desktop); revert to the terminal.
         if (dashboardMode) setDashboard(false);
         showHint("Couldn't switch to Dashboard — still controlling the terminal");
+      } else if (msg.code === "capture_unavailable") {
+        showHint("Couldn't capture the pane");
       }
       break;
   }
@@ -1017,6 +1025,7 @@ function clearPaneViews(): void {
   paneViews = [];
   viewToggleBtn.hidden = true;
   closePopup();
+  closeCopyOverlay(); // a capture from another session/connection is now stale
   if (dashboardMode) setDashboard(false);
 }
 
@@ -1846,10 +1855,59 @@ document.addEventListener("click", (ev) => {
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
 $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
 $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
+setupCopyMode();
 notifyBtn.addEventListener("click", () => void toggleNotify());
 feedBtn.addEventListener("click", toggleFeed);
 viewToggleBtn.addEventListener("click", toggleDashboard);
 renderNotifyBtn();
+
+// ---------- copy overlay (selectable pane text) ----------
+// The terminal is a WebGL canvas with tmux `mouse on`, so touch = scroll and
+// native selection never triggers. This captures the pane's screen + scrollback
+// as plain text into a selectable <pre> so the phone's own long-press select +
+// Copy works. A read-only snapshot (labelled as such), not live copy-mode.
+const copyOverlay = $("copy-overlay");
+const copyTextEl = $("copy-text");
+let capturedText = "";
+
+function openCopyOverlay(text: string, truncated: boolean): void {
+  capturedText = text;
+  copyTextEl.textContent = text;
+  $("copy-title").textContent = truncated
+    ? "Copy — most recent (truncated). Long-press to select, or"
+    : "Copy — long-press to select, or";
+  copyOverlay.hidden = false;
+  copyTextEl.scrollTop = copyTextEl.scrollHeight; // open at the newest output
+}
+
+function closeCopyOverlay(): void {
+  if (copyOverlay.hidden) return;
+  copyOverlay.hidden = true;
+  copyTextEl.textContent = ""; // don't retain captured (possibly secret) content
+  capturedText = "";
+}
+
+function setupCopyMode(): void {
+  $("copy-key").addEventListener("click", () => {
+    const pane = activePaneId();
+    if (!pane) {
+      showHint("No active pane to copy");
+      return;
+    }
+    sendJson({ type: "capture", pane });
+  });
+  $("copy-all").addEventListener("click", () => {
+    // Use the ALREADY-captured text synchronously in the click handler — WebKit
+    // requires clipboard writes during the user gesture (a fresh async capture
+    // would lose the activation).
+    if (!capturedText) return;
+    void navigator.clipboard.writeText(capturedText).then(
+      () => showHint("Copied"),
+      () => showHint("Long-press to select and copy instead")
+    );
+  });
+  $("copy-close").addEventListener("click", closeCopyOverlay);
+}
 
 // ---------- command composer ----------
 

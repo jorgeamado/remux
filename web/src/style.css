@@ -1021,6 +1021,43 @@ button {
   white-space: nowrap;
 }
 
+/* Copy overlay: pane screen + scrollback as selectable text. */
+#copy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+}
+#copy-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  border-bottom: 1px solid var(--card-border);
+}
+#copy-title {
+  color: var(--muted);
+  font-size: 12px;
+}
+#copy-text {
+  flex: 1;
+  margin: 0;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* The whole point: let the phone select this text natively. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* Source-declared actions: a core button above a dashboard that opens the
    generic popup with the view's menu options. */
 .dash-actions {

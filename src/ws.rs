@@ -36,6 +36,13 @@ const MAX_WS_MESSAGE: usize = 64 * 1024;
 /// the JSON parse. Keystrokes/scroll are Binary and not counted here.
 const TEXT_MSG_BURST: f64 = 32.0;
 const TEXT_MSG_REFILL_PER_SEC: f64 = 32.0;
+/// Copy-overlay capture: scrollback lines requested, response byte cap (most
+/// recent kept), and min spacing between captures on one connection. A capture
+/// response is large (unlike other frames) and OUT_QUEUE counts messages, so
+/// captures get their own rate cap on top of the text token bucket.
+const CAPTURE_LINES: u32 = 2000;
+const CAPTURE_MAX_BYTES: usize = 256 * 1024;
+const CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -78,6 +85,11 @@ enum ClientMsg {
         #[serde(default)]
         index: Option<u32>,
     },
+    /// Capture a pane's screen + scrollback as plain text for the copy overlay.
+    /// The client sends the pane id it was viewing at tap time (snapshot).
+    Capture {
+        pane: String,
+    },
     Ping,
 }
 
@@ -92,6 +104,14 @@ enum ServerMsg<'a> {
     Error {
         code: &'a str,
         message: &'a str,
+    },
+    /// A pane's captured text (screen + scrollback) for the copy overlay.
+    /// `truncated` = the capture exceeded the byte cap and only the most recent
+    /// portion is included.
+    PaneCapture {
+        pane: &'a str,
+        text: &'a str,
+        truncated: bool,
     },
     /// Someone/something in this session wants the user: a hook-fed event
     /// (agent_needs_input) or the busy→quiet heuristic.
@@ -563,6 +583,9 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // so a client can't CPU-flood the daemon with large/malformed control frames.
     let mut text_tokens: f64 = TEXT_MSG_BURST;
     let mut text_refill = std::time::Instant::now();
+    // Last copy-overlay capture on this connection (separate rate cap — a capture
+    // response is large and OUT_QUEUE counts messages, not bytes).
+    let mut last_capture: Option<std::time::Instant> = None;
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
@@ -842,6 +865,50 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Ok(ClientMsg::Capture { pane }) => {
+                        // Read access to this session's pane contents + recent
+                        // scrollback (more than just bytes already streamed to
+                        // THIS device — incl. pre-connect history and full-screen
+                        // apps), but never another session. In-session gate, no
+                        // `approve` (read-only, like scrolling). Own rate cap.
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        let now = std::time::Instant::now();
+                        let spaced = last_capture
+                            .is_none_or(|t| now.duration_since(t) >= CAPTURE_MIN_INTERVAL);
+                        if in_session && spaced {
+                            last_capture = Some(now);
+                            let p = pane.clone();
+                            let captured = tokio::task::spawn_blocking(move || {
+                                tmux::capture_scrollback(&p, CAPTURE_LINES)
+                            })
+                            .await;
+                            match captured {
+                                Ok(Ok(Some(raw))) => {
+                                    let (text, truncated) = cap_capture(&raw);
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::PaneCapture {
+                                            pane: &pane,
+                                            text: &text,
+                                            truncated,
+                                        }))
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::Error {
+                                            code: "capture_unavailable",
+                                            message: "could not capture the pane",
+                                        }))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
                     Ok(ClientMsg::Ping) => {
                         let _ = out_tx.send(json(&ServerMsg::Pong)).await;
                     }
@@ -940,6 +1007,27 @@ fn clamp_size(cols: &mut u16, rows: &mut u16) {
     *rows = (*rows).clamp(5, 300);
 }
 
+/// Prepare a captured pane for the copy overlay: trim trailing whitespace on
+/// every line (tmux pads cells with spaces), then keep at most
+/// `CAPTURE_MAX_BYTES` of the MOST RECENT text (the tail), cut on a char
+/// boundary so the JSON stays valid UTF-8. Returns `(text, truncated)`.
+fn cap_capture(raw: &str) -> (String, bool) {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    if out.len() <= CAPTURE_MAX_BYTES {
+        return (out, false);
+    }
+    // Keep the tail; advance to the next char boundary so we never split a char.
+    let mut start = out.len() - CAPTURE_MAX_BYTES;
+    while start < out.len() && !out.is_char_boundary(start) {
+        start += 1;
+    }
+    (out[start..].to_string(), true)
+}
+
 /// True when the payload is nothing but SGR mouse *wheel* press reports
 /// (`ESC [ < 64|65 ; col ; row M`) — the only input observers may send.
 fn wheel_reports_only(bytes: &[u8]) -> bool {
@@ -989,6 +1077,27 @@ async fn resolve_client_name(pid: Option<u32>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_capture_trims_and_bounds() {
+        // Per-line trailing whitespace is trimmed; each line ends with \n.
+        let (text, trunc) = cap_capture("ls   \n  hi \t\n");
+        assert_eq!(text, "ls\n  hi\n");
+        assert!(!trunc);
+
+        // Over-cap keeps the most-recent tail and flags truncation.
+        let big = "x".repeat(CAPTURE_MAX_BYTES + 5000);
+        let (text, trunc) = cap_capture(&big);
+        assert!(trunc);
+        assert!(text.len() <= CAPTURE_MAX_BYTES + 1); // +1 for the appended \n
+
+        // A multibyte char straddling the cut boundary is never split.
+        let mut s = "é".repeat(CAPTURE_MAX_BYTES); // 2 bytes each
+        s.push('\n');
+        let (text, trunc) = cap_capture(&s);
+        assert!(trunc);
+        assert!(text.is_char_boundary(0) && std::str::from_utf8(text.as_bytes()).is_ok());
+    }
 
     #[test]
     fn wheel_report_whitelist() {

@@ -95,6 +95,24 @@ pub fn capture_pane(pane: &str) -> Result<Option<String>> {
     run_classified(cmd, true)
 }
 
+/// Capture a pane's visible screen plus up to `back` lines of scrollback, as
+/// plain text with wrapped lines joined (`-J`, so a wrapped command/URL is one
+/// line the phone can copy cleanly). For the copy overlay. `Ok(None)` if the
+/// pane/server is gone. tmux clamps `back` to the available history.
+pub fn capture_scrollback(pane: &str, back: u32) -> Result<Option<String>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "capture-pane",
+        "-p",
+        "-J",
+        "-t",
+        pane,
+        "-S",
+        &format!("-{back}"),
+    ]);
+    run_classified(cmd, true)
+}
+
 /// Create the managed session if missing and apply session-scoped options.
 /// Never touches global tmux configuration.
 pub fn ensure_session(session: &str) -> Result<()> {

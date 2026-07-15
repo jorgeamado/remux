@@ -138,6 +138,30 @@ editing, M4b decision/EOF race) now have real tests.
   self-heals. Durable fix worth doing: recreate the container to exec from
   `target-linux/debug/remux` so host and container builds never collide.
 - Mint a pairing link: `docker exec remux-mobile /workspaces/remux/target/debug/remux pair`.
+- **Recreate recipe (2026-07-15).** The container is launched by a custom command,
+  NOT stock `devcontainer up`. State that survives a recreate lives on external
+  mounts: pairing/devices on the `remux-state` named volume (`/root/.local/share`)
+  and the TLS cert on the `~/.remux-certs` bind (`/certs`, ro). The repo bind
+  carries the binary + PWA + persisted Claude config. To recreate:
+  ```sh
+  docker rm -f remux-mobile
+  docker run -d --name remux-mobile --restart unless-stopped -p 7777:7777 \
+    -e CLAUDE_CONFIG_DIR=/workspaces/remux/.devcontainer/data/claude \
+    -v remux-state:/root/.local/share \
+    -v $PWD:/workspaces/remux \
+    -v ~/.remux-certs:/certs:ro \
+    vsc-remux-f67888504cc9283453a2e1f4b49fb4445a96be485d44774ed0d6a30d70bf5fa4 \
+    bash -c 'exec /workspaces/remux/target/debug/remux serve --listen 0.0.0.0:7777 \
+      --url https://georges-macbook-air.shrew-fort.ts.net:7777 \
+      --allowed-host georges-macbook-air.shrew-fort.ts.net \
+      --tls-cert /certs/georges-macbook-air.shrew-fort.ts.net.crt \
+      --tls-key /certs/georges-macbook-air.shrew-fort.ts.net.key'
+  docker exec remux-mobile npm install -g @anthropic-ai/claude-code   # ephemeral fs → reinstall
+  ```
+  `CLAUDE_CONFIG_DIR` points at the bind-mounted repo so Claude Code's login
+  persists across recreates; `.devcontainer/data/` is gitignored. Claude Code
+  itself lives on the ephemeral fs (npm -g), so reinstall after a recreate — the
+  `devcontainer.json` `postCreateCommand` does this on a real `devcontainer up`.
 
 ## Done (this arc)
 

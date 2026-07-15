@@ -938,7 +938,7 @@ function renderDashboard(): void {
   if (v.view === "taskscope.v1") {
     dashboardPanel.appendChild(renderTaskscope(v.state));
   } else if (v.view === "htop.v1") {
-    dashboardPanel.appendChild(renderHtop(v.state));
+    dashboardPanel.appendChild(renderHtop(v.state, v.pane));
   } else {
     const unknown = document.createElement("div");
     unknown.className = "dash-empty";
@@ -962,7 +962,24 @@ function htStat(label: string, value: string): HTMLElement {
   return el;
 }
 
-function renderHtop(state: Record<string, unknown>): HTMLElement {
+// The active htop sort, remembered client-side just to highlight the button —
+// htop itself is the source of truth (it re-sorts and the next capture reflects
+// it).
+let htSort = "cpu";
+
+function htSortBtn(label: string, key: string, pane: string): HTMLElement {
+  const b = document.createElement("button");
+  b.className = "ht-sort" + (htSort === key ? " active" : "");
+  b.textContent = label;
+  b.addEventListener("click", () => {
+    htSort = key;
+    sendJson({ type: "pane_action", pane, action: `sort:${key}` });
+    renderDashboard(); // move the highlight now; htop reorders within ~1.5s
+  });
+  return b;
+}
+
+function renderHtop(state: Record<string, unknown>, pane: string): HTMLElement {
   const root = document.createElement("div");
   root.className = "ht";
   const summary = (state.summary ?? {}) as Record<string, unknown>;
@@ -977,6 +994,19 @@ function renderHtop(state: Record<string, unknown>): HTMLElement {
   if (summary.load) head.appendChild(htStat("LOAD", String(summary.load)));
   if (summary.uptime) head.appendChild(htStat("UP", String(summary.uptime)));
   root.appendChild(head);
+
+  const sortBar = document.createElement("div");
+  sortBar.className = "ht-sortbar";
+  const l = document.createElement("span");
+  l.className = "ht-sortbar-l";
+  l.textContent = "sort";
+  sortBar.append(
+    l,
+    htSortBtn("CPU", "cpu", pane),
+    htSortBtn("MEM", "mem", pane),
+    htSortBtn("TIME", "time", pane)
+  );
+  root.appendChild(sortBar);
 
   if (state.confidence === "low" || procs.length === 0) {
     const note = document.createElement("div");

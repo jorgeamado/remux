@@ -177,6 +177,11 @@ impl Registry {
             .collect()
     }
 
+    /// The view id currently held for `pane`, if any.
+    pub fn view_of(&self, pane: &str) -> Option<String> {
+        self.inner.lock().unwrap().get(pane).map(|e| e.view.clone())
+    }
+
     /// Drop views whose pane is no longer in the live topology set.
     pub fn prune(&self, live: &HashSet<String>) {
         let mut map = self.inner.lock().unwrap();
@@ -231,6 +236,18 @@ impl Drop for ClaimGuard {
             drop(map);
             let _ = self.events.send(());
         }
+    }
+}
+
+/// Map a whitelisted dashboard *action* for a view to the literal key(s) to send
+/// to the real tool. Returns `None` for an unknown (view, action) pair — so a
+/// client can only trigger vetted actions, never arbitrary keystrokes.
+pub fn action_keys(view: &str, action: &str) -> Option<&'static str> {
+    match (view, action) {
+        ("htop.v1", "sort:cpu") => Some("P"),
+        ("htop.v1", "sort:mem") => Some("M"),
+        ("htop.v1", "sort:time") => Some("T"),
+        _ => None,
     }
 }
 
@@ -933,6 +950,18 @@ F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortBy";
         assert_eq!(ps[0]["mem"], 0.5);
         assert_eq!(ps[0]["res"], "19812");
         assert_eq!(ps[0]["command"], ""); // no Command column at this width
+    }
+
+    #[test]
+    fn dashboard_actions_are_whitelisted_per_view() {
+        assert_eq!(action_keys("htop.v1", "sort:cpu"), Some("P"));
+        assert_eq!(action_keys("htop.v1", "sort:mem"), Some("M"));
+        assert_eq!(action_keys("htop.v1", "sort:time"), Some("T"));
+        // Unknown action / view / a raw keystroke smuggling attempt → nothing.
+        assert_eq!(action_keys("htop.v1", "sort:bogus"), None);
+        assert_eq!(action_keys("htop.v1", "q"), None);
+        assert_eq!(action_keys("htop.v1", "rm -rf /"), None);
+        assert_eq!(action_keys("taskscope.v1", "sort:cpu"), None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::{tmux, App};
+use crate::{paneview, tmux, App};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -53,6 +53,13 @@ enum ClientMsg {
         #[serde(default)]
         pane: String,
         dashboard: bool,
+    },
+    /// A semantic action from a pane's dashboard (e.g. `sort:mem`). The daemon
+    /// maps it to the real tool's key(s) via a per-view whitelist and sends them
+    /// through tmux — a client can never send raw keystrokes this way.
+    PaneAction {
+        pane: String,
+        action: String,
     },
     /// Window/pane operations (new window, splits, switching) — controller only.
     WindowAction {
@@ -691,6 +698,29 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             if let Some(old) = current_dash.take() {
                                 dash_leave(&app, old).await;
                             }
+                        }
+                    }
+                }
+                Ok(ClientMsg::PaneAction { pane, action }) => {
+                    // Only for a pane in THIS session that has a live view, and
+                    // only whitelisted actions → mapped keys. Compute the checks
+                    // before any await (don't hold the topology borrow across it).
+                    let in_session = app.topology.borrow().iter().any(|s| {
+                        s.name == session
+                            && s.windows
+                                .iter()
+                                .any(|w| w.panes.iter().any(|p| p.id == pane))
+                    });
+                    let keys = app
+                        .pane_views
+                        .view_of(&pane)
+                        .and_then(|v| paneview::action_keys(&v, &action));
+                    if in_session {
+                        if let Some(keys) = keys {
+                            let p = pane.clone();
+                            let k = keys.to_string();
+                            let _ =
+                                tokio::task::spawn_blocking(move || tmux::send_keys(&p, &k)).await;
                         }
                     }
                 }

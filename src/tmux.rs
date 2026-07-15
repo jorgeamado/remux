@@ -143,6 +143,15 @@ pub fn ensure_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send literal key(s) to a pane — for whitelisted dashboard actions. Literal
+/// (`-l`) so the string is never interpreted as a tmux key-name.
+pub fn send_keys(pane: &str, keys: &str) -> Result<()> {
+    let mut c = tmux();
+    c.args(["send-keys", "-t", pane, "-l", keys]);
+    run_classified(c, true)?;
+    Ok(())
+}
+
 /// The window id (`@N`) a pane belongs to — for window-scoped options.
 pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
     let mut c = tmux();

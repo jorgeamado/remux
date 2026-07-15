@@ -29,7 +29,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -52,6 +52,28 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_STREAMS: usize = 32;
 /// taskscope.v1: cap the worker array.
 const MAX_WORKERS: usize = 128;
+/// A source must send its header this quickly, or we drop the (slot-holding)
+/// connection — a half-open connection can't squat a stream slot forever.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The capped, buffered read half of a source connection.
+type SourceReader = tokio::io::Take<BufReader<tokio::net::unix::OwnedReadHalf>>;
+
+/// Read one newline-terminated line, capped at `MAX_LINE`. Returns the line
+/// bytes (newline trimmed), `None` on EOF, or `Err` if the line exceeds the cap
+/// (the limit is hit before a `\n`).
+async fn read_line(reader: &mut SourceReader, buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+    reader.set_limit(MAX_LINE);
+    buf.clear();
+    let n = reader.read_until(b'\n', buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') {
+        anyhow::bail!("line exceeds cap");
+    }
+    Ok(Some(trim_line(buf).to_vec()))
+}
 
 /// Latest structured state for one pane.
 struct Entry {
@@ -306,13 +328,13 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
     let mut reader = BufReader::new(read).take(MAX_LINE);
     let mut buf = Vec::new();
 
-    // --- header ---
-    reader.set_limit(MAX_LINE);
-    let n = reader.read_until(b'\n', &mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let header: Header = match serde_json::from_slice(trim_line(&buf)) {
+    // --- header (time-bounded so a half-open connection can't hold a slot) ---
+    let header_bytes =
+        match tokio::time::timeout(HEADER_TIMEOUT, read_line(&mut reader, &mut buf)).await {
+            Ok(Ok(Some(b))) => b,
+            _ => return Ok(()), // timeout, EOF, or over-cap → just close
+        };
+    let header: Header = match serde_json::from_slice(&header_bytes) {
         Ok(h) => h,
         Err(_) => return ack_err(&mut write, "bad header json").await,
     };
@@ -329,36 +351,37 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
     write.write_all(b"{\"ok\":true}\n").await?;
 
     // --- snapshots ---
-    let mut last = Instant::now()
-        .checked_sub(MIN_UPDATE_INTERVAL)
-        .unwrap_or_else(Instant::now);
+    // Latest-wins rate cap: coalesce snapshots into a single `pending` slot and
+    // publish it at most once per MIN_UPDATE_INTERVAL. Unlike a plain drop, the
+    // *final* snapshot of a source that then goes idle (but stays connected) is
+    // never stranded — the timer flushes it within one interval.
+    let mut pending: Option<Value> = None;
+    let mut flush = tokio::time::interval(MIN_UPDATE_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        reader.set_limit(MAX_LINE);
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf).await?;
-        if n == 0 {
-            break; // EOF → guard drop removes the view
+        tokio::select! {
+            biased;
+            _ = flush.tick(), if pending.is_some() => {
+                guard.update(pending.take().unwrap());
+            }
+            line = read_line(&mut reader, &mut buf) => {
+                match line? {
+                    None => break, // EOF → guard drop removes the view
+                    Some(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let Ok(state) = serde_json::from_slice::<Value>(&bytes) else {
+                            continue; // skip a malformed frame, keep the stream alive
+                        };
+                        if validate(&header.view, &state).is_err() {
+                            continue;
+                        }
+                        pending = Some(state); // coalesced; the timer publishes it
+                    }
+                }
+            }
         }
-        if buf.last() != Some(&b'\n') {
-            anyhow::bail!("snapshot line exceeds cap");
-        }
-        // Rate cap: drop snapshots that arrive too fast (latest-wins).
-        if last.elapsed() < MIN_UPDATE_INTERVAL {
-            continue;
-        }
-        let line = trim_line(&buf);
-        if line.is_empty() {
-            continue;
-        }
-        let state: Value = match serde_json::from_slice(line) {
-            Ok(v) => v,
-            Err(_) => continue, // skip a malformed frame, keep the stream alive
-        };
-        if validate(&header.view, &state).is_err() {
-            continue;
-        }
-        guard.update(state);
-        last = Instant::now();
     }
     Ok(())
 }
@@ -414,7 +437,7 @@ async fn gc_loop(app: Arc<App>) {
 /// on stdin and forward them to the daemon as pane `pane`'s view. Blocks until
 /// stdin closes (or the daemon goes away).
 pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()> {
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, Read, Write};
 
     let pane = pane
         .or_else(|| std::env::var("TMUX_PANE").ok())
@@ -424,12 +447,17 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
     let mut sock = std::os::unix::net::UnixStream::connect(&path)
         .with_context(|| format!("is the daemon running? (no pane-view socket at {path:?})"))?;
 
-    // Header, then read the ack.
+    // Header, then read the ack under a deadline so a hung daemon can't wedge us.
     let header = serde_json::json!({ "pane": &pane, "view": &view });
     writeln!(sock, "{header}")?;
     sock.flush()?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut ackline = String::new();
-    std::io::BufReader::new(sock.try_clone()?).read_line(&mut ackline)?;
+    std::io::BufReader::new(sock.try_clone()?)
+        .take(4096)
+        .read_line(&mut ackline)
+        .context("no ack from the daemon (timed out)")?;
+    sock.set_read_timeout(None)?; // we only write from here on
     let ack: Value = serde_json::from_str(ackline.trim())
         .with_context(|| format!("unexpected ack from daemon: {ackline:?}"))?;
     if ack["ok"] != serde_json::json!(true) {
@@ -443,15 +471,30 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
         "remux: streaming '{view}' for pane {pane} — open the Dashboard on your phone (Ctrl-C to stop)"
     );
 
-    // Forward stdin lines until EOF; closing the socket signals the daemon to
-    // drop the view.
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    // Forward stdin lines until EOF, each capped at MAX_LINE (like the daemon)
+    // so a runaway source can't allocate unbounded. Closing the socket on EOF
+    // signals the daemon to drop the view.
+    let mut reader = std::io::stdin().lock().take(MAX_LINE);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        reader.set_limit(MAX_LINE);
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break; // stdin EOF
+        }
+        if buf.last() != Some(&b'\n') {
+            continue; // over-cap line — skip (the daemon would reject it anyway)
+        }
+        let line = trim_line(&buf);
+        if line.is_empty() {
             continue;
         }
-        if writeln!(sock, "{line}").is_err() {
+        if sock
+            .write_all(line)
+            .and_then(|_| sock.write_all(b"\n"))
+            .is_err()
+        {
             anyhow::bail!("daemon closed the pane-view stream");
         }
         sock.flush().ok();

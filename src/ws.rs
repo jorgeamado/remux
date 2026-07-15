@@ -445,16 +445,22 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // add/update/remove all reconcile client-side.
     let paneview_task = tokio::spawn({
         let mut rx = app.pane_views.subscribe();
+        // Also wake on topology changes: a pane moving between sessions (or a
+        // window closing) shifts which views belong here WITHOUT a pane-view
+        // hint, so the filter must re-run then too — otherwise a moved pane's
+        // frame goes stale in the old session and never appears in the new one.
+        let mut topo_rx = app.topology.subscribe();
         let out = out_tx.clone();
         let app = app.clone();
         let session = session.clone();
         async move {
             let mut last_sent: Option<String> = None;
             loop {
-                // Pane ids that belong to this session right now.
-                let session_panes: std::collections::HashSet<String> = app
-                    .topology
-                    .borrow()
+                // Pane ids that belong to this session right now. borrow_and_update
+                // marks this topology version seen so `topo_rx.changed()` only
+                // fires on a genuinely new one.
+                let session_panes: std::collections::HashSet<String> = topo_rx
+                    .borrow_and_update()
                     .iter()
                     .filter(|s| s.name == session)
                     .flat_map(|s| s.windows.iter())
@@ -478,10 +484,18 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     }
                     last_sent = Some(json);
                 }
-                match rx.recv().await {
-                    Ok(()) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // Wake on either a pane-view change or a topology change.
+                tokio::select! {
+                    r = rx.recv() => match r {
+                        Ok(()) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    c = topo_rx.changed() => {
+                        if c.is_err() {
+                            break;
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 while matches!(rx.try_recv(), Ok(())) {}
@@ -586,13 +600,30 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     }
                 },
                 Ok(ClientMsg::ReleaseControl) => {
-                    if let Some(name) = &client_name {
-                        let name = name.clone();
-                        let _ =
-                            tokio::task::spawn_blocking(move || tmux::demote_client(&name)).await?;
+                    // Only drop the controller role if tmux actually demoted us.
+                    // Otherwise the client stays a sizing participant (window-size
+                    // latest) and reporting "observer" would be a lie — the exact
+                    // failure the pane-view dashboard relies on NOT happening.
+                    let demoted = match &client_name {
+                        Some(name) => {
+                            let name = name.clone();
+                            tokio::task::spawn_blocking(move || tmux::demote_client(&name))
+                                .await?
+                                .is_ok()
+                        }
+                        None => true, // no client name → never really driving size
+                    };
+                    if demoted {
+                        controller = false;
+                        let _ = out_tx.send(status("observer")).await;
+                    } else {
+                        let _ = out_tx
+                            .send(json(&ServerMsg::Error {
+                                code: "release_failed",
+                                message: "could not release control",
+                            }))
+                            .await;
                     }
-                    controller = false;
-                    let _ = out_tx.send(status("observer")).await;
                 }
                 Ok(ClientMsg::WindowAction { action, index }) => {
                     if !controller {

@@ -299,6 +299,7 @@ function connect(): void {
     paneTabs.hidden = true;
     clearPermissionCards();
     clearFeed();
+    clearPaneViews();
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -439,6 +440,7 @@ function handleControl(msg: ControlMsg): void {
       topology = msg.sessions ?? [];
       renderTabs();
       maybeAutoZoom();
+      refreshPaneView(); // the active pane may have changed → re-pick its view
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
@@ -538,6 +540,7 @@ function switchSession(name: string): void {
   // (superseded), so onclose won't, and the new session may have an empty feed
   // the daemon stays silent about — leaving stale cards without this.
   clearFeed();
+  clearPaneViews(); // per-pane views belong to the old session — drop them
   handle.term.reset(); // fresh grid; the new attach repaints everything
   connect();
 }
@@ -860,23 +863,39 @@ const viewToggleBtn = $<HTMLButtonElement>("view-toggle-btn");
 let paneViews: PaneView[] = [];
 let dashboardMode = false;
 
-/** The view to show: the active pane's if it has one, else the first available. */
+/** The view for the pane we're actually looking at. Only falls back to the
+ *  first available while topology is still unknown — otherwise a split could
+ *  show an unrelated pane's dashboard. */
 function currentView(): PaneView | undefined {
   if (paneViews.length === 0) return undefined;
   const active = activePaneId();
-  return paneViews.find((v) => v.pane === active) ?? paneViews[0];
+  if (active === undefined) return paneViews[0]; // topology not loaded yet
+  return paneViews.find((v) => v.pane === active);
+}
+
+/** Re-evaluate the toggle + dashboard against the current view. Called on a new
+ *  pane_views frame AND on topology changes (the active pane may have moved). */
+function refreshPaneView(): void {
+  const v = currentView();
+  // The toggle only exists while a source is streaming a view for THIS pane.
+  viewToggleBtn.hidden = v === undefined;
+  if (v === undefined && dashboardMode) {
+    setDashboard(false); // no view for this pane → fall back to the terminal
+  } else if (dashboardMode) {
+    renderDashboard();
+  }
 }
 
 function onPaneViews(views: PaneView[]): void {
   paneViews = views;
-  const v = currentView();
-  // The toggle only exists while a source is streaming a view for this pane.
-  viewToggleBtn.hidden = v === undefined;
-  if (v === undefined && dashboardMode) {
-    setDashboard(false); // source went away → fall back to the terminal
-  } else if (dashboardMode) {
-    renderDashboard();
-  }
+  refreshPaneView();
+}
+
+/** Drop all pane views and leave dashboard mode — on reconnect / session switch. */
+function clearPaneViews(): void {
+  paneViews = [];
+  viewToggleBtn.hidden = true;
+  if (dashboardMode) setDashboard(false);
 }
 
 function setDashboard(on: boolean): void {

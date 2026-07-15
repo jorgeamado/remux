@@ -300,7 +300,7 @@ impl Registry {
 /// A 128-bit random card id (32 hex chars). 48-bit ids collide too readily and
 /// a collision would overwrite an entry, dropping the first waiter's sender.
 pub fn mint_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = [0u8; 16];
     rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)

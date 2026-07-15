@@ -1072,6 +1072,10 @@ function renderDashboard(): void {
   }
   htChrome = null;
   dashboardPanel.textContent = "";
+  if (v.view === "claude.v1") {
+    dashboardPanel.appendChild(renderClaude(v.state));
+    return;
+  }
   // Generic: any source view may advertise an interactive `menu`. Render a
   // core Actions button for it, independent of the view's own renderer.
   const bar = menuBar(v);
@@ -1496,6 +1500,65 @@ function tsStatusClass(status: string): string {
     default:
       return "idle";
   }
+}
+
+/** claude.v1 dashboard: honest, broadcast-safe agent status. The pending ask
+ * carries only a tool name + a permission-card id; we JOIN that id against the
+ * (approve-only) permission_cards frame to show Approve/Deny inline — the command
+ * itself never travels in claude.v1. */
+function renderClaude(state: Record<string, unknown>): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "claude-dash";
+  const status = String(state.status ?? "idle");
+  const ask = state.current_tool_ask as
+    | { tool_name?: string; permission_card_id?: string }
+    | null
+    | undefined;
+
+  const head = document.createElement("div");
+  head.className = `claude-status claude-${status}`;
+  head.textContent =
+    status === "awaiting-approval"
+      ? "Awaiting approval"
+      : status === "working"
+        ? "Working…"
+        : "Idle";
+  root.appendChild(head);
+
+  if (ask && ask.tool_name) {
+    const askEl = document.createElement("div");
+    askEl.className = "claude-ask";
+    askEl.textContent = `Wants to run: ${ask.tool_name}`;
+    root.appendChild(askEl);
+    // Join the card by id (approve-only). If present, Approve/Deny right here.
+    const card = permCards.find((c) => c.id === ask.permission_card_id);
+    if (card) {
+      const elapsed = Math.floor((performance.now() - permReceivedAt) / 1000);
+      root.appendChild(permCardEl(card, Math.max(0, card.remaining_secs - elapsed)));
+    } else {
+      const note = document.createElement("div");
+      note.className = "claude-note";
+      note.textContent = "Approve or deny on an approve-capable device.";
+      root.appendChild(note);
+    }
+  }
+
+  const sid = String(state.session_id ?? "");
+  if (sid) {
+    const meta = document.createElement("div");
+    meta.className = "claude-meta";
+    meta.textContent = `session ${sid.slice(0, 8)}`;
+    root.appendChild(meta);
+  }
+
+  const recent = Array.isArray(state.recent_tools) ? state.recent_tools : [];
+  if (!recent.length) {
+    const empty = document.createElement("div");
+    empty.className = "claude-note";
+    empty.textContent = "No recent activity.";
+    root.appendChild(empty);
+  }
+  return root;
 }
 
 function renderTaskscope(state: Record<string, unknown>): HTMLElement {

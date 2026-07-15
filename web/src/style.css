@@ -1021,6 +1021,43 @@ button {
   white-space: nowrap;
 }
 
+/* claude.v1 dashboard. */
+.claude-dash {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.claude-status {
+  font-size: 20px;
+  font-weight: 700;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+}
+.claude-status.claude-working {
+  color: #e0b357;
+  border-color: #6b551d;
+}
+.claude-status.claude-awaiting-approval {
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.claude-status.claude-idle {
+  color: var(--muted);
+}
+.claude-ask {
+  font-size: 14px;
+  color: var(--fg);
+}
+.claude-meta,
+.claude-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* Copy overlay: pane screen + scrollback as selectable text. */
 #copy-overlay {
   position: fixed;

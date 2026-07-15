@@ -932,12 +932,96 @@ function renderDashboard(): void {
   if (!v) return;
   if (v.view === "taskscope.v1") {
     dashboardPanel.appendChild(renderTaskscope(v.state));
+  } else if (v.view === "htop.v1") {
+    dashboardPanel.appendChild(renderHtop(v.state));
   } else {
     const unknown = document.createElement("div");
     unknown.className = "dash-empty";
     unknown.textContent = `No renderer for “${v.view}”.`;
     dashboardPanel.appendChild(unknown);
   }
+}
+
+// --- htop.v1 renderer (a lens over the real htop's rendered screen) ---
+
+function htStat(label: string, value: string): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "ht-stat";
+  const l = document.createElement("span");
+  l.className = "ht-stat-l";
+  l.textContent = label;
+  const val = document.createElement("span");
+  val.className = "ht-stat-v";
+  val.textContent = value;
+  el.append(l, val);
+  return el;
+}
+
+function renderHtop(state: Record<string, unknown>): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "ht";
+  const summary = (state.summary ?? {}) as Record<string, unknown>;
+  const procs = Array.isArray(state.processes)
+    ? (state.processes as Record<string, unknown>[])
+    : [];
+
+  const head = document.createElement("div");
+  head.className = "ht-head";
+  head.appendChild(htStat("CPU", `${Number(summary.cpu_pct ?? 0).toFixed(1)}%`));
+  if (summary.mem) head.appendChild(htStat("MEM", String(summary.mem)));
+  if (summary.load) head.appendChild(htStat("LOAD", String(summary.load)));
+  if (summary.uptime) head.appendChild(htStat("UP", String(summary.uptime)));
+  root.appendChild(head);
+
+  if (state.confidence === "low" || procs.length === 0) {
+    const note = document.createElement("div");
+    note.className = "dash-empty";
+    note.textContent =
+      "Couldn't read htop's screen — tap Terminal for the live view.";
+    root.appendChild(note);
+    return root;
+  }
+
+  for (const p of procs) root.appendChild(htRow(p));
+  return root;
+}
+
+function htRow(p: Record<string, unknown>): HTMLElement {
+  const cpu = Number(p.cpu ?? 0);
+  const mem = Number(p.mem ?? 0);
+
+  const row = document.createElement("div");
+  row.className = "ht-row";
+
+  const top = document.createElement("div");
+  top.className = "ht-line";
+  const cmd = document.createElement("span");
+  cmd.className = "ht-cmd";
+  // Narrow panes drop htop's Command column; fall back to the pid so the row
+  // still has a title.
+  cmd.textContent = String(p.command || `pid ${p.pid ?? "?"}`);
+  const cpuEl = document.createElement("span");
+  cpuEl.className = "ht-cpu";
+  cpuEl.textContent = `${cpu.toFixed(1)}%`;
+  top.append(cmd, cpuEl);
+
+  const meta = document.createElement("div");
+  meta.className = "ht-line ht-meta";
+  const who = document.createElement("span");
+  who.textContent = `${p.pid ?? "?"} · ${String(p.user ?? "")} · ${String(p.res ?? "")}`;
+  const memEl = document.createElement("span");
+  memEl.textContent = `mem ${mem.toFixed(1)}%`;
+  meta.append(who, memEl);
+
+  const bar = document.createElement("div");
+  bar.className = "ht-bar";
+  const fill = document.createElement("div");
+  fill.className = "ht-fill";
+  fill.style.width = `${Math.max(0, Math.min(100, cpu))}%`;
+  bar.appendChild(fill);
+
+  row.append(top, meta, bar);
+  return row;
 }
 
 // --- taskscope.v1 renderer (hard-coded; one built-in view) ---

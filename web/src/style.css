@@ -781,3 +781,70 @@ button {
 .ts-fill.err {
   background: var(--danger);
 }
+
+/* ---------- htop.v1 dashboard ---------- */
+
+.ht-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 2px 2px 12px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--card-border);
+}
+.ht-stat {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+.ht-stat-l {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.ht-stat-v {
+  font-weight: 600;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ht-row {
+  padding: 7px 2px 8px;
+  border-bottom: 1px solid var(--card-border);
+}
+.ht-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ht-cmd {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ht-cpu {
+  flex: none;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.ht-meta {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+.ht-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bar);
+  overflow: hidden;
+  margin-top: 6px;
+}
+.ht-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}

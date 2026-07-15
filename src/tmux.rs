@@ -85,6 +85,16 @@ fn run_optional(cmd: Command) -> Result<Option<String>> {
     run_classified(cmd, false)
 }
 
+/// Capture the *rendered* visible screen of a pane (`capture-pane -p`), as plain
+/// text (no escapes). `Ok(None)` if the server or the pane is gone. This is how
+/// the pane-view capture adapter reads a real tool's output (e.g. htop) without
+/// touching the running program.
+pub fn capture_pane(pane: &str) -> Result<Option<String>> {
+    let mut cmd = tmux();
+    cmd.args(["capture-pane", "-p", "-t", pane]);
+    run_classified(cmd, true)
+}
+
 /// Create the managed session if missing and apply session-scoped options.
 /// Never touches global tmux configuration.
 pub fn ensure_session(session: &str) -> Result<()> {

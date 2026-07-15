@@ -39,7 +39,15 @@ pub const SOCKET: &str = "pane-view.sock";
 
 /// Built-in view identifiers. A source may only claim one of these; the PWA
 /// ships a hard-coded renderer for each. (No third-party/plugin views yet.)
-pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1"];
+pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1", "htop.v1"];
+
+/// Foreground commands the daemon auto-captures into a pane view (best-effort
+/// "semantic lens" over the real tool's rendered screen — see `parse_htop`).
+const CAPTURE_TOOLS: &[&str] = &["htop"];
+/// How often the capture adapter re-reads a pane's screen.
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(1500);
+/// Cap the process rows published from one htop capture.
+const MAX_PROCS: usize = 300;
 
 /// Per-snapshot line cap (bytes). Bounds a buggy source; well above any real
 /// view payload.
@@ -258,8 +266,249 @@ pub fn validate(view: &str, state: &Value) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        "htop.v1" => {
+            if obj.get("processes").is_some_and(Value::is_array) {
+                Ok(())
+            } else {
+                Err("htop.v1: `processes` must be an array")
+            }
+        }
         _ => Err("unknown view"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// htop capture adapter: read a real tool's rendered screen and project it.
+// ---------------------------------------------------------------------------
+
+/// Watch topology; for each pane whose foreground command is a captured tool
+/// (htop), run a task that reads its rendered screen and feeds an `htop.v1`
+/// view. Stop when the tool exits or the pane vanishes. Best-effort: the
+/// terminal stays the real tool; this is only a projection of visible state.
+pub fn spawn_capture(app: Arc<App>) {
+    tokio::spawn(async move {
+        let mut rx = app.topology.subscribe();
+        let mut tasks: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+        loop {
+            let want: HashSet<String> = rx
+                .borrow_and_update()
+                .iter()
+                .flat_map(|s| s.windows.iter())
+                .flat_map(|w| w.panes.iter())
+                .filter(|p| CAPTURE_TOOLS.contains(&p.command.as_str()))
+                .map(|p| p.id.clone())
+                .collect();
+            for pane in &want {
+                if !tasks.contains_key(pane) {
+                    let app = app.clone();
+                    let p = pane.clone();
+                    let h = tokio::spawn(async move { capture_task(app, p).await });
+                    tasks.insert(pane.clone(), h.abort_handle());
+                }
+            }
+            // Stop tasks whose pane is no longer running the tool (aborting drops
+            // the task's ClaimGuard → the view is removed).
+            tasks.retain(|pane, ah| {
+                let keep = want.contains(pane) && !ah.is_finished();
+                if !keep {
+                    ah.abort();
+                }
+                keep
+            });
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+async fn capture_task(app: Arc<App>, pane: String) {
+    // Claim the pane's view; if it already has one (e.g. a `remux stream`), skip.
+    let guard = match app.pane_views.claim(&pane, "htop.v1") {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut ticker = tokio::time::interval(CAPTURE_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let p = pane.clone();
+        let captured = tokio::task::spawn_blocking(move || crate::tmux::capture_pane(&p)).await;
+        let text = match captured {
+            Ok(Ok(Some(t))) => t,
+            _ => continue, // pane gone / tmux error — the spawner will stop us
+        };
+        guard.update(parse_htop(&text));
+    }
+}
+
+/// Parse an htop screen (from `capture-pane -p`) into `htop.v1` state. Tolerant
+/// and visible-slice-only: it never infers hidden rows, derives columns from the
+/// header (so column reordering is tolerated), and reports `confidence: "low"`
+/// when the screen doesn't look like htop (the PWA then keeps the terminal).
+pub fn parse_htop(text: &str) -> Value {
+    let lines: Vec<&str> = text.lines().collect();
+
+    // The header row names the columns. htop renders the sort column with a
+    // marker that can glue "CPU%-MEM%"; replacing '-' (never a real label char)
+    // splits them back apart.
+    let header_idx = lines.iter().position(|l| {
+        let u = l.to_ascii_uppercase();
+        // Don't require COMMAND: a narrow pane (e.g. a phone at 64 cols) drops
+        // it, but the rest of the table is still worth showing.
+        u.contains("PID") && (u.contains("CPU%") || u.contains("MEM%"))
+    });
+    // The meters live above the header; scan only there so a process command
+    // that happens to contain "Uptime:" etc. can't corrupt the summary.
+    let summary = parse_htop_summary(match header_idx {
+        Some(hi) => &lines[..hi],
+        None => &lines,
+    });
+    let Some(hi) = header_idx else {
+        return serde_json::json!({
+            "confidence": "low", "reason": "no htop header", "summary": summary, "processes": []
+        });
+    };
+    let cols: Vec<String> = lines[hi]
+        .replace('-', " ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let idx = |name: &str| cols.iter().position(|c| c.eq_ignore_ascii_case(name));
+    // Command is optional — absent when the pane is too narrow to show it.
+    let cmd_i = idx("Command");
+    let (pid_i, user_i, res_i, cpu_i, mem_i, time_i) = (
+        idx("PID"),
+        idx("USER"),
+        idx("RES"),
+        idx("CPU%"),
+        idx("MEM%"),
+        idx("TIME+"),
+    );
+
+    let mut procs = Vec::new();
+    for line in &lines[hi + 1..] {
+        let head = line.trim_start();
+        if head.is_empty() || head.starts_with("F1") {
+            continue; // blank tail / function-key footer
+        }
+        // Split the fixed leading columns from the command remainder (the command
+        // contains spaces, so it can't be a plain token). If there's no Command
+        // column (narrow pane), every token is a leading column and command="".
+        let mut it = line.split_whitespace();
+        let (leading, command): (Vec<&str>, String) = match cmd_i {
+            Some(ci) => {
+                let lead: Vec<&str> = it.by_ref().take(ci).collect();
+                if lead.len() < ci {
+                    continue;
+                }
+                (lead, it.collect::<Vec<_>>().join(" "))
+            }
+            None => (it.collect(), String::new()),
+        };
+        // A row is only a process if its PID cell is numeric.
+        let pid = match pid_i
+            .and_then(|i| leading.get(i))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let cell = |oi: Option<usize>| oi.and_then(|i| leading.get(i)).copied().unwrap_or("");
+        let num = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+        procs.push(serde_json::json!({
+            "pid": pid,
+            "user": cell(user_i),
+            "cpu": num(cell(cpu_i)),
+            "mem": num(cell(mem_i)),
+            "res": cell(res_i),
+            "time": cell(time_i),
+            "command": command,
+        }));
+        if procs.len() >= MAX_PROCS {
+            break;
+        }
+    }
+    serde_json::json!({
+        "confidence": if procs.is_empty() { "low" } else { "ok" },
+        "summary": summary,
+        "processes": procs,
+    })
+}
+
+/// Best-effort parse of htop's top meters (above the process header).
+fn parse_htop_summary(lines: &[&str]) -> Value {
+    let mut cores: Vec<f64> = Vec::new();
+    let mut mem = String::new();
+    let mut swap = String::new();
+    let mut tasks = String::new();
+    let mut load = String::new();
+    let mut uptime = String::new();
+    let after = |l: &str, label: &str| {
+        l.find(label)
+            .map(|p| l[p + label.len()..].trim().to_string())
+    };
+    for l in lines {
+        cores.extend(core_percents(l));
+        if let Some(v) = meter_value(l, "Mem[") {
+            mem = v;
+        }
+        if let Some(v) = meter_value(l, "Swp[") {
+            swap = v;
+        }
+        // Tasks / Load sit to the RIGHT of the Mem / Swp meters on the same line,
+        // and Uptime is on its own — so match them as substrings, not prefixes.
+        if let Some(v) = after(l, "Tasks:") {
+            tasks = v;
+        }
+        if let Some(v) = after(l, "Load average:") {
+            load = v;
+        }
+        if let Some(v) = after(l, "Uptime:") {
+            uptime = v;
+        }
+    }
+    let cpu = if cores.is_empty() {
+        0.0
+    } else {
+        (cores.iter().sum::<f64>() / cores.len() as f64 * 10.0).round() / 10.0
+    };
+    serde_json::json!({
+        "cpu_pct": cpu, "cores": cores.len(),
+        "mem": mem, "swap": swap, "tasks": tasks, "load": load, "uptime": uptime,
+    })
+}
+
+/// Each htop CPU meter ends `…X.X%]`; pull the percentages out of a line (a line
+/// can hold several cores). Non-CPU meters (Mem/Swp) end `…]` without `%`, so
+/// they don't match.
+fn core_percents(line: &str) -> Vec<f64> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find("%]") {
+        let end = from + rel; // index of '%'
+        let mut start = end;
+        while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'.') {
+            start -= 1;
+        }
+        if start < end {
+            if let Ok(v) = line[start..end].parse::<f64>() {
+                out.push(v);
+            }
+        }
+        from = end + 2;
+    }
+    out
+}
+
+/// The value htop shows at the right of a meter, e.g. `Mem[|||2.27G/3.83G]` →
+/// `2.27G/3.83G`.
+fn meter_value(line: &str, prefix: &str) -> Option<String> {
+    let inner = line.split_once(prefix)?.1;
+    // Up to the meter's own closing ']', which may be mid-line (Tasks/Load
+    // follow it), then drop the leading bar/spaces to leave just the value.
+    let inner = inner.split_once(']').map(|(a, _)| a).unwrap_or(inner);
+    Some(inner.trim_start_matches(['|', ' ']).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -608,5 +857,91 @@ mod tests {
         .is_err());
         assert!(validate("other.v1", &ts(1)).is_err());
         assert!(validate("taskscope.v1", &ts(MAX_WORKERS + 1)).is_err());
+    }
+
+    // A real `tmux capture-pane -p` of htop (trimmed), including the meters, the
+    // "CPU%-MEM%" sort-marker glitch in the header, a command with spaces, and
+    // the function-key footer.
+    const HTOP: &str = "\
+    0[|||||||                                        10.1%]   4[||||||       7.6%]
+    1[||||||                                          8.8%]   5[||||||       8.1%]
+  Mem[|||||||||||||||||||||||||||||||||||||||||2.27G/3.83G] Tasks: 13, 10 thr, 0 kthr; 2 running
+  Swp[|||||||||||||||||||||||||||||||||||||||||||430M/512M] Load average: 1.15 0.72 0.69
+                                                            Uptime: 01:06:41
+
+  [Main] [I/O]
+  PID USER       PRI  NI  VIRT   RES   SHR S  CPU%-MEM%   TIME+  Command
+    1 root        20   0  817M 10720  7736 S   0.0  0.3  0:04.36 /workspaces/remux/target/debug/remux serve --listen 0.0
+ 2243 root        20   0  4624  3080  2300 R   0.5  0.1  0:00.00 htop
+F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortByF7Nice -F8Nice +F9Kill  F10Quit";
+
+    #[test]
+    fn parse_htop_reads_the_process_table_and_summary() {
+        let v = parse_htop(HTOP);
+        assert_eq!(v["confidence"], "ok");
+        let ps = v["processes"].as_array().unwrap();
+        assert_eq!(
+            ps.len(),
+            2,
+            "the footer and blank/meter lines are not processes"
+        );
+
+        assert_eq!(ps[0]["pid"], 1);
+        assert_eq!(ps[0]["user"], "root");
+        assert_eq!(ps[0]["cpu"], 0.0);
+        assert_eq!(ps[0]["mem"], 0.3);
+        assert_eq!(ps[0]["res"], "10720");
+        assert_eq!(ps[0]["time"], "0:04.36");
+        // The command keeps its spaces (it is the remainder, not a token).
+        assert_eq!(
+            ps[0]["command"],
+            "/workspaces/remux/target/debug/remux serve --listen 0.0"
+        );
+
+        assert_eq!(ps[1]["pid"], 2243);
+        assert_eq!(ps[1]["cpu"], 0.5);
+        assert_eq!(ps[1]["command"], "htop");
+
+        let s = &v["summary"];
+        assert_eq!(s["cores"], 4); // two meter lines × two cores
+        assert_eq!(s["mem"], "2.27G/3.83G");
+        assert_eq!(s["load"], "1.15 0.72 0.69");
+        assert_eq!(s["uptime"], "01:06:41");
+        assert!(s["tasks"].as_str().unwrap().contains("13"));
+    }
+
+    // A NARROW pane (≈64 cols, a phone driving the size): htop drops the Command
+    // column. We should still parse the visible columns, command empty.
+    const HTOP_NARROW: &str = "\
+  Mem[||||||||||||||||||||||1.9G/3.8G] Tasks: 40, 1 thr; 1 running
+  PID USER       PRI  NI  VIRT   RES   SHR S  CPU%-MEM%   TIME+
+    1 root        20   0  883M 19812 17080 S   0.4  0.5  0:00.68
+   18 root        20   0  8268  3828  2784 S   0.1  0.1  0:00.17
+F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortBy";
+
+    #[test]
+    fn parse_htop_tolerates_a_narrow_pane_without_the_command_column() {
+        let v = parse_htop(HTOP_NARROW);
+        assert_eq!(
+            v["confidence"], "ok",
+            "still parses without a Command column"
+        );
+        let ps = v["processes"].as_array().unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0]["pid"], 1);
+        assert_eq!(ps[0]["cpu"], 0.4);
+        assert_eq!(ps[0]["mem"], 0.5);
+        assert_eq!(ps[0]["res"], "19812");
+        assert_eq!(ps[0]["command"], ""); // no Command column at this width
+    }
+
+    #[test]
+    fn parse_htop_is_low_confidence_on_non_htop_and_never_invents_rows() {
+        let v = parse_htop("just some\nrandom terminal output\n$ ls\n");
+        assert_eq!(v["confidence"], "low");
+        assert_eq!(v["processes"].as_array().unwrap().len(), 0);
+        // Valid as an htop.v1 payload (processes is an array), so the socket path
+        // and the renderer agree on the shape.
+        assert!(validate("htop.v1", &v).is_ok());
     }
 }

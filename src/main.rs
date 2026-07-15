@@ -297,6 +297,8 @@ async fn main() -> Result<()> {
     shell::spawn(app.clone(), &state_dir)?;
     // Pane views: the `remux stream` socket + topology-driven GC.
     paneview::spawn(app.clone(), &state_dir)?;
+    // Auto-capture real tools (htop) into a pane view — a lens over the pane.
+    paneview::spawn_capture(app.clone());
     server::run(app).await
 }
 

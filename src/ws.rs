@@ -438,6 +438,57 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Push this session's pane views (structured state a source streams for a
+    // pane, rendered by the PWA as a custom interface) and keep them reconciled.
+    // Session-filtered like the feed — only panes in *this* session — and
+    // debounced to coalesce a fast source. A full-set frame each time so
+    // add/update/remove all reconcile client-side.
+    let paneview_task = tokio::spawn({
+        let mut rx = app.pane_views.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let session = session.clone();
+        async move {
+            let mut last_sent: Option<String> = None;
+            loop {
+                // Pane ids that belong to this session right now.
+                let session_panes: std::collections::HashSet<String> = app
+                    .topology
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.name == session)
+                    .flat_map(|s| s.windows.iter())
+                    .flat_map(|w| w.panes.iter())
+                    .map(|p| p.id.clone())
+                    .collect();
+                let views: Vec<_> = app
+                    .pane_views
+                    .snapshot()
+                    .into_iter()
+                    .filter(|v| session_panes.contains(&v.pane))
+                    .collect();
+                let is_empty = views.is_empty();
+                let json = serde_json::json!({ "type": "pane_views", "views": views }).to_string();
+                // Send on change; stay quiet on a fresh empty connection, but do
+                // send an empty set to clear a previously-sent one.
+                if last_sent.as_deref() != Some(json.as_str()) && (!is_empty || last_sent.is_some())
+                {
+                    if out.send(Message::Text(json.clone().into())).await.is_err() {
+                        break;
+                    }
+                    last_sent = Some(json);
+                }
+                match rx.recv().await {
+                    Ok(()) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                while matches!(rx.try_recv(), Ok(())) {}
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -587,6 +638,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     attention_task.abort();
     permits_task.abort();
     feed_task.abort();
+    paneview_task.abort();
     revoke_task.abort();
     topology_task.abort();
     sender.abort();

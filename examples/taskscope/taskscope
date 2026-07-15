@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# taskscope — a tiny demo monitor ("our own htop") for remux.
+#
+# Default: a live fleet dashboard in the terminal (view it raw in the PWA).
+# --json: emit the SAME state as newline-delimited JSON (one object per tick),
+#         so a remux plugin can render a custom PWA interface from clean
+#         structured data instead of scraping the TUI.
+# --once: render/emit a single frame and exit (handy for testing).
+#
+# No dependencies — pure bash. Runs in the remux container:
+#   /workspaces/remux/examples/taskscope/taskscope
+set -u
+
+INTERVAL="${TASKSCOPE_INTERVAL:-1}"
+JSON=0; ONCE=0
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --once) ONCE=1 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "taskscope: unknown option $a" >&2; exit 2 ;;
+  esac
+done
+
+WORKERS=(api-gateway indexer web-1 web-2 scheduler backup)
+STATUS=(running running idle running idle done)
+CPU=(12 44 8 30 3 0)
+MEM=(120 512 90 140 40 20)
+PROG=(0 62 0 41 0 100)
+
+tick=0
+esc=$'\033'
+hide="${esc}[?25l"; show="${esc}[?25h"; home="${esc}[H"; clr="${esc}[2J"
+bold="${esc}[1m"; dim="${esc}[2m"; reset="${esc}[0m"
+green="${esc}[32m"; red="${esc}[31m"; cyan="${esc}[36m"; grey="${esc}[90m"
+
+cleanup() { printf '%s%s' "$show" "$reset"; exit 0; }
+trap cleanup INT TERM
+rnd() { echo $(( RANDOM % $1 )); }
+
+step() {
+  local i
+  for i in "${!WORKERS[@]}"; do
+    case "${STATUS[$i]}" in
+      running)
+        CPU[$i]=$(( (CPU[i]*3 + $(rnd 90) + 5) / 4 ))
+        MEM[$i]=$(( MEM[i] + $(rnd 7) - 3 )); (( MEM[i] < 10 )) && MEM[$i]=10
+        PROG[$i]=$(( PROG[i] + $(rnd 6) ))
+        if (( PROG[i] >= 100 )); then PROG[$i]=100; STATUS[$i]=done; CPU[$i]=0; fi
+        (( $(rnd 45) == 0 )) && STATUS[$i]=error
+        ;;
+      idle)
+        CPU[$i]=$(( CPU[i] > 2 ? CPU[i]-2 : $(rnd 3) ))
+        (( $(rnd 6) == 0 )) && STATUS[$i]=running
+        ;;
+      done)
+        (( $(rnd 12) == 0 )) && { STATUS[$i]=running; PROG[$i]=0; }
+        ;;
+      error)
+        CPU[$i]=0
+        (( $(rnd 5) == 0 )) && STATUS[$i]=running
+        ;;
+    esac
+    (( CPU[i] > 100 )) && CPU[$i]=100
+  done
+}
+
+bar() { # value width
+  local v=$1 w=$2 fill i out=""
+  fill=$(( v * w / 100 ))
+  for ((i=0;i<w;i++)); do (( i < fill )) && out+="#" || out+="."; done
+  printf '%s' "$out"
+}
+
+color_for() {
+  case "$1" in
+    running) printf '%s' "$green" ;; idle) printf '%s' "$grey" ;;
+    done) printf '%s' "$cyan" ;; error) printf '%s' "$red" ;;
+  esac
+}
+
+render_tui() {
+  local i c
+  printf '%s' "$home"
+  printf '%s%s taskscope%s  %sdemo monitor%s            uptime %ds  \n' \
+    "$bold" "$cyan" "$reset" "$dim" "$reset" "$tick"
+  printf '%s\n' "──────────────────────────────────────────────────────────"
+  printf '%s%-13s %-8s %5s %7s  %-16s %s%s\n' \
+    "$dim" "WORKER" "STATUS" "CPU%" "MEM" "PROGRESS" "" "$reset"
+  for i in "${!WORKERS[@]}"; do
+    c=$(color_for "${STATUS[$i]}")
+    printf '%-13s %s%-8s%s %4d%% %6dM  %s%s%s %3d%%  \n' \
+      "${WORKERS[$i]}" "$c" "${STATUS[$i]}" "$reset" \
+      "${CPU[$i]}" "${MEM[$i]}" "$c" "$(bar "${PROG[$i]}" 16)" "$reset" "${PROG[$i]}"
+  done
+  printf '%s\n' "──────────────────────────────────────────────────────────"
+  printf '%sCtrl-C to quit · remux demo tool · try --json for structured state%s  \n' \
+    "$dim" "$reset"
+}
+
+emit_json() {
+  local i first=1
+  printf '{"t":%d,"workers":[' "$tick"
+  for i in "${!WORKERS[@]}"; do
+    (( first )) || printf ','; first=0
+    printf '{"name":"%s","status":"%s","cpu":%d,"mem":%d,"progress":%d}' \
+      "${WORKERS[$i]}" "${STATUS[$i]}" "${CPU[$i]}" "${MEM[$i]}" "${PROG[$i]}"
+  done
+  printf ']}\n'
+}
+
+if (( JSON )); then
+  while :; do emit_json; (( ONCE )) && break; tick=$((tick+1)); step; sleep "$INTERVAL"; done
+else
+  printf '%s%s' "$hide" "$clr"
+  while :; do
+    render_tui
+    (( ONCE )) && cleanup
+    tick=$((tick+1)); step; sleep "$INTERVAL"
+  done
+fi

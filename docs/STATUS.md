@@ -60,19 +60,30 @@ editing, M4b decision/EOF race) now have real tests.
   full-screen). WebGL renderer + debounced sizing underneath (font = tmux
   resolution). **M3 control-mode arc complete.**
 
-## Publishing v0.2.0 (in progress 2026-07-15)
+## Publishing v0.2.0 (2026-07-15)
 
-v0.1.0's draft release is 63 commits stale (predates the whole M4 layer + the
-three hardening tiers), so we're cutting a fresh **v0.2.0** from HEAD rather
-than publishing it. Version bumped, README/docs reconciled; tag `v0.2.0` drives
-release CI (4-platform tarballs/.debs, SHA256SUMS, filled Homebrew formula,
-sigstore attestations) into a new draft. Two public-facing flips left, held for
-the user's explicit go:
+v0.1.0's draft was 63 commits stale (predated the whole M4 layer + the three
+hardening tiers), so we cut a fresh **v0.2.0** from HEAD. Prep done and verified:
 
-1. Publish the draft **v0.2.0** GitHub release (after CI green + verify).
-2. Create the `jorgeamado/homebrew-remux` tap repo and drop the release's
-   generated `remux.rb` into `Formula/` → makes `brew install` real.
-3. Bin the stale v0.1.0 draft.
+- version bumped (Cargo.toml/lock), README filled (What-you-get list, badges,
+  demo placeholder `docs/media/demo-placeholder.svg`, FAQ, Contributing/License),
+  approval docs reconciled to the plugin path;
+- CI actions flagged for Node-20 bumped to node24 majors (gitleaks v2→v3,
+  attest-build-provenance v2→v4, upload-artifact v4→v7, download-artifact
+  v4→v8) — re-cut release run is warning-free;
+- stale v0.1.0 draft binned;
+- **draft v0.2.0 built green** (4 platforms + full CI gate) with the polished
+  README bundled; shipped macOS-arm64 artifact smoke-tested (boots, serves 200,
+  `/api` 401);
+- `jorgeamado/homebrew-remux` tap created + populated (README + `Formula/
+  remux.rb`, checksums synced to the re-cut build);
+- `main` branch-protected: PR + `test`/`security` checks required, force-push &
+  deletion blocked, admins may bypass.
+
+One public flip left, held for the user's explicit go:
+
+1. **Publish the draft v0.2.0 release** → tarballs/.debs become downloadable and
+   the tap's formula URLs resolve, making `brew install remux` real.
 
 ## Active: M4 — semantic layer (started 2026-07-13)
 

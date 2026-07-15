@@ -10,3 +10,6 @@
 /target-host
 /web/test-results
 test-results/
+
+# Claude Code local worktrees/state
+.claude/

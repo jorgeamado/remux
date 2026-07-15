@@ -3,33 +3,62 @@
 > Uncommitted working note (per request). Point-in-time picture of where the
 > project is and what's planned. The durable plan is `docs/PLAN.md`.
 
-## M5 pane views — slice 1 VERIFIED ON DEVICE (2026-07-15)
+## M5 pane views / custom dashboards — VERIFIED ON DEVICE (2026-07-15)
 
-remux can now render a **custom PWA interface for a pane** from structured
-state a *source* streams — the `source → remux → custom renderer` pipe. First
-slice done on branch `feat/pane-view` (NOT merged), Codex-reviewed across three
-rounds (7 findings → fixed → 2 more → fixed → clean):
+remux can render a **custom, phone-adapted PWA interface for a pane** — a
+"semantic lens" over the pane, the terminal always one tap away. On branch
+`feat/pane-view` (NOT merged), ~2.7k lines, multiple Codex review rounds.
+Architecture (Codex-guided): compiled-in renderers over a versioned schema (NO
+third-party JS), terminal stays canonical, one pane-view registry that any
+*source* feeds.
 
-- `examples/taskscope/taskscope` — a dependency-free demo monitor (our own
-  htop): live TUI, plus `--json` structured stream.
-- `remux stream --view <id>` + a dedicated persistent `pane-view.sock`: a source
-  claims a pane (verified against topology), streams NDJSON snapshots;
-  latest-state-per-pane registry, one view per pane, EOF + topology-GC cleanup,
-  size/rate/shape caps. (`paneview.rs`, 6 unit + 3 integration tests.)
-- WS `pane_views` frame: session-filtered, topology-aware wake, reconcile.
-- PWA: hard-coded `taskscope.v1` card renderer + Terminal/Dashboard toggle
-  (dashboard releases terminal control so the hidden xterm can't drive size;
-  overlay scrolls natively).
-- Also fixed a latent bug: static assets had **no cache headers**, so browsers
-  pinned a stale `index.html` and never loaded new deploys — now the shell/sw
-  revalidate and hashed assets are immutable.
+**The pipe** — `source → remux (pane_views registry) → session-filtered WS frame
+→ compiled-in PWA renderer`, with a Terminal/Dashboard toggle:
+- `remux stream --view <id>` + a dedicated persistent `pane-view.sock`: latest-
+  state-per-pane registry, one view/pane, EOF + topology-GC cleanup, size/rate/
+  shape caps.
 
-On-device (iPhone, `remux-mobile` container): ran `taskscope --json | remux
-stream --view taskscope.v1`, tapped **Dashboard**, saw live scrollable worker
-cards. Architecture per the Codex review: compiled-in renderer (no third-party
-JS), terminal stays canonical, popup/agent-source deferred.
-Next options: a `/proc` "real htop" source, the generic popup primitive, or an
-agent-window source.
+**Two source kinds proven:**
+- **`taskscope`** (`examples/taskscope`) — our demo monitor; run it plain and it
+  self-streams to remux (bg process-sub) so a Dashboard appears with no piping.
+- **htop capture adapter** — the daemon auto-detects a pane running `htop`
+  (topology `pane_current_command`) and reads its RENDERED screen via
+  `tmux capture-pane` on a timer, parses the visible process table + meters into
+  `htop.v1` (tolerant, visible-slice-only, low-confidence fallback). No /proc,
+  no reimplementation — uses htop's own output.
+
+**Dashboard "capture resolution"**: entering the dashboard forces that pane's
+window to 210×60 (window-size manual) so a full-screen tool exposes all
+columns/rows for the capture; restored to `latest` on leave/disconnect. Terminal
+hidden then, so the oversized render is invisible.
+
+**Interactions** — the phone sends a *whitelisted semantic action*, the daemon
+maps it to the tool's real keys and `tmux send-keys` (never raw keystrokes),
+only for an htop pane in the client's session:
+- sort CPU/MEM/TIME (P/M/T) + invert (I), tree (F5), filter (F4+clear+text+Enter,
+  control-stripped/capped), kill:<pid> (SIGTERM, gated to a pid in the pane's
+  captured view, behind a confirmation sheet).
+
+**htop UI redesign** (Codex-reviewed): instrument-panel — compact CPU/MEM bars,
+sticky filter/tree/sort toolbar, two-line rows with a 3px CPU rail, restrained
+color thresholds, stateful renderer that keeps the filter input focused across
+live updates.
+
+Also fixed a latent bug: static assets had no cache headers, so a stale
+`index.html` pinned the old JS bundle — now the shell/sw revalidate and hashed
+assets are immutable.
+
+On device (iPhone, `remux-mobile` container): taskscope dashboard, htop dashboard
+with command names (via capture-resolution), and sort/filter/kill all verified.
+Tree renders but is cosmetically rough at phone width (kept as-is). A final
+holistic Codex review (3 High + 2 Medium) has been addressed: every dashboard
+action now re-verifies htop still owns the pane before sending keys; the capture
+adapter is poll-driven and self-verifying (no stale tasks); kill is gated to
+approver devices AND a pid in the pane's captured view; ViewMode is gated to the
+client's own in-session pane with a live view; and the PWA re-sends `view_mode`
+and closes the kill sheet on any pane switch. Branch is merge-ready.
+Next options: `docker stats` (native-JSON command adapter — Codex's robust pick),
+the generic popup primitive, or an agent-window source.
 
 Repo: `github.com/jorgeamado/remux` (public); `main` builds green on CI. The M3
 control-mode arc and the whole M4 semantic layer (M4a attention → M4b approvals

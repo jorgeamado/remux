@@ -869,6 +869,8 @@ const dashboardPanel = $("dashboard-panel");
 const viewToggleBtn = $<HTMLButtonElement>("view-toggle-btn");
 let paneViews: PaneView[] = [];
 let dashboardMode = false;
+// The pane we've asked the daemon to hold at capture resolution (view_mode).
+let dashPane: string | null = null;
 
 /** The view for the pane we're actually looking at. Only falls back to the
  *  first available while topology is still unknown — otherwise a split could
@@ -889,6 +891,13 @@ function refreshPaneView(): void {
   if (v === undefined && dashboardMode) {
     setDashboard(false); // no view for this pane → fall back to the terminal
   } else if (dashboardMode) {
+    if (v && v.pane !== dashPane) {
+      // The active pane changed while in the dashboard — move the capture-size
+      // hold to the new window, and drop a now-stale kill sheet.
+      closeKillSheet();
+      dashPane = v.pane;
+      sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
+    }
     renderDashboard();
   }
 }
@@ -902,6 +911,7 @@ function onPaneViews(views: PaneView[]): void {
 function clearPaneViews(): void {
   paneViews = [];
   viewToggleBtn.hidden = true;
+  closeKillSheet();
   if (dashboardMode) setDashboard(false);
 }
 
@@ -918,9 +928,12 @@ function setDashboard(on: boolean): void {
     // Ask the daemon to render this pane at a big "capture resolution" so a
     // full-screen tool (htop) exposes all its info to the dashboard. The
     // terminal is hidden now, so the oversized render isn't seen.
-    sendJson({ type: "view_mode", pane: currentView()?.pane ?? "", dashboard: true });
+    dashPane = currentView()?.pane ?? "";
+    sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
     renderDashboard();
   } else {
+    closeKillSheet();
+    dashPane = null;
     sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
     handle.fit(); // terminal is visible again — remeasure the grid
   }
@@ -1190,10 +1203,19 @@ function htRow(p: Record<string, unknown>, pane: string): HTMLElement {
   return row;
 }
 
+// The open kill confirmation sheet, so it can be dropped when the dashboard is
+// left or the pane changes (its pid/pane closure would otherwise go stale).
+let killSheet: HTMLElement | null = null;
+function closeKillSheet(): void {
+  killSheet?.remove();
+  killSheet = null;
+}
+
 /** Deliberate, confirmed kill — never a one-tap action. */
 function openKillSheet(p: Record<string, unknown>, pane: string): void {
   const pid = Number(p.pid ?? 0);
   if (!pid) return;
+  closeKillSheet(); // only one at a time
   const bg = document.createElement("div");
   bg.className = "ht-sheet-bg";
   const sheet = document.createElement("div");
@@ -1214,7 +1236,7 @@ function openKillSheet(p: Record<string, unknown>, pane: string): void {
   const kill = document.createElement("button");
   kill.className = "btn ht-kill";
   kill.textContent = `Kill ${pid}`;
-  const close = (): void => bg.remove();
+  const close = (): void => closeKillSheet();
   cancel.addEventListener("click", close);
   bg.addEventListener("click", (e) => {
     if (e.target === bg) close();
@@ -1226,6 +1248,7 @@ function openKillSheet(p: Record<string, unknown>, pane: string): void {
   btns.append(cancel, kill);
   sheet.append(cmd, meta, btns);
   bg.appendChild(sheet);
+  killSheet = bg;
   $("app").appendChild(bg);
 }
 

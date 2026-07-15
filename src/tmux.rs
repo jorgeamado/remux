@@ -165,6 +165,46 @@ pub fn send_named(pane: &str, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// All panes whose *current* foreground command is one of `tools`, server-wide.
+/// A fresh poll — unlike topology's cached `pane_current_command`, which is not
+/// refreshed on a foreground-process change, so it can't be trusted to detect a
+/// tool starting/exiting.
+pub fn panes_running(tools: &[&str]) -> Result<std::collections::HashSet<String>> {
+    let mut c = tmux();
+    c.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id} #{pane_current_command}",
+    ]);
+    let out = run_optional(c)?.unwrap_or_default();
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let (id, cmd) = l.split_once(' ')?;
+            tools.contains(&cmd).then(|| id.to_string())
+        })
+        .collect())
+}
+
+/// The current foreground command of a pane (freshly polled), or `None` if the
+/// pane/server is gone. Used to re-verify a tool owns the pane before an action.
+pub fn pane_command(pane: &str) -> Option<String> {
+    let mut c = tmux();
+    c.args([
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_current_command}",
+    ]);
+    run_classified(c, true)
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The window id (`@N`) a pane belongs to — for window-scoped options.
 pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
     let mut c = tmux();

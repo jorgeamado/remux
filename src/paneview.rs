@@ -20,7 +20,7 @@
 //! users. This is a projection of a local program's state, not a security
 //! boundary.
 
-use crate::App;
+use crate::{tmux, App};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -46,6 +46,8 @@ pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1", "htop.v1"];
 const CAPTURE_TOOLS: &[&str] = &["htop"];
 /// How often the capture adapter re-reads a pane's screen.
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(1500);
+/// How often to poll which panes run a captured tool (start/stop capture tasks).
+const CAPTURE_POLL: Duration = Duration::from_millis(2000);
 /// Cap the process rows published from one htop capture.
 const MAX_PROCS: usize = 300;
 
@@ -294,11 +296,20 @@ pub fn parse_htop_action(action: &str) -> Option<HtopAction> {
 }
 
 /// Drive a non-kill htop action through tmux. Kill is handled by the caller
-/// (it needs a visibility check first).
+/// (it needs a capability + visibility check).
+///
+/// Re-verifies htop *currently* owns the pane immediately before sending keys:
+/// otherwise a stale view could type the filter text at a shell prompt (a
+/// command-execution path). The residual window is the few ms between this check
+/// and send-keys; the capture task drops the view within one tick of htop
+/// exiting, so a stale view is not durable.
 pub fn exec_htop_action(pane: &str, action: &HtopAction) -> Result<()> {
+    if tmux::pane_command(pane).as_deref() != Some("htop") {
+        return Ok(());
+    }
     match action {
-        HtopAction::Key(k) => crate::tmux::send_keys(pane, k),
-        HtopAction::Named(k) => crate::tmux::send_named(pane, &[k]),
+        HtopAction::Key(k) => tmux::send_keys(pane, k),
+        HtopAction::Named(k) => tmux::send_named(pane, &[k]),
         HtopAction::Filter(q) => htop_set_filter(pane, q),
         HtopAction::Kill(_) => Ok(()),
     }
@@ -378,27 +389,33 @@ pub fn validate(view: &str, state: &Value) -> Result<(), &'static str> {
 /// terminal stays the real tool; this is only a projection of visible state.
 pub fn spawn_capture(app: Arc<App>) {
     tokio::spawn(async move {
-        let mut rx = app.topology.subscribe();
         let mut tasks: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+        let mut poll = tokio::time::interval(CAPTURE_POLL);
         loop {
-            let want: HashSet<String> = rx
-                .borrow_and_update()
-                .iter()
-                .flat_map(|s| s.windows.iter())
-                .flat_map(|w| w.panes.iter())
-                .filter(|p| CAPTURE_TOOLS.contains(&p.command.as_str()))
-                .map(|p| p.id.clone())
-                .collect();
+            poll.tick().await;
+            // Fresh poll of which panes run a captured tool. topology's cached
+            // command is NOT refreshed on a foreground-process change, so it
+            // can't detect a tool starting/exiting — poll authoritatively.
+            let want =
+                match tokio::task::spawn_blocking(|| tmux::panes_running(CAPTURE_TOOLS)).await {
+                    Ok(Ok(w)) => w,
+                    _ => continue,
+                };
             for pane in &want {
-                if !tasks.contains_key(pane) {
+                // (Re)start if there's no task, or the last one exited (e.g. it
+                // lost the claim to a stream, or htop briefly stopped).
+                if tasks
+                    .get(pane)
+                    .is_none_or(tokio::task::AbortHandle::is_finished)
+                {
                     let app = app.clone();
                     let p = pane.clone();
                     let h = tokio::spawn(async move { capture_task(app, p).await });
                     tasks.insert(pane.clone(), h.abort_handle());
                 }
             }
-            // Stop tasks whose pane is no longer running the tool (aborting drops
-            // the task's ClaimGuard → the view is removed).
+            // Stop tasks whose pane no longer runs the tool (abort drops the
+            // task's ClaimGuard → the view is removed → action gates go false).
             tasks.retain(|pane, ah| {
                 let keep = want.contains(pane) && !ah.is_finished();
                 if !keep {
@@ -406,9 +423,6 @@ pub fn spawn_capture(app: Arc<App>) {
                 }
                 keep
             });
-            if rx.changed().await.is_err() {
-                break;
-            }
         }
     });
 }
@@ -422,11 +436,19 @@ async fn capture_task(app: Arc<App>, pane: String) {
     let mut ticker = tokio::time::interval(CAPTURE_INTERVAL);
     loop {
         ticker.tick().await;
+        // Authoritatively re-verify the pane still runs the tool before each
+        // capture, so the view (and every action gate keyed on it) drops the
+        // instant htop exits — no window where a stale view accepts actions.
         let p = pane.clone();
-        let captured = tokio::task::spawn_blocking(move || crate::tmux::capture_pane(&p)).await;
+        let still = tokio::task::spawn_blocking(move || tmux::pane_command(&p)).await;
+        if !matches!(&still, Ok(Some(c)) if CAPTURE_TOOLS.contains(&c.as_str())) {
+            break; // guard drop removes the view
+        }
+        let p = pane.clone();
+        let captured = tokio::task::spawn_blocking(move || tmux::capture_pane(&p)).await;
         let text = match captured {
             Ok(Ok(Some(t))) => t,
-            _ => continue, // pane gone / tmux error — the spawner will stop us
+            _ => continue,
         };
         guard.update(parse_htop(&text));
     }

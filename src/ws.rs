@@ -675,12 +675,26 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                 }
                 Ok(ClientMsg::ViewMode { pane, dashboard }) => {
                     // Force this pane's window to the big capture resolution while
-                    // the dashboard is shown, and restore it on leave/switch.
+                    // the dashboard is shown, and restore it on leave/switch. Only
+                    // a pane in THIS session that actually has a view may be
+                    // forced — else a client could resize another session's window.
                     let target = if dashboard {
-                        match tokio::task::spawn_blocking(move || tmux::window_of_pane(&pane)).await
-                        {
-                            Ok(Ok(w)) => w,
-                            _ => None,
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        let has_view = app.pane_views.view_of(&pane).is_some();
+                        if in_session && has_view {
+                            match tokio::task::spawn_blocking(move || tmux::window_of_pane(&pane))
+                                .await
+                            {
+                                Ok(Ok(w)) => w,
+                                _ => None,
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
@@ -715,8 +729,12 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     if in_session && is_htop {
                         match paneview::parse_htop_action(&action) {
                             Some(paneview::HtopAction::Kill(pid)) => {
-                                // Only kill a process the dashboard is showing.
-                                if app.pane_views.pane_has_pid(&pane, pid) {
+                                // Killing is destructive → require the host-granted
+                                // `approve` capability (not just any paired device),
+                                // and only a pid the dashboard is actually showing.
+                                if app.auth.can_approve(&device.id)
+                                    && app.pane_views.pane_has_pid(&pane, pid)
+                                {
                                     let _ = tokio::task::spawn_blocking(move || {
                                         paneview::kill_process(pid)
                                     })
@@ -724,6 +742,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                 }
                             }
                             Some(act) => {
+                                // exec re-verifies htop owns the pane right before
+                                // sending keys (a stale view must not type at a shell).
                                 let p = pane.clone();
                                 let _ = tokio::task::spawn_blocking(move || {
                                     paneview::exec_htop_action(&p, &act)

@@ -167,6 +167,46 @@ async fn full_terminal_flow_over_tmux() {
         .unwrap();
     collect_output_until(&mut ws, "remux2marker").await;
 
+    // --- Composer tab-completion round-trip: the daemon types the draft into
+    // the shell, presses Tab, and echoes the completed line back. A directory
+    // with a single uniquely-prefixed file makes the completion deterministic
+    // in any shell. ---
+    let dir = std::env::temp_dir().join(format!("remuxtab-{}", common::rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("remuxtab_target.txt"), b"x").unwrap();
+    ws.send(WsMsg::binary(
+        format!("cd '{}' && echo cd$((3+3))ok\r", dir.display()).into_bytes(),
+    ))
+    .await
+    .unwrap();
+    collect_output_until(&mut ws, "cd6ok").await;
+    // Let the prompt redraw before the daemon measures the cursor column.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "tab_complete", "text": "cat remuxtab_", "synced": ""})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    // Skip unrelated control frames (topology updates from the cd) but treat
+    // an error frame as the verdict.
+    let reply = loop {
+        let v = next_json(&mut ws).await;
+        if v["type"] == "tab_completed" || v["type"] == "error" {
+            break v;
+        }
+    };
+    assert_eq!(reply["type"], "tab_completed", "unexpected: {reply}");
+    let completed = reply["text"].as_str().unwrap();
+    assert_eq!(
+        completed.trim_end(),
+        "cat remuxtab_target.txt",
+        "unexpected completion: {completed:?}"
+    );
+    // Clear the pending shell line so later steps type on a clean prompt.
+    ws.send(WsMsg::binary(b"\x15".to_vec())).await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
     // Resize: as the latest active client we should drive the window size.
     ws.send(WsMsg::text(
         serde_json::json!({"type": "resize", "cols": 90, "rows": 28}).to_string(),

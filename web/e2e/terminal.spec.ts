@@ -3,7 +3,7 @@
 
 import { test, expect, type Page } from "@playwright/test";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -220,6 +220,32 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("composed6ok");
   expect(await page.locator("#composer-input").inputValue()).toBe("");
+
+  // --- Composer Tab: the shell completes the draft AND the completed line is
+  // echoed back into the input field (not just shown in the terminal). A
+  // directory with a single uniquely-prefixed file makes it deterministic. ---
+  const tabDir = mkdtempSync(join(tmpdir(), "remux-tab-"));
+  writeFileSync(join(tabDir, "e2etab_target.txt"), "e2etab-file-contents");
+  await page.locator("#composer-input").fill(`cd '${tabDir}' && echo tab$((2+2))ready`);
+  await page.locator("#composer-input").press("Enter");
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("tab4ready");
+  await page.locator("#composer-input").fill("cat e2etab_");
+  await page.locator("#composer-input").press("Tab");
+  await expect
+    .poll(async () => page.locator("#composer-input").inputValue(), { timeout: 10_000 })
+    .toContain("cat e2etab_target.txt");
+  // Submitting the mirrored line runs it (the shell already holds it — the
+  // client sends just Enter).
+  await page.locator("#composer-input").press("Enter");
+  await expect
+    .poll(async () => terminalText(page), { timeout: 10_000 })
+    .toContain("e2etab-file-contents");
+  expect(await page.locator("#composer-input").inputValue()).toBe("");
+  // Back out of the temp dir so later steps see the usual cwd.
+  await page.locator("#composer-input").fill("cd -");
+  await page.locator("#composer-input").press("Enter");
 
   // --- The composer chevron collapses and restores the key panel. ---
   await page.locator("#keys-toggle").click();

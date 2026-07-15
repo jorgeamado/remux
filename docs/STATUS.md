@@ -157,6 +157,7 @@ editing, M4b decision/EOF race) now have real tests.
       --tls-cert /certs/georges-macbook-air.shrew-fort.ts.net.crt \
       --tls-key /certs/georges-macbook-air.shrew-fort.ts.net.key'
   docker exec remux-mobile npm install -g @anthropic-ai/claude-code   # ephemeral fs → reinstall
+  docker exec remux-mobile ln -sf /workspaces/remux/target/debug/remux /usr/local/bin/remux  # PATH symlink (hooks call bare `remux`)
   ```
   `CLAUDE_CONFIG_DIR` points at the bind-mounted repo so Claude Code's login
   persists across recreates; `.devcontainer/data/` is gitignored. Claude Code

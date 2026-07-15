@@ -11,7 +11,12 @@ import { fileURLToPath } from "node:url";
 const PORT = 7900 + Math.floor(Math.random() * 100);
 const BASE = `http://127.0.0.1:${PORT}`;
 const SOCK = `remux-e2e-${process.pid}`;
-const BIN = join(dirname(fileURLToPath(import.meta.url)), "../../target/debug/remux");
+// Overridable because target/debug/remux is sometimes the *Linux* binary:
+// the remux-mobile container execs it from the bind mount, so deploys copy
+// a cross-build there (see docs/STATUS.md "deploy hazard").
+const BIN =
+  process.env.REMUX_BIN ??
+  join(dirname(fileURLToPath(import.meta.url)), "../../target/debug/remux");
 
 let daemon: ChildProcess;
 let pairToken: string;
@@ -64,7 +69,10 @@ test.afterAll(() => {
 });
 
 async function terminalText(page: Page): Promise<string> {
-  return (await page.locator(".xterm-rows").textContent()) ?? "";
+  // Renderer-independent: the WebGL renderer leaves .xterm-rows empty.
+  return await page.evaluate(
+    () => (window as unknown as { __termText?: () => string }).__termText?.() ?? ""
+  );
 }
 
 test("pair, observe, take control, run a command, reconnect", async ({ page }) => {
@@ -77,26 +85,10 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect(page.locator("#session-name")).toHaveText("e2emain");
   await expect(page.locator("#setup")).toBeHidden();
 
-  // Observer fit-width toggle is offered (and remembered).
-  await expect(page.locator("#fit-btn")).toBeVisible();
-  await page.locator("#fit-btn").click();
-  await expect(page.locator("#fit-btn")).toHaveClass(/on/);
-  await page.locator("#fit-btn").click();
-  await expect(page.locator("#fit-btn")).not.toHaveClass(/on/);
-
   // The tmux repaint (shell prompt) reaches the terminal.
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("$");
-
-  // The tmux status row is clipped out of view by default: the terminal box
-  // extends past its container's bottom edge by one cell row.
-  const clipped = await page.evaluate(() => {
-    const t = document.getElementById("terminal")!.getBoundingClientRect();
-    const b = document.getElementById("termbox")!.getBoundingClientRect();
-    return b.bottom - t.bottom;
-  });
-  expect(clipped).toBeGreaterThan(0);
 
   // Observer swipe: scrolls tmux history (copy-mode) WITHOUT taking control
   // (glancing at a session must not resize it under the desktop user).
@@ -153,10 +145,22 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#composer-input").fill("echo e2e$((1+1))marker");
   await page.locator("#composer-input").press("Enter");
   await expect(roleChip).toContainText("Controller");
-  await expect(page.locator("#fit-btn")).toBeHidden(); // controller: real grid
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("e2e2marker");
+
+  // --- Font size (A- / A+) is the tmux resolution: a smaller font must fit
+  // MORE columns in the same width (renderer-independent check). ---
+  const cols = () =>
+    page.evaluate(
+      () => (window as unknown as { __termCols: () => number }).__termCols()
+    );
+  await page.locator("#menu-btn").click();
+  const beforeCols = await cols();
+  await page.locator("#font-dec").click();
+  await expect.poll(cols, { timeout: 3_000 }).toBeGreaterThan(beforeCols);
+  await page.locator("#font-inc").click(); // restore
+  await page.locator("#menu-btn").click(); // close menu
 
   // Touch default: direct typing is off — terminal taps never focus xterm's
   // textarea (no on-screen keyboard).
@@ -176,7 +180,8 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
 
-  // --- Windows: create a second window via the + menu, then switch back. ---
+  // --- Windows: create a second window via the + menu; the live topology
+  // (M3a) surfaces it as a tab (M3b), then switch back via the tabs. ---
   await page.locator("#tmux-btn").click();
   await expect(page.locator("#tmux-menu")).toBeVisible();
   await page.locator("#tmux-menu .btn", { hasText: "New window" }).click();
@@ -184,12 +189,19 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .not.toContain("direct4typing");
-  await page.locator("#tmux-btn").click();
-  await expect(page.locator("#tmux-menu")).toContainText("Windows");
-  await page.locator("#tmux-menu .btn", { hasText: "0:" }).click();
+
+  // The tab strip renders from topology with no polling: two tabs appear.
+  await expect(page.locator("#window-tabs")).toBeVisible();
+  await expect(page.locator("#window-tabs .wtab")).toHaveCount(2);
+  // The active tab is the new window; tap window 0's tab to switch back.
+  await page.locator("#window-tabs .wtab", { hasText: /^0:/ }).click();
   await expect
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
+  // After switching, window 0's tab is the active one.
+  await expect(
+    page.locator("#window-tabs .wtab.active")
+  ).toHaveText(/^0:/);
 
   // --- Key row: ^C lives in the "…" overflow row. ---
   await page.locator("#more-key").click();
@@ -297,7 +309,8 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#menu-btn").click();
   await expect(page.locator("#menu")).toBeVisible();
   await page.locator("#font-inc").click();
-  expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("15");
+  // Default is 10; the earlier A-/A+ test restored it, so +1 here → 11.
+  expect(await page.evaluate(() => localStorage.getItem("remux.font"))).toBe("11");
   await expect(page.locator("#notify-btn")).toHaveText("Notifications: off");
   await expect(page.locator("#termkb-btn")).toHaveText("Direct typing: on");
   await page.locator("#conn-status").click();

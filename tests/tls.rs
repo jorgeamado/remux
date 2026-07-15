@@ -19,7 +19,7 @@ async fn https_listener_serves_health() {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Grab a free port (small race window; fine for a test).
     let port = {
@@ -51,6 +51,10 @@ async fn https_listener_serves_health() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     tokio::spawn(async move {
         if let Err(e) = remux::server::run(app).await {

@@ -31,21 +31,33 @@
       <div id="control-banner" hidden>
         <span id="control-text" class="chip">Observer</span>
         <span class="flex-spacer"></span>
-        <button id="fit-btn" class="btn" hidden>Fit</button>
         <button id="tmux-btn" class="btn">+</button>
         <button id="control-btn" class="btn primary">Take control</button>
         <button id="menu-btn" class="btn" hidden>aA</button>
       </div>
+
+      <nav id="window-tabs" hidden></nav>
+      <nav id="pane-tabs" hidden></nav>
+
+      <!-- M4b: agent permission cards (Approve/Deny). Populated from the WS
+           permission_cards frame; approve-capable devices only. -->
+      <div id="permission-cards" hidden></div>
 
       <div id="menu" hidden>
         <button id="font-dec" class="btn">A&minus; smaller</button>
         <button id="font-inc" class="btn">A+ larger</button>
         <button id="paste-btn" class="btn">Paste</button>
         <button id="notify-btn" class="btn">Notifications: off</button>
-        <button id="status-btn" class="btn">tmux bar: hidden</button>
         <button id="termkb-btn" class="btn">Direct typing: off</button>
+        <button id="feed-btn" class="btn">Command feed</button>
         <button id="devices-btn" class="btn">Devices</button>
+        <button id="debug-btn" class="btn">Debug: off</button>
       </div>
+
+      <!-- M4c: the shell command feed for this session (metadata only). -->
+      <div id="command-feed-panel" hidden></div>
+
+      <pre id="debug-overlay" hidden></pre>
 
       <div id="devices-menu" hidden></div>
 
@@ -69,6 +81,7 @@
         <input id="composer-input" type="text" enterkeyhint="send"
                autocomplete="off" autocapitalize="off" autocorrect="off"
                spellcheck="false" placeholder="Type a command…" />
+        <button id="composer-hist" class="btn" title="previous command">&#x25B4;</button>
         <button id="composer-send" class="btn primary">&#x27A4;</button>
         <button id="keys-toggle" class="btn">&#x2304;</button>
       </div>

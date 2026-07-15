@@ -1,7 +1,7 @@
 use crate::{auth::PairError, ws, App};
 use anyhow::Result;
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, HeaderMap, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,6 +26,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/attention", get(attention_pending))
+        .route("/api/permissions", get(permissions_pending))
+        .route("/api/permissions/{id}/decide", post(permission_decide))
         .route("/api/devices", get(devices))
         .route("/ws", any(ws::handler))
         .fallback(static_handler)
@@ -103,7 +105,14 @@ async fn push_unsubscribe(
     let Some(device) = bearer_device(&app, &headers) else {
         return (StatusCode::UNAUTHORIZED, "device token required").into_response();
     };
-    app.push.unsubscribe(&device.id, &req.endpoint);
+    if let Err(e) = app.push.unsubscribe(&device.id, &req.endpoint) {
+        tracing::error!("failed to persist unsubscribe: {e:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not persist unsubscribe",
+        )
+            .into_response();
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -116,10 +125,119 @@ async fn attention_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> R
     }
     let mut pending = app.pending_attention.lock().unwrap();
     let now = std::time::Instant::now();
-    pending.retain(|_, t| now.duration_since(*t) < PENDING_TTL);
+    pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_TTL);
+    // Info on purpose: this is how we tell "service worker never asked"
+    // from "asked but showed generic text" when debugging notifications.
+    tracing::info!(pending = pending.len(), "attention details served");
     let mut sessions: Vec<&String> = pending.keys().collect();
     sessions.sort();
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    // `details` is additive; `sessions` stays for older clients. Freshest
+    // first — the service worker names the most recent event in the
+    // notification it shows for a payload-less push.
+    // Sort by the Instant, not by whole-second age: same-second events would
+    // otherwise inherit HashMap iteration order and "freshest" would lie.
+    let mut by_time: Vec<(&std::time::Instant, &crate::Attention)> =
+        pending.values().map(|(t, a)| (t, a)).collect();
+    by_time.sort_by(|(a, _), (b, _)| b.cmp(a));
+    let details: Vec<serde_json::Value> = by_time
+        .iter()
+        .map(|(t, a)| {
+            let mut v = serde_json::to_value(a).unwrap_or_default();
+            v["age_secs"] = now.duration_since(**t).as_secs().into();
+            v
+        })
+        .collect();
+    Json(serde_json::json!({ "sessions": sessions, "details": details })).into_response()
+}
+
+/// Open agent permission cards (M4b), for the PWA to render Approve/Deny.
+/// Approve-capable devices only — the command/path in a card is sensitive, so
+/// a non-approve device gets an empty list (no details, no existence leak),
+/// mirroring what its websocket receives.
+async fn permissions_pending(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    let cards = if app.auth.can_approve(&device.id) {
+        app.perms
+            .snapshot()
+            .iter()
+            .map(|c| c.view())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::json!({ "cards": cards })).into_response()
+}
+
+#[derive(Deserialize)]
+struct DecideRequest {
+    decision: String,
+}
+
+/// Resolve a permission card. The canonical decision op (the websocket only
+/// *delivers* cards). Approve-gated; the capability is re-checked under the
+/// registry lock at the moment of decision. Reports success only once the
+/// decision has been written to the live hook socket (not a guaranteed
+/// end-to-end ACK) — a decision that raced the hook's socket closing returns
+/// 409, not a false "approved".
+async fn permission_decide(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<DecideRequest>,
+) -> Response {
+    let Some(device) = bearer_device(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    };
+    if !app.auth.can_approve(&device.id) {
+        return (StatusCode::FORBIDDEN, "approve capability required").into_response();
+    }
+    let Some(decision) = crate::permit::Decision::parse(&req.decision) else {
+        return (StatusCode::BAD_REQUEST, "decision must be allow or deny").into_response();
+    };
+    let device_id = device.id.clone();
+    match app
+        .perms
+        .resolve(&id, decision, || app.auth.can_approve(&device_id))
+    {
+        Ok((card, confirm)) => {
+            // Wait for the held-wait to confirm it wrote the decision to a live
+            // hook. No confirmation → the hook vanished (the Mac answered)
+            // between consume and delivery. The deadline must exceed the
+            // ingest write timeout (5s) with margin, or a slow-but-successful
+            // write could be reported as a false 409.
+            match tokio::time::timeout(std::time::Duration::from_secs(8), confirm).await {
+                // `written`: the decision reached the live hook socket (the
+                // write succeeded before the connection closed). We deliberately
+                // do NOT claim end-to-end receipt — proving the hook parsed and
+                // acted on it would need an application-level ACK (Codex).
+                Ok(Ok(())) => Json(serde_json::json!({
+                    "ok": true, "written": true, "session": card.session,
+                }))
+                .into_response(),
+                _ => (
+                    StatusCode::CONFLICT,
+                    "decision recorded but the agent was no longer waiting",
+                )
+                    .into_response(),
+            }
+        }
+        Err(crate::permit::ResolveError::Forbidden) => {
+            (StatusCode::FORBIDDEN, "approve capability required").into_response()
+        }
+        Err(crate::permit::ResolveError::Truncated) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the full command was not shown — approve on the host",
+        )
+            .into_response(),
+        Err(crate::permit::ResolveError::Expired) => {
+            (StatusCode::GONE, "this request expired").into_response()
+        }
+        Err(crate::permit::ResolveError::Unknown) => {
+            (StatusCode::NOT_FOUND, "no such pending request").into_response()
+        }
+    }
 }
 
 /// Read-only device list for the PWA sheet. Management (revoke/rename) is
@@ -209,18 +327,29 @@ async fn guard(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let origin_host = origin
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .map(strip_port);
-        if !origin_host.map(|h| allowed(&app, h)).unwrap_or(false) {
-            tracing::warn!(origin, "rejected request: bad Origin header");
+    // Branch on *presence* first: an Origin that exists but isn't valid text
+    // must be rejected, not skipped as if absent (Codex).
+    if let Some(origin_val) = headers.get(header::ORIGIN) {
+        // Parse strictly with `url` rather than string-splitting: reject an
+        // Origin carrying credentials (`https://allowed@evil` — the old splitter
+        // read the host as `allowed`) and compare the REAL host. A non-text or
+        // malformed Origin is rejected outright.
+        let origin_ok = origin_val
+            .to_str()
+            .ok()
+            .and_then(|origin| url::Url::parse(origin).ok())
+            .filter(|u| u.username().is_empty() && u.password().is_none())
+            .and_then(|u| u.host_str().map(|h| allowed(&app, strip_brackets(h))))
+            .unwrap_or(false);
+        if !origin_ok {
+            tracing::warn!("rejected request: bad or non-text Origin header");
             return Err(StatusCode::FORBIDDEN);
         }
     }
 
+    // Authenticated API responses can carry command summaries / attention detail;
+    // keep them out of the browser's HTTP cache. Static assets may still cache.
+    let is_api = request.uri().path().starts_with("/api");
     let mut response = next.run(request).await;
     let h = response.headers_mut();
     h.insert(
@@ -231,6 +360,12 @@ async fn guard(
         header::REFERRER_POLICY,
         header::HeaderValue::from_static("no-referrer"),
     );
+    if is_api {
+        h.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store, private"),
+        );
+    }
     Ok(response)
 }
 
@@ -247,6 +382,14 @@ fn strip_port(host: &str) -> &str {
         return rest.split(']').next().unwrap_or(host);
     }
     host.split(':').next().unwrap_or(host)
+}
+
+/// `url::Url::host_str` keeps the brackets on an IPv6 literal (`[::1]`); the
+/// allowlist stores bare hosts, so strip them to compare like-for-like.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn allowed(app: &App, host: &str) -> bool {

@@ -1,6 +1,6 @@
 [package]
 name = "remux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Your persistent tmux session, on your phone."
 license = "MIT"
@@ -48,7 +48,7 @@ hex = "0.4"
 mime_guess = "2"
 portable-pty = "0.9"
 qrcode = { version = "0.14", default-features = false }
-rand = "0.9"
+rand = "0.10"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,7 +59,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio-tungstenite = "0.29"
 

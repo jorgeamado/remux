@@ -4,3 +4,9 @@
 /web/test-results
 /web/playwright-report
 /web/ui-*.png
+/web/*.png
+/web/tabshot.mjs
+/target-linux
+/target-host
+/web/test-results
+test-results/

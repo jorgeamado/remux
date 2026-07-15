@@ -23,6 +23,10 @@ async fn admin_socket_mints_usable_pairing_tokens() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 
@@ -68,6 +72,10 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
     // A second spawn on the same state dir must refuse — and must NOT have
@@ -99,6 +107,10 @@ async fn stale_socket_file_is_replaced() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app, &dir).unwrap();
 }
@@ -119,6 +131,10 @@ async fn admin_socket_rejects_garbage() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 
@@ -153,6 +169,10 @@ async fn revoke_cascades_and_cancels_pairing() {
         connections: Default::default(),
         pending_attention: Default::default(),
         revoked: tokio::sync::broadcast::channel(16).0,
+        topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
+        perms: Default::default(),
+        feed: Default::default(),
+        detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
 

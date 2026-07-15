@@ -85,19 +85,22 @@ pub enum EmitCmd {
         message: Option<String>,
     },
     /// An agent permission prompt: block until a device approves/denies, then
-    /// print Claude Code's decision JSON on stdout. Reads the hook's
-    /// PermissionRequest payload (tool_name, tool_input, prompt_id) from stdin
-    /// — the install snippet pipes it straight through, so no fragile shell
-    /// extraction. On any failure (no decision, expiry, daemon down) prints a
-    /// diagnostic to stderr and exits non-zero, which makes Claude Code fall
-    /// back to its own dialog on the Mac.
+    /// print the neutral decision word (`allow` or `deny`) on stdout. Reads a
+    /// permission payload (tool_name, tool_input, optional prompt_id) from
+    /// stdin — an agent adapter (e.g. the remux Claude Code plugin) pipes its
+    /// hook payload in and maps the decision back to its own format, so remux
+    /// stays agent-agnostic. On any failure (no decision, expiry, daemon down)
+    /// prints a diagnostic to stderr and exits non-zero, so the agent falls
+    /// back to its own prompt.
     Permission {
         /// tmux pane id (%N). Defaults to $TMUX_PANE (read here, not from the
         /// hook payload, which doesn't carry it).
         #[arg(long)]
         pane: Option<String>,
-        /// Producer label.
-        #[arg(long, default_value = "claude-code")]
+        /// Producer label shown on the card (which agent is asking). Neutral by
+        /// default; an agent's adapter passes its own, e.g. `--source
+        /// claude-code`.
+        #[arg(long, default_value = "agent")]
         source: String,
         /// Present for symmetry with the docs; the wait is implied for this
         /// subcommand (a permission prompt with no blocking makes no sense).

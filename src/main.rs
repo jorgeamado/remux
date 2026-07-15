@@ -9,8 +9,8 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     remux::init_crypto();
-    // Logs go to stderr, unconditionally. `remux emit permission` prints
-    // Claude Code's decision JSON to stdout and the hook parses it, so a stray
+    // Logs go to stderr, unconditionally. `remux emit permission` prints its
+    // neutral decision word to stdout and the caller parses it, so a stray
     // tracing line on stdout would corrupt the contract.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -615,13 +615,15 @@ fn strip_hook_block(s: &str) -> Option<String> {
     Some(out)
 }
 
-/// `remux emit permission` — the blocking Claude Code PermissionRequest hook.
-/// Reads the hook's JSON payload from stdin (so there's no fragile shell-arg
-/// extraction in the install snippet), blocks on the ingest socket until a
-/// device decides or the card expires, then prints *only* Claude Code's exact
-/// decision JSON on stdout. Any failure returns an error (→ stderr, non-zero
-/// exit, no stdout), which makes Claude Code fall back to its own Mac dialog —
-/// never a fabricated allow/deny.
+/// `remux emit permission` — the blocking remote-approval primitive. Reads an
+/// agent permission payload (`tool_name`, `tool_input`, optional `prompt_id`)
+/// from stdin, blocks on the ingest socket until a device decides or the card
+/// expires, then prints *only* the neutral decision word (`allow` / `deny`) on
+/// stdout. This is agent-agnostic: an adapter (e.g. the remux Claude Code
+/// plugin) pipes its hook payload in and maps `allow`/`deny` back into that
+/// agent's decision format. Any failure returns an error (→ stderr, non-zero
+/// exit, no stdout), so the agent falls back to its own prompt — never a
+/// fabricated allow/deny.
 fn emit_permission(
     state_dir: &std::path::Path,
     pane: Option<String>,
@@ -652,26 +654,29 @@ fn emit_permission(
     }
 
     let v = ingest::request_wait(state_dir, body)?;
-    // Require an explicit success: an inconsistent ack (ok:false with a stray
-    // decision field) must never be treated as a decision.
+    // Print the *neutral* decision; the agent's adapter (e.g. the remux Claude
+    // Code plugin) maps it into that agent's own hook format.
+    println!("{}", decision_from_ack(&v)?);
+    Ok(())
+}
+
+/// Map the ingest ack from `request_wait` to the neutral decision word printed
+/// on stdout (`allow` / `deny`). Returns `Err` on anything that is not an
+/// explicit, consistent success — an inconsistent ack (`ok:false` with a stray
+/// `decision`), an expiry, or a missing field must never be read as a decision,
+/// so the caller exits non-zero and the agent falls back to its own prompt.
+/// This is the load-bearing "never fabricate a decision" rule, kept pure so it
+/// is testable without a socket.
+fn decision_from_ack(v: &serde_json::Value) -> Result<&'static str> {
     match v["decision"]
         .as_str()
         .filter(|_| v["ok"] == serde_json::json!(true))
     {
-        Some(b @ ("allow" | "deny")) => {
-            // The exact shape Claude Code expects (verified in the M4.0 spike).
-            let out = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": { "behavior": b }
-                }
-            });
-            println!("{out}");
-            Ok(())
-        }
+        Some("allow") => Ok("allow"),
+        Some("deny") => Ok("deny"),
         // ok:false / "expired" / anything unexpected → no decision → fall back.
         _ => anyhow::bail!(
-            "no remote decision ({}); falling back to the Mac dialog",
+            "no remote decision ({}); the agent should fall back to its own prompt",
             v["error"].as_str().unwrap_or("unknown")
         ),
     }
@@ -1088,5 +1093,35 @@ mod tests {
         atomic_write_rc(&rc, &stripped).unwrap();
         assert_eq!(std::fs::read_to_string(&rc).unwrap(), original);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decision_from_ack_only_honors_explicit_consistent_success() {
+        use serde_json::json;
+        // A clean allow/deny ack yields the neutral decision word.
+        assert_eq!(
+            decision_from_ack(&json!({"ok": true, "decision": "allow"})).unwrap(),
+            "allow"
+        );
+        assert_eq!(
+            decision_from_ack(&json!({"ok": true, "decision": "deny"})).unwrap(),
+            "deny"
+        );
+        // Everything else must FAIL (→ non-zero exit → agent falls back). The
+        // load-bearing cases: an inconsistent ack (ok:false but a stray
+        // decision), an expiry, an unknown verb, and a missing field must never
+        // be read as a decision.
+        for bad in [
+            json!({"ok": false, "decision": "allow"}), // inconsistent — never trust
+            json!({"ok": false, "error": "expired"}),  // card expired
+            json!({"ok": true, "decision": "maybe"}),  // unknown verb
+            json!({"ok": true}),                       // no decision field
+            json!({}),                                 // empty
+        ] {
+            assert!(
+                decision_from_ack(&bad).is_err(),
+                "must not fabricate a decision from {bad}"
+            );
+        }
     }
 }

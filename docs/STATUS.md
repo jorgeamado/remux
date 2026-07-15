@@ -86,8 +86,30 @@ tied to pane switch / dashboard exit / view clear). First consumer: the htop
 process-signal sheet, refactored onto it and now offering **SIGTERM / SIGKILL**
 (action whitelist extended to `kill:<pid>:TERM|KILL`, signal a closed whitelist,
 still `approve`-gated + `pane_has_pid`).
-Slice 2 (unlocks plugins): a declarative `popup` field in the view schema so a
-*source* can request a popup server-side, not just the compiled-in renderer.
+**Generic popup primitive (slice 2 done — the plugin interaction loop).** A
+streaming *source* can now declare an interactive `menu` in its view state, and
+the user's choice is routed back to that source over a duplex back-channel — so a
+plugin can offer actions without shipping UI or reaching tmux/shell. Design and
+implementation went through **three Codex security rounds**. Shape:
+- Schema: a snapshot may carry a generic `menu {title, detail?, options:[{label,
+  action, style?, requires?}]}`, validated for any view. Action tokens use an
+  ASCII grammar `[A-Za-z0-9._:-]{1,64}` (no newline/separator → safe to relay as
+  one JSON line), deduped, bounded.
+- Provenance boundary: `htop.v1` is internal-only (daemon executes its actions
+  via tmux/kill); external `remux stream` sources get socket views only and can
+  never claim `htop.v1` or drive the tmux path. Actions route by provenance, not
+  view id. The htop kill gate checks `InternalHtop` + pid under one lock.
+- Capability: each option carries `requires: approve|session` (default `approve`;
+  `danger` forces `approve`); the daemon enforces it and only forwards a token
+  that is in the pane's *current* menu. Sources use nonced/target-bound tokens;
+  the PWA also drops an open popup when the underlying menu changes.
+- Back-channel: bounded (16) channel, write-timeout, fair (non-biased) select,
+  prompt prune-release; `remux stream --actions <fifo>` relays choices to the
+  source (O_RDWR FIFO, detached relay, EOF-clean). WS hardened with a 64 KiB
+  message cap + a pre-parse text-message token bucket (CPU-flood bound).
+- Demo: taskscope advertises Pause/Resume and reacts via a FIFO; PWA renders a
+  generic Actions button + the shared popup.
+
 Other next options: `docker stats` (native-JSON command adapter — Codex's robust
 pick), or an agent-window source.
 

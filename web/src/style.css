@@ -984,6 +984,18 @@ button {
   white-space: nowrap;
 }
 
+/* Source-declared actions: a core button above a dashboard that opens the
+   generic popup with the view's menu options. */
+.dash-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 2px 12px;
+}
+.dash-actions-btn {
+  padding: 8px 16px;
+  font-size: 13px;
+}
+
 /* Generic popup primitive — a bottom sheet any pane view can raise. Options
    stack vertically so a menu of 2+ choices reads cleanly on a phone. */
 .rx-popup-bg {

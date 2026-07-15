@@ -898,6 +898,11 @@ function refreshPaneView(): void {
       dashPane = v.pane;
       sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
     }
+    // If a menu popup is open and the underlying menu changed (target swap or a
+    // new source instance), drop it so the user can't act on a stale menu.
+    if (openMenuSig !== null && menuSig(v ? readMenu(v.state) : null) !== openMenuSig) {
+      closePopup();
+    }
     renderDashboard();
   }
 }
@@ -958,6 +963,10 @@ function renderDashboard(): void {
   }
   htChrome = null;
   dashboardPanel.textContent = "";
+  // Generic: any source view may advertise an interactive `menu`. Render a
+  // core Actions button for it, independent of the view's own renderer.
+  const bar = menuBar(v);
+  if (bar) dashboardPanel.appendChild(bar);
   if (v.view === "taskscope.v1") {
     dashboardPanel.appendChild(renderTaskscope(v.state));
   } else {
@@ -966,6 +975,70 @@ function renderDashboard(): void {
     unknown.textContent = `No renderer for “${v.view}”.`;
     dashboardPanel.appendChild(unknown);
   }
+}
+
+interface MenuOption {
+  label: string;
+  action: string;
+  style?: "default" | "danger" | "cancel";
+}
+
+/** Parse a view's optional generic `menu` (mirrors the daemon's validated
+ * shape). Returns null when absent/empty, so the button only shows when there
+ * are real options. */
+function readMenu(
+  state: Record<string, unknown>
+): { title: string; detail?: string; options: MenuOption[] } | null {
+  const m = state.menu as Record<string, unknown> | undefined;
+  if (!m || typeof m !== "object") return null;
+  const raw = Array.isArray(m.options) ? m.options : [];
+  const options: MenuOption[] = [];
+  for (const o of raw) {
+    if (!o || typeof o !== "object") continue;
+    const oo = o as Record<string, unknown>;
+    if (typeof oo.label !== "string" || typeof oo.action !== "string") continue;
+    const style =
+      oo.style === "danger" || oo.style === "cancel" ? oo.style : "default";
+    options.push({ label: oo.label, action: oo.action, style });
+  }
+  if (!options.length) return null;
+  return {
+    title: typeof m.title === "string" ? m.title : "Actions",
+    detail: typeof m.detail === "string" ? m.detail : undefined,
+    options,
+  };
+}
+
+/** The core "Actions" button for a source-declared menu — opens the generic
+ * popup. Selecting an option sends its action token; the daemon validates it
+ * against the currently-advertised menu and forwards it to the source. */
+function menuBar(v: PaneView): HTMLElement | null {
+  const menu = readMenu(v.state);
+  if (!menu) return null;
+  const bar = document.createElement("div");
+  bar.className = "dash-actions";
+  const btn = document.createElement("button");
+  btn.className = "btn dash-actions-btn";
+  btn.textContent = menu.title;
+  btn.addEventListener("click", () => {
+    openPopup({
+      pane: v.pane,
+      title: menu.title,
+      detail: menu.detail,
+      options: [
+        ...menu.options.map((o) => ({
+          label: o.label,
+          action: o.action,
+          style: o.style,
+        })),
+        { label: "Cancel", action: null, style: "cancel" as const },
+      ],
+    });
+    // Remember what we're showing, so a later menu change auto-dismisses it.
+    openMenuSig = menuSig(menu);
+  });
+  bar.appendChild(btn);
+  return bar;
 }
 
 // --- htop.v1 renderer: a live "instrument panel" over the real htop ---
@@ -1226,9 +1299,21 @@ interface PopupSpec {
 }
 
 let popupEl: HTMLElement | null = null;
+// Signature of the source menu the open popup was built from (null if the popup
+// isn't menu-driven, e.g. the htop kill sheet). If the pane's menu content
+// changes underneath an open menu popup — the source swapped targets, or a new
+// source instance claimed the pane — we drop the popup so a tap can't act on a
+// different menu than the one the user is looking at (Codex).
+let openMenuSig: string | null = null;
+function menuSig(menu: { options: MenuOption[] } | null): string | null {
+  return menu
+    ? JSON.stringify(menu.options.map((o) => [o.label, o.action, o.style]))
+    : null;
+}
 function closePopup(): void {
   popupEl?.remove();
   popupEl = null;
+  openMenuSig = null;
 }
 
 function openPopup(spec: PopupSpec): void {

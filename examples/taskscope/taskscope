@@ -17,6 +17,8 @@ set -u
 
 INTERVAL="${TASKSCOPE_INTERVAL:-1}"
 JSON=0; ONCE=0; STREAM=1
+PAUSED=0        # toggled from the phone via the remux action back-channel
+AFIFO=""        # action FIFO (daemon -> this source), set when interactive
 for a in "$@"; do
   case "$a" in
     --json) JSON=1 ;;
@@ -43,6 +45,8 @@ STREAMING=0
 cleanup() {
   # Closing fd 3 signals `remux stream` (EOF) to drop the pane view.
   [ "$STREAMING" = 1 ] && exec 3>&- 2>/dev/null
+  # Close and remove the action FIFO.
+  [ -n "$AFIFO" ] && { exec 4<&- 2>/dev/null; rm -f "$AFIFO"; }
   printf '%s%s' "$show" "$reset"
   exit 0
 }
@@ -52,15 +56,42 @@ rnd() { echo $(( RANDOM % $1 )); }
 # Auto-stream to remux when running inside a remux-served pane, so the phone gets
 # a Dashboard with no piping. Best-effort: if the daemon isn't there `remux
 # stream` just exits and writes to fd 3 fail (ignored) — the TUI is unaffected.
+#
+# Also set up the ACTION back-channel: a FIFO the daemon writes chosen menu
+# actions to. We open it read-write on fd 4 FIRST (so it always has a reader and
+# `remux stream`'s write-open never blocks), then read it non-blockingly.
 maybe_start_stream() {
   [ "$STREAM" = 1 ] || return 0
   [ -n "${TMUX_PANE:-}" ] || return 0
   local bin="${REMUX_BIN:-remux}"
   command -v "$bin" >/dev/null 2>&1 || return 0
-  exec 3> >("$bin" stream --view taskscope.v1 2>/dev/null) && STREAMING=1
+  local fifo
+  fifo="$(mktemp -u "${TMPDIR:-/tmp}/taskscope.act.XXXXXX")"
+  if mkfifo "$fifo" 2>/dev/null && exec 4<>"$fifo" 2>/dev/null; then
+    AFIFO="$fifo"
+    exec 3> >("$bin" stream --view taskscope.v1 --actions "$fifo" 2>/dev/null) && STREAMING=1
+    [ "$STREAMING" = 1 ] || { exec 4<&- 2>/dev/null; rm -f "$fifo"; AFIFO=""; }
+  else
+    rm -f "$fifo" 2>/dev/null
+    exec 3> >("$bin" stream --view taskscope.v1 2>/dev/null) && STREAMING=1
+  fi
+}
+
+# Drain any actions the daemon has delivered (non-blocking). fd 4 is opened
+# read-write so a read never hits EOF; the short -t timeout bounds the wait.
+drain_actions() {
+  [ -n "$AFIFO" ] || return 0
+  local line
+  while IFS= read -r -t 0.01 -u 4 line 2>/dev/null; do
+    case "$line" in
+      *'"action":"pause"'*)  PAUSED=1 ;;
+      *'"action":"resume"'*) PAUSED=0 ;;
+    esac
+  done
 }
 
 step() {
+  [ "$PAUSED" = 1 ] && return 0   # frozen from the phone
   local i
   for i in "${!WORKERS[@]}"; do
     case "${STATUS[$i]}" in
@@ -104,8 +135,9 @@ color_for() {
 render_tui() {
   local i c
   printf '%s' "$home"
-  printf '%s%s taskscope%s  %sdemo monitor%s            uptime %ds  \n' \
-    "$bold" "$cyan" "$reset" "$dim" "$reset" "$tick"
+  local pausetag=""; [ "$PAUSED" = 1 ] && pausetag="${red} ▮▮ paused${reset}"
+  printf '%s%s taskscope%s  %sdemo monitor%s%s            uptime %ds  \n' \
+    "$bold" "$cyan" "$reset" "$dim" "$reset" "$pausetag" "$tick"
   printf '%s\n' "──────────────────────────────────────────────────────────"
   printf '%s%-13s %-8s %5s %7s  %-16s %s%s\n' \
     "$dim" "WORKER" "STATUS" "CPU%" "MEM" "PROGRESS" "" "$reset"
@@ -128,7 +160,18 @@ emit_json() {
     printf '{"name":"%s","status":"%s","cpu":%d,"mem":%d,"progress":%d}' \
       "${WORKERS[$i]}" "${STATUS[$i]}" "${CPU[$i]}" "${MEM[$i]}" "${PROG[$i]}"
   done
-  printf ']}\n'
+  printf ']'
+  # Advertise an interactive menu only when the action back-channel exists, so a
+  # display-only source (plain --json piping) doesn't offer actions that can't
+  # be delivered. Options are low-risk → requires:"session".
+  if [ -n "$AFIFO" ]; then
+    if [ "$PAUSED" = 1 ]; then
+      printf ',"menu":{"title":"taskscope","options":[{"label":"Resume all","action":"resume","requires":"session"}]}'
+    else
+      printf ',"menu":{"title":"taskscope","options":[{"label":"Pause all","action":"pause","requires":"session"}]}'
+    fi
+  fi
+  printf '}\n'
 }
 
 if (( JSON )); then
@@ -140,6 +183,7 @@ else
   maybe_start_stream
   printf '%s%s' "$hide" "$clr"
   while :; do
+    drain_actions   # apply any pause/resume the phone sent
     render_tui
     # Same tick's state to the phone, so terminal and dashboard never disagree.
     [ "$STREAMING" = 1 ] && { emit_json >&3 2>/dev/null || STREAMING=0; }

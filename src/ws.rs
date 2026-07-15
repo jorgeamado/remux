@@ -25,6 +25,17 @@ const MAX_PER_DEVICE_CONNECTIONS: usize = 8;
 /// terminal is hidden then, so the oversized render is invisible.
 const DASH_COLS: u16 = 210;
 const DASH_ROWS: u16 = 60;
+/// Min spacing between pane actions from one connection — a rate cap applied
+/// BEFORE any registry/topology work, so a client can't CPU-flood the daemon
+/// (Codex). Comfortably faster than any human tap.
+const PANE_ACTION_MIN_INTERVAL: Duration = Duration::from_millis(50);
+/// Cap on any inbound WebSocket message/frame.
+const MAX_WS_MESSAGE: usize = 64 * 1024;
+/// Text-message token bucket: burst size and refill rate (msgs/sec). Control
+/// messages (resize/ping/taps) are well under this; a flood is bounded before
+/// the JSON parse. Keystrokes/scroll are Binary and not counted here.
+const TEXT_MSG_BURST: f64 = 32.0;
+const TEXT_MSG_REFILL_PER_SEC: f64 = 32.0;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -99,11 +110,18 @@ fn json(msg: &ServerMsg) -> Message {
 }
 
 pub async fn handler(State(app): State<Arc<App>>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| async move {
-        if let Err(e) = handle(socket, app).await {
-            tracing::debug!("ws session ended: {e:#}");
-        }
-    })
+    // Cap inbound frames/messages. Axum defaults to 64 MiB per message; every
+    // client message (control frames, pane actions) is small, so a tight bound
+    // stops a paired device from forcing huge transient allocations by padding a
+    // message (Codex). Well above any legitimate client payload.
+    upgrade
+        .max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = handle(socket, app).await {
+                tracing::debug!("ws session ended: {e:#}");
+            }
+        })
 }
 
 async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
@@ -533,6 +551,13 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     let mut controller = false;
     // The window (if any) this client is holding at dashboard capture size.
     let mut current_dash: Option<String> = None;
+    // Rate-limit pane actions from this connection (applied before any registry/
+    // topology work) so a client can't flood a source's back-channel (Codex).
+    let mut last_pane_action: Option<std::time::Instant> = None;
+    // Token bucket over ALL inbound text messages, spent before the JSON parse,
+    // so a client can't CPU-flood the daemon with large/malformed control frames.
+    let mut text_tokens: f64 = TEXT_MSG_BURST;
+    let mut text_refill = std::time::Instant::now();
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
@@ -570,217 +595,257 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                         .await;
                 }
             }
-            Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
-                Ok(ClientMsg::Resize {
-                    cols: mut c,
-                    rows: mut r,
-                }) => {
-                    clamp_size(&mut c, &mut r);
-                    (cols, rows) = (c, r);
-                    let _ = master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+            Message::Text(text) => {
+                // Token-bucket EVERY text message before the (relatively costly)
+                // JSON parse, so an authenticated client can't CPU-flood the daemon
+                // with a stream of large/malformed JSON control frames (Codex). All
+                // legitimate control messages (resize, ping, taps) are far below
+                // this rate; keystrokes/scroll are Binary and unaffected.
+                let now = std::time::Instant::now();
+                text_tokens = (text_tokens
+                    + now.duration_since(text_refill).as_secs_f64() * TEXT_MSG_REFILL_PER_SEC)
+                    .min(TEXT_MSG_BURST);
+                text_refill = now;
+                if text_tokens < 1.0 {
+                    continue; // over budget — drop before parsing
                 }
-                Ok(ClientMsg::TakeControl) => match &client_name {
-                    Some(name) => {
-                        let name = name.clone();
-                        let res = tokio::task::spawn_blocking(move || tmux::promote_client(&name))
-                            .await?;
-                        match res {
-                            Ok(()) => {
-                                controller = true;
-                                // Nudge the size so tmux re-evaluates layout now that
-                                // this client participates in sizing.
-                                let _ = master.resize(PtySize {
-                                    rows,
-                                    cols,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                });
-                                let _ = out_tx.send(status("controller")).await;
+                text_tokens -= 1.0;
+                match serde_json::from_str::<ClientMsg>(&text) {
+                    Ok(ClientMsg::Resize {
+                        cols: mut c,
+                        rows: mut r,
+                    }) => {
+                        clamp_size(&mut c, &mut r);
+                        (cols, rows) = (c, r);
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    Ok(ClientMsg::TakeControl) => match &client_name {
+                        Some(name) => {
+                            let name = name.clone();
+                            let res =
+                                tokio::task::spawn_blocking(move || tmux::promote_client(&name))
+                                    .await?;
+                            match res {
+                                Ok(()) => {
+                                    controller = true;
+                                    // Nudge the size so tmux re-evaluates layout now that
+                                    // this client participates in sizing.
+                                    let _ = master.resize(PtySize {
+                                        rows,
+                                        cols,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    });
+                                    let _ = out_tx.send(status("controller")).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("promote failed: {e:#}");
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::Error {
+                                            code: "take_control_failed",
+                                            message: "could not take control",
+                                        }))
+                                        .await;
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("promote failed: {e:#}");
+                        }
+                        None => {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "take_control_failed",
+                                    message: "tmux client not resolved",
+                                }))
+                                .await;
+                        }
+                    },
+                    Ok(ClientMsg::ReleaseControl) => {
+                        // Only drop the controller role if tmux actually demoted us.
+                        // Otherwise the client stays a sizing participant (window-size
+                        // latest) and reporting "observer" would be a lie — the exact
+                        // failure the pane-view dashboard relies on NOT happening.
+                        let demoted = match &client_name {
+                            Some(name) => {
+                                let name = name.clone();
+                                tokio::task::spawn_blocking(move || tmux::demote_client(&name))
+                                    .await?
+                                    .is_ok()
+                            }
+                            None => true, // no client name → never really driving size
+                        };
+                        if demoted {
+                            controller = false;
+                            let _ = out_tx.send(status("observer")).await;
+                        } else {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "release_failed",
+                                    message: "could not release control",
+                                }))
+                                .await;
+                        }
+                    }
+                    Ok(ClientMsg::WindowAction { action, index }) => {
+                        if !controller {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "observer",
+                                    message: "take control before changing windows",
+                                }))
+                                .await;
+                        } else {
+                            let session = session.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                tmux::window_action(&session, &action, index)
+                            })
+                            .await?;
+                            if let Err(e) = res {
+                                tracing::warn!("window action failed: {e:#}");
                                 let _ = out_tx
                                     .send(json(&ServerMsg::Error {
-                                        code: "take_control_failed",
-                                        message: "could not take control",
+                                        code: "window_action_failed",
+                                        message: "could not perform window action",
                                     }))
                                     .await;
                             }
                         }
                     }
-                    None => {
-                        let _ = out_tx
-                            .send(json(&ServerMsg::Error {
-                                code: "take_control_failed",
-                                message: "tmux client not resolved",
-                            }))
-                            .await;
-                    }
-                },
-                Ok(ClientMsg::ReleaseControl) => {
-                    // Only drop the controller role if tmux actually demoted us.
-                    // Otherwise the client stays a sizing participant (window-size
-                    // latest) and reporting "observer" would be a lie — the exact
-                    // failure the pane-view dashboard relies on NOT happening.
-                    let demoted = match &client_name {
-                        Some(name) => {
-                            let name = name.clone();
-                            tokio::task::spawn_blocking(move || tmux::demote_client(&name))
-                                .await?
-                                .is_ok()
-                        }
-                        None => true, // no client name → never really driving size
-                    };
-                    if demoted {
-                        controller = false;
-                        let _ = out_tx.send(status("observer")).await;
-                    } else {
-                        let _ = out_tx
-                            .send(json(&ServerMsg::Error {
-                                code: "release_failed",
-                                message: "could not release control",
-                            }))
-                            .await;
-                    }
-                }
-                Ok(ClientMsg::WindowAction { action, index }) => {
-                    if !controller {
-                        let _ = out_tx
-                            .send(json(&ServerMsg::Error {
-                                code: "observer",
-                                message: "take control before changing windows",
-                            }))
-                            .await;
-                    } else {
-                        let session = session.clone();
-                        let res = tokio::task::spawn_blocking(move || {
-                            tmux::window_action(&session, &action, index)
-                        })
-                        .await?;
-                        if let Err(e) = res {
-                            tracing::warn!("window action failed: {e:#}");
-                            let _ = out_tx
-                                .send(json(&ServerMsg::Error {
-                                    code: "window_action_failed",
-                                    message: "could not perform window action",
-                                }))
-                                .await;
+                    Ok(ClientMsg::ViewMode { pane, dashboard }) => {
+                        // Force this pane's window to the big capture resolution while
+                        // the dashboard is shown, and restore it on leave/switch. Only
+                        // a pane in THIS session that actually has a view may be
+                        // forced — else a client could resize another session's window.
+                        let target = if dashboard {
+                            let in_session = app.topology.borrow().iter().any(|s| {
+                                s.name == session
+                                    && s.windows
+                                        .iter()
+                                        .any(|w| w.panes.iter().any(|p| p.id == pane))
+                            });
+                            let has_view = app.pane_views.view_of(&pane).is_some();
+                            if in_session && has_view {
+                                match tokio::task::spawn_blocking(move || {
+                                    tmux::window_of_pane(&pane)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(w)) => w,
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(win) if current_dash.as_deref() != Some(&win) => {
+                                if let Some(old) = current_dash.take() {
+                                    dash_leave(&app, old).await;
+                                }
+                                dash_enter(&app, win.clone()).await;
+                                current_dash = Some(win);
+                            }
+                            Some(_) => {} // already sized for this window
+                            None => {
+                                if let Some(old) = current_dash.take() {
+                                    dash_leave(&app, old).await;
+                                }
+                            }
                         }
                     }
-                }
-                Ok(ClientMsg::ViewMode { pane, dashboard }) => {
-                    // Force this pane's window to the big capture resolution while
-                    // the dashboard is shown, and restore it on leave/switch. Only
-                    // a pane in THIS session that actually has a view may be
-                    // forced — else a client could resize another session's window.
-                    let target = if dashboard {
+                    Ok(ClientMsg::PaneAction { pane, action }) => {
+                        // Rate-limit BEFORE any registry/topology work so a flood of
+                        // tiny frames can't spin the daemon (Codex). Too-soon → drop.
+                        let now = std::time::Instant::now();
+                        if last_pane_action
+                            .is_some_and(|t| now.duration_since(t) < PANE_ACTION_MIN_INTERVAL)
+                        {
+                            continue;
+                        }
+                        last_pane_action = Some(now);
+                        // Only for a pane in THIS session. Compute before any await
+                        // (don't hold the topology borrow across it). Route by the
+                        // view's PROVENANCE, not its id: an internal-htop view runs the
+                        // tmux whitelist; a socket (plugin) view forwards to the source.
                         let in_session = app.topology.borrow().iter().any(|s| {
                             s.name == session
                                 && s.windows
                                     .iter()
                                     .any(|w| w.panes.iter().any(|p| p.id == pane))
                         });
-                        let has_view = app.pane_views.view_of(&pane).is_some();
-                        if in_session && has_view {
-                            match tokio::task::spawn_blocking(move || tmux::window_of_pane(&pane))
-                                .await
-                            {
-                                Ok(Ok(w)) => w,
-                                _ => None,
+                        let kind = app.pane_views.action_kind(&pane);
+                        if in_session && kind == Some(paneview::ActionKind::Source) {
+                            // A plugin action: the daemon does not interpret it. Cap
+                            // its size (matches the token grammar); send_action
+                            // enforces membership + policy.
+                            if action.len() <= paneview::MAX_ACTION_TOKEN {
+                                app.pane_views.send_action(
+                                    &pane,
+                                    &action,
+                                    app.auth.can_approve(&device.id),
+                                );
                             }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    match target {
-                        Some(win) if current_dash.as_deref() != Some(&win) => {
-                            if let Some(old) = current_dash.take() {
-                                dash_leave(&app, old).await;
-                            }
-                            dash_enter(&app, win.clone()).await;
-                            current_dash = Some(win);
-                        }
-                        Some(_) => {} // already sized for this window
-                        None => {
-                            if let Some(old) = current_dash.take() {
-                                dash_leave(&app, old).await;
-                            }
-                        }
-                    }
-                }
-                Ok(ClientMsg::PaneAction { pane, action }) => {
-                    // Only for an htop pane in THIS session, and only whitelisted
-                    // actions. Compute the checks before any await (don't hold the
-                    // topology borrow across it).
-                    let in_session = app.topology.borrow().iter().any(|s| {
-                        s.name == session
-                            && s.windows
-                                .iter()
-                                .any(|w| w.panes.iter().any(|p| p.id == pane))
-                    });
-                    let is_htop = app.pane_views.view_of(&pane).as_deref() == Some("htop.v1");
-                    if in_session && is_htop {
-                        match paneview::parse_htop_action(&action) {
-                            Some(paneview::HtopAction::Kill { pid, signal }) => {
-                                // Killing is destructive → require the host-granted
-                                // `approve` capability (not just any paired device),
-                                // and only a pid the dashboard is actually showing.
-                                if app.auth.can_approve(&device.id)
-                                    && app.pane_views.pane_has_pid(&pane, pid)
-                                {
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        paneview::kill_process(pid, signal)
-                                    })
-                                    .await;
+                        } else if in_session && kind == Some(paneview::ActionKind::Htop) {
+                            match paneview::parse_htop_action(&action) {
+                                Some(paneview::HtopAction::Kill { pid, signal }) => {
+                                    // Killing is destructive → require the host-granted
+                                    // `approve` capability (not just any paired device),
+                                    // and only a pid the dashboard is actually showing.
+                                    if app.auth.can_approve(&device.id)
+                                        && app.pane_views.pane_has_pid(&pane, pid)
+                                    {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            paneview::kill_process(pid, signal)
+                                        })
+                                        .await;
+                                    }
                                 }
-                            }
-                            Some(act @ paneview::HtopAction::Filter(_)) => {
-                                // Filter types attacker-controlled LITERAL text into
-                                // the pane. send-keys -l stops tmux key interpretation
-                                // but not shell syntax, and check-then-send is not
-                                // atomic: if htop exits mid-sequence the text can land
-                                // at the shell for the user's next Enter. So restrict
-                                // it — like kill — to a device holding the host-granted
-                                // `approve` capability, which is already trusted to
-                                // approve arbitrary command execution. exec_htop_action
-                                // additionally re-verifies htop owns the pane per phase.
-                                if app.auth.can_approve(&device.id) {
+                                Some(act @ paneview::HtopAction::Filter(_)) => {
+                                    // Filter types attacker-controlled LITERAL text into
+                                    // the pane. send-keys -l stops tmux key interpretation
+                                    // but not shell syntax, and check-then-send is not
+                                    // atomic: if htop exits mid-sequence the text can land
+                                    // at the shell for the user's next Enter. So restrict
+                                    // it — like kill — to a device holding the host-granted
+                                    // `approve` capability, which is already trusted to
+                                    // approve arbitrary command execution. exec_htop_action
+                                    // additionally re-verifies htop owns the pane per phase.
+                                    if app.auth.can_approve(&device.id) {
+                                        let p = pane.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            paneview::exec_htop_action(&p, &act)
+                                        })
+                                        .await;
+                                    }
+                                }
+                                Some(act) => {
+                                    // sort/invert/tree: fixed single keys, no attacker-
+                                    // controlled content. exec re-verifies htop owns the
+                                    // pane right before sending (no junk at a shell).
                                     let p = pane.clone();
                                     let _ = tokio::task::spawn_blocking(move || {
                                         paneview::exec_htop_action(&p, &act)
                                     })
                                     .await;
                                 }
+                                None => {}
                             }
-                            Some(act) => {
-                                // sort/invert/tree: fixed single keys, no attacker-
-                                // controlled content. exec re-verifies htop owns the
-                                // pane right before sending (no junk at a shell).
-                                let p = pane.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    paneview::exec_htop_action(&p, &act)
-                                })
-                                .await;
-                            }
-                            None => {}
                         }
                     }
+                    Ok(ClientMsg::Ping) => {
+                        let _ = out_tx.send(json(&ServerMsg::Pong)).await;
+                    }
+                    Ok(ClientMsg::Auth { .. }) => {} // already authed; ignore
+                    Err(e) => {
+                        tracing::debug!("bad client message: {e}");
+                    }
                 }
-                Ok(ClientMsg::Ping) => {
-                    let _ = out_tx.send(json(&ServerMsg::Pong)).await;
-                }
-                Ok(ClientMsg::Auth { .. }) => {} // already authed; ignore
-                Err(e) => {
-                    tracing::debug!("bad client message: {e}");
-                }
-            },
+            }
             Message::Close(_) => break,
             _ => {}
         }

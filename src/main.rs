@@ -223,7 +223,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         },
-        Cmd::Stream { pane, view } => return paneview::stream(&state_dir, pane, view),
+        Cmd::Stream {
+            pane,
+            view,
+            actions,
+        } => return paneview::stream(&state_dir, pane, view, actions),
     };
 
     std::fs::create_dir_all(&state_dir)?;

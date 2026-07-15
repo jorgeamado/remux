@@ -80,6 +80,11 @@ pub enum Cmd {
         /// Built-in view id the source renders as (e.g. `taskscope.v1`).
         #[arg(long)]
         view: String,
+        /// Optional path (e.g. a FIFO) to write chosen menu actions to, one JSON
+        /// line each (`{"action":"..."}`) — the daemon→source back-channel for an
+        /// interactive dashboard. Omit for a display-only source.
+        #[arg(long)]
+        actions: Option<std::path::PathBuf>,
     },
 }
 

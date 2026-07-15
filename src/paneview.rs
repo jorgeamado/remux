@@ -32,14 +32,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// Socket filename in the state dir.
 pub const SOCKET: &str = "pane-view.sock";
 
-/// Built-in view identifiers. A source may only claim one of these; the PWA
-/// ships a hard-coded renderer for each. (No third-party/plugin views yet.)
+/// Built-in view identifiers the PWA ships a hard-coded renderer for.
 pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1", "htop.v1"];
+
+/// Views produced ONLY by an in-process adapter (the htop capture adapter),
+/// never claimable over the source socket. This is a provenance boundary: the
+/// daemon executes `htop.v1` actions itself (tmux/kill), so an external source
+/// must not be able to impersonate that view and drive the tmux path with a
+/// forged process list (Codex). External sources get `SOCKET_VIEWS` only.
+pub const INTERNAL_VIEWS: &[&str] = &["htop.v1"];
 
 /// Foreground commands the daemon auto-captures into a pane view (best-effort
 /// "semantic lens" over the real tool's rendered screen — see `parse_htop`).
@@ -85,6 +91,37 @@ async fn read_line(reader: &mut SourceReader, buf: &mut Vec<u8>) -> Result<Optio
     Ok(Some(trim_line(buf).to_vec()))
 }
 
+/// Where a pane's view came from — the provenance boundary that decides how its
+/// actions are routed (Codex finding 4).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SourceKind {
+    /// The in-process htop capture adapter. Actions run through the tmux/kill
+    /// whitelist in this module.
+    InternalHtop,
+    /// An external `remux stream` source. Actions are forwarded back to it over
+    /// the connection's back-channel; the daemon never interprets them.
+    Socket,
+}
+
+/// Whether a menu action may be triggered by any in-session device, or only by a
+/// device holding the host-granted `approve` capability. Default is `Approve`;
+/// a trusted source opts a low-risk action down to `Session` explicitly, and a
+/// `danger`-styled option is always `Approve` regardless (Codex finding 1).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ActionPolicy {
+    Session,
+    Approve,
+}
+
+/// Bounded depth of a source's action back-channel. A client can enqueue at most
+/// this many un-delivered actions; further ones are dropped (Codex finding 2).
+const ACTION_QUEUE: usize = 16;
+/// How long a single action-line write to a source may block before we give up
+/// and drop the connection — bounds a source that stopped reading its socket.
+const ACTION_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Max bytes of a source action token (matches the menu-token grammar cap).
+pub const MAX_ACTION_TOKEN: usize = 64;
+
 /// Latest structured state for one pane.
 struct Entry {
     view: String,
@@ -94,6 +131,56 @@ struct Entry {
     rev: u64,
     /// `None` until the first snapshot — a claimed-but-empty pane shows nothing.
     state: Option<Value>,
+    kind: SourceKind,
+    /// Action tokens the *current* snapshot's `menu` advertises, each with its
+    /// policy. A client action is only forwarded if it is a key here (so a
+    /// client can never trigger an action the view is not currently offering),
+    /// and only if its policy is satisfied.
+    menu: HashMap<String, ActionPolicy>,
+    /// Back-channel to the owning source connection (set only for `Socket`
+    /// sources). `send_action` pushes a chosen menu token here; the connection
+    /// task writes it to the source. Bounded so a stuck source can't grow it.
+    action_tx: Option<mpsc::Sender<String>>,
+}
+
+/// The token→policy map a snapshot's `menu` advertises. Empty if there is no
+/// menu. `validate` has already shape-checked the menu, so this trusts the
+/// structure; it re-derives policy defensively (default Approve; `danger` forces
+/// Approve; explicit `requires:"session"` opts down).
+fn menu_policies(state: &Value) -> HashMap<String, ActionPolicy> {
+    let mut out = HashMap::new();
+    let Some(opts) = state
+        .get("menu")
+        .and_then(|m| m.get("options"))
+        .and_then(Value::as_array)
+    else {
+        return out;
+    };
+    for o in opts {
+        let Some(action) = o.get("action").and_then(Value::as_str) else {
+            continue;
+        };
+        let danger = o.get("style").and_then(Value::as_str) == Some("danger");
+        let session_ok = !danger && o.get("requires").and_then(Value::as_str) == Some("session");
+        out.insert(
+            action.to_string(),
+            if session_ok {
+                ActionPolicy::Session
+            } else {
+                ActionPolicy::Approve
+            },
+        );
+    }
+    out
+}
+
+/// How a pane's client actions are routed (by provenance, not view id).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ActionKind {
+    /// Run through the in-module tmux/kill whitelist (`exec_htop_action`).
+    Htop,
+    /// Forward to the external source over its back-channel (`send_action`).
+    Source,
 }
 
 /// One pane's current view, as sent to the PWA.
@@ -131,10 +218,38 @@ impl Registry {
         self.events.subscribe()
     }
 
-    /// Claim `pane` for `view`. Fails if the view is unknown or the pane already
-    /// has a live view. The returned guard owns the entry: dropping it (on EOF /
-    /// task exit) removes the pane's view.
-    pub fn claim(&self, pane: &str, view: &str) -> Result<ClaimGuard, &'static str> {
+    /// Claim `pane` for an in-process (`InternalHtop`) view — the capture
+    /// adapter. No back-channel.
+    pub fn claim_internal(&self, pane: &str, view: &str) -> Result<ClaimGuard, &'static str> {
+        self.claim_inner(pane, view, SourceKind::InternalHtop, None)
+            .map(|(g, _)| g)
+    }
+
+    /// Claim `pane` for an external `remux stream` (`Socket`) source. Rejects
+    /// `INTERNAL_VIEWS` so an external source can't impersonate the htop adapter
+    /// and drive the tmux/kill path (Codex finding 4). Returns the guard and the
+    /// receive half of a bounded action back-channel; the caller writes each
+    /// received token to the source.
+    pub fn claim_socket(
+        &self,
+        pane: &str,
+        view: &str,
+    ) -> Result<(ClaimGuard, mpsc::Receiver<String>), &'static str> {
+        if INTERNAL_VIEWS.contains(&view) {
+            return Err("view not available to external sources");
+        }
+        let (tx, rx) = mpsc::channel(ACTION_QUEUE);
+        let (guard, _) = self.claim_inner(pane, view, SourceKind::Socket, Some(tx))?;
+        Ok((guard, rx))
+    }
+
+    fn claim_inner(
+        &self,
+        pane: &str,
+        view: &str,
+        kind: SourceKind,
+        action_tx: Option<mpsc::Sender<String>>,
+    ) -> Result<(ClaimGuard, ()), &'static str> {
         if !KNOWN_VIEWS.contains(&view) {
             return Err("unknown view");
         }
@@ -150,15 +265,54 @@ impl Registry {
                 instance,
                 rev: 0,
                 state: None,
+                kind,
+                menu: HashMap::new(),
+                action_tx,
             },
         );
         // No hint yet: nothing is renderable until the first snapshot lands.
-        Ok(ClaimGuard {
-            inner: self.inner.clone(),
-            events: self.events.clone(),
-            pane: pane.to_string(),
-            instance,
+        Ok((
+            ClaimGuard {
+                inner: self.inner.clone(),
+                events: self.events.clone(),
+                pane: pane.to_string(),
+                instance,
+            },
+            (),
+        ))
+    }
+
+    /// How a pane's actions should be routed, by provenance — `None` if the pane
+    /// has no live view.
+    pub fn action_kind(&self, pane: &str) -> Option<ActionKind> {
+        self.inner.lock().unwrap().get(pane).map(|e| match e.kind {
+            SourceKind::InternalHtop => ActionKind::Htop,
+            SourceKind::Socket => ActionKind::Source,
         })
+    }
+
+    /// Forward a chosen menu `token` to the pane's `Socket` source. Returns
+    /// `false` (dropped) unless: the pane is a socket source, the token is in the
+    /// pane's *current* menu, its policy is satisfied (`can_approve` for an
+    /// `Approve` action), and the bounded channel has room. The daemon never
+    /// interprets the token — semantics are the source's.
+    pub fn send_action(&self, pane: &str, token: &str, can_approve: bool) -> bool {
+        let map = self.inner.lock().unwrap();
+        let Some(e) = map.get(pane) else {
+            return false;
+        };
+        let Some(policy) = e.menu.get(token) else {
+            return false; // not currently advertised
+        };
+        if *policy == ActionPolicy::Approve && !can_approve {
+            return false;
+        }
+        let Some(tx) = &e.action_tx else {
+            return false; // not a socket source
+        };
+        // try_send: a full queue means the source is stuck; drop rather than
+        // grow memory or block (Codex finding 2).
+        tx.try_send(token.to_string()).is_ok()
     }
 
     /// Current renderable views (entries that have received at least one
@@ -184,14 +338,21 @@ impl Registry {
         self.inner.lock().unwrap().get(pane).map(|e| e.view.clone())
     }
 
-    /// Whether the pane's current view lists a process with this pid — so a kill
-    /// can be gated to only what the dashboard is actually showing.
+    /// Whether the pane is an **internal htop** view listing a process with this
+    /// pid — the kill gate. The `InternalHtop` check and the pid check happen
+    /// under ONE lock, so a prune+reclaim race can't swap in a socket source with
+    /// a forged `processes` array between a separate provenance check and this
+    /// one (Codex finding 6). A socket source can never satisfy this.
     pub fn pane_has_pid(&self, pane: &str, pid: u32) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(pane)
-            .and_then(|e| e.state.as_ref())
+        let map = self.inner.lock().unwrap();
+        let Some(e) = map.get(pane) else {
+            return false;
+        };
+        if e.kind != SourceKind::InternalHtop {
+            return false;
+        }
+        e.state
+            .as_ref()
             .and_then(|s| s.get("processes"))
             .and_then(Value::as_array)
             .is_some_and(|arr| {
@@ -233,11 +394,26 @@ impl ClaimGuard {
             return None;
         }
         e.rev += 1;
+        // Recompute the authorized action set from the new snapshot's menu, so a
+        // client can only ever trigger what the view is *currently* advertising.
+        e.menu = menu_policies(&state);
         e.state = Some(state);
         let rev = e.rev;
         drop(map);
         let _ = self.events.send(());
         Some(rev)
+    }
+
+    /// Whether this guard still owns its pane's entry — false once the entry was
+    /// pruned (topology GC) or replaced by a newer claim. Lets a connection that
+    /// isn't currently publishing snapshots still notice promptly that its view
+    /// is gone and free its stream slot (Codex finding 5).
+    pub fn owns(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&self.pane)
+            .is_some_and(|e| e.instance == self.instance)
     }
 }
 
@@ -383,9 +559,96 @@ pub fn kill_process(pid: u32, signal: KillSignal) {
         .status();
 }
 
+/// Cap the option count of a generic menu.
+const MAX_MENU_OPTIONS: usize = 16;
+/// Cap menu title / option-label length (chars).
+const MAX_MENU_LABEL: usize = 64;
+/// Cap menu detail length (chars).
+const MAX_MENU_DETAIL: usize = 160;
+
+/// Opaque action-token grammar: `[A-Za-z0-9._:-]`, 1..=MAX_ACTION_TOKEN chars.
+/// No whitespace, control chars, or Unicode line separators — so a token is safe
+/// to relay to a source as one JSON line and can never smuggle a second frame
+/// (Codex Q1: `char::is_control` misses U+2028/U+2029; an explicit allowlist
+/// does not). ASCII-only, so byte length == char length.
+fn is_valid_action_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_ACTION_TOKEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// Validate the optional generic `menu` (present on any view). A menu declares
+/// interactive options a source (or the htop adapter) offers; each option's
+/// `action` is an opaque token the client can trigger. Absent menu is fine.
+fn validate_menu(obj: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    let Some(menu) = obj.get("menu") else {
+        return Ok(());
+    };
+    let menu = menu.as_object().ok_or("menu must be an object")?;
+    let title = menu
+        .get("title")
+        .and_then(Value::as_str)
+        .ok_or("menu.title must be a string")?;
+    if title.is_empty() || title.chars().count() > MAX_MENU_LABEL {
+        return Err("menu.title length");
+    }
+    if let Some(d) = menu.get("detail") {
+        if d.as_str()
+            .ok_or("menu.detail must be a string")?
+            .chars()
+            .count()
+            > MAX_MENU_DETAIL
+        {
+            return Err("menu.detail too long");
+        }
+    }
+    let opts = menu
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or("menu.options must be an array")?;
+    if opts.is_empty() || opts.len() > MAX_MENU_OPTIONS {
+        return Err("menu.options count");
+    }
+    let mut seen = HashSet::new();
+    for o in opts {
+        let o = o.as_object().ok_or("menu option must be an object")?;
+        let label = o
+            .get("label")
+            .and_then(Value::as_str)
+            .ok_or("option.label must be a string")?;
+        if label.is_empty() || label.chars().count() > MAX_MENU_LABEL {
+            return Err("option.label length");
+        }
+        let action = o
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or("option.action must be a string")?;
+        if !is_valid_action_token(action) {
+            return Err("option.action grammar");
+        }
+        if !seen.insert(action) {
+            return Err("duplicate option.action");
+        }
+        if let Some(s) = o.get("style") {
+            let s = s.as_str().ok_or("option.style must be a string")?;
+            if !matches!(s, "default" | "danger" | "cancel") {
+                return Err("option.style enum");
+            }
+        }
+        if let Some(r) = o.get("requires") {
+            let r = r.as_str().ok_or("option.requires must be a string")?;
+            if !matches!(r, "approve" | "session") {
+                return Err("option.requires enum");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate a snapshot's shape for `view`. Kept strict but minimal — enough that
 /// the PWA renderer can trust the structure. Per-view knowledge lives here for
-/// now (one built-in view); a declarative schema can replace this later.
+/// now; the generic `menu` is validated for every view.
 pub fn validate(view: &str, state: &Value) -> Result<(), &'static str> {
     let obj = state.as_object().ok_or("state must be a JSON object")?;
     match view {
@@ -413,17 +676,15 @@ pub fn validate(view: &str, state: &Value) -> Result<(), &'static str> {
                     }
                 }
             }
-            Ok(())
         }
         "htop.v1" => {
-            if obj.get("processes").is_some_and(Value::is_array) {
-                Ok(())
-            } else {
-                Err("htop.v1: `processes` must be an array")
+            if !obj.get("processes").is_some_and(Value::is_array) {
+                return Err("htop.v1: `processes` must be an array");
             }
         }
-        _ => Err("unknown view"),
+        _ => return Err("unknown view"),
     }
+    validate_menu(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +737,7 @@ pub fn spawn_capture(app: Arc<App>) {
 
 async fn capture_task(app: Arc<App>, pane: String) {
     // Claim the pane's view; if it already has one (e.g. a `remux stream`), skip.
-    let guard = match app.pane_views.claim(&pane, "htop.v1") {
+    let guard = match app.pane_views.claim_internal(&pane, "htop.v1") {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -760,13 +1021,13 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
     if !pane_exists(&app, &header.pane) {
         return ack_err(&mut write, "no such pane in this session").await;
     }
-    let guard = match app.pane_views.claim(&header.pane, &header.view) {
-        Ok(g) => g,
+    let (guard, mut action_rx) = match app.pane_views.claim_socket(&header.pane, &header.view) {
+        Ok(pair) => pair,
         Err(e) => return ack_err(&mut write, e).await,
     };
     write.write_all(b"{\"ok\":true}\n").await?;
 
-    // --- snapshots ---
+    // --- snapshots (source → daemon) + actions (daemon → source), duplex ---
     // Latest-wins rate cap: coalesce snapshots into a single `pending` slot and
     // publish it at most once per MIN_UPDATE_INTERVAL. Unlike a plain drop, the
     // *final* snapshot of a source that then goes idle (but stays connected) is
@@ -775,10 +1036,38 @@ async fn handle(stream: UnixStream, app: Arc<App>) -> Result<()> {
     let mut flush = tokio::time::interval(MIN_UPDATE_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // NB: not `biased` — a perpetually-ready action branch must not starve
+        // snapshot reads / EOF (Codex finding 4); fair polling gives reads a turn.
         tokio::select! {
-            biased;
-            _ = flush.tick(), if pending.is_some() => {
-                guard.update(pending.take().unwrap());
+            _ = flush.tick() => {
+                match pending.take() {
+                    // Publish a coalesced snapshot; break if our claim is gone.
+                    Some(state) => if guard.update(state).is_none() { break; },
+                    // Idle tick: still notice a prune promptly so a pruned-but-
+                    // quiet connection frees its slot instead of lingering until
+                    // the whole action queue drains. (An action write already in
+                    // flight can delay this by up to ACTION_WRITE_TIMEOUT, but it
+                    // is always bounded and never a wedge.)
+                    None => if !guard.owns() { break; },
+                }
+            }
+            // A chosen menu action to relay back to the source. The token was
+            // validated against the ASCII grammar at menu-validate time, so it
+            // holds no newline; serde_json framing keeps it one JSON line. The
+            // write is timeout-bounded so a source that stops reading its socket
+            // can't wedge this task (and thus the stream slot) — on timeout we
+            // drop the connection (Codex finding 2).
+            act = action_rx.recv() => {
+                let Some(token) = act else { break }; // channel closed
+                let line = serde_json::json!({ "action": token }).to_string();
+                let w = async {
+                    write.write_all(line.as_bytes()).await?;
+                    write.write_all(b"\n").await
+                };
+                match tokio::time::timeout(ACTION_WRITE_TIMEOUT, w).await {
+                    Ok(Ok(())) => {}
+                    _ => break, // slow/broken source → drop it
+                }
             }
             line = read_line(&mut reader, &mut buf) => {
                 match line? {
@@ -852,7 +1141,12 @@ async fn gc_loop(app: Arc<App>) {
 /// `remux stream --view <id> [--pane %N]`: read newline-delimited JSON snapshots
 /// on stdin and forward them to the daemon as pane `pane`'s view. Blocks until
 /// stdin closes (or the daemon goes away).
-pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()> {
+pub fn stream(
+    state_dir: &Path,
+    pane: Option<String>,
+    view: String,
+    actions: Option<PathBuf>,
+) -> Result<()> {
     use std::io::{BufRead, Read, Write};
 
     let pane = pane
@@ -873,7 +1167,7 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
         .take(4096)
         .read_line(&mut ackline)
         .context("no ack from the daemon (timed out)")?;
-    sock.set_read_timeout(None)?; // we only write from here on
+    sock.set_read_timeout(None)?;
     let ack: Value = serde_json::from_str(ackline.trim())
         .with_context(|| format!("unexpected ack from daemon: {ackline:?}"))?;
     if ack["ok"] != serde_json::json!(true) {
@@ -887,17 +1181,61 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
         "remux: streaming '{view}' for pane {pane} — open the Dashboard on your phone (Ctrl-C to stop)"
     );
 
+    // Back-channel: if --actions was given, a detached thread relays daemon
+    // action lines to that path (a FIFO the source reads). It holds a socket
+    // CLONE, so on stdin EOF we must explicitly shutdown() the socket — dropping
+    // our handle alone would not close the connection while the clone lives, and
+    // the daemon would never see EOF to drop the view (Codex finding 3).
+    if let Some(actions_path) = actions {
+        let rsock = sock.try_clone()?;
+        // Open read+write, NOT write-only: opening a FIFO write-only blocks until
+        // a reader appears, which would hang the client (holding the daemon view)
+        // if the source hasn't opened its read end. O_RDWR on a FIFO never blocks
+        // (Codex finding 3); we only ever write to it.
+        let mut out = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false) // a FIFO/existing file must not be truncated
+            .open(&actions_path)
+            .with_context(|| format!("open --actions path {actions_path:?}"))?;
+        // Detached, NOT joined: a relay blocked writing to a full/undrained FIFO
+        // can't be interrupted by the socket shutdown, so joining could hang
+        // teardown. The daemon already learns of EOF from our `shutdown(Both)`;
+        // the OS reaps this thread on process exit.
+        std::thread::spawn(move || {
+            let mut lines = std::io::BufReader::new(rsock);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match lines.read_line(&mut line) {
+                    Ok(0) | Err(_) => break, // daemon closed / socket shut down
+                    Ok(_) => {
+                        // Relay verbatim (one JSON line per action); if the source
+                        // stops reading the FIFO, bail so we don't spin.
+                        if out
+                            .write_all(line.as_bytes())
+                            .and_then(|_| out.flush())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Forward stdin lines until EOF, each capped at MAX_LINE (like the daemon)
-    // so a runaway source can't allocate unbounded. Closing the socket on EOF
-    // signals the daemon to drop the view.
+    // so a runaway source can't allocate unbounded.
     let mut reader = std::io::stdin().lock().take(MAX_LINE);
     let mut buf: Vec<u8> = Vec::new();
-    loop {
+    let result = loop {
         reader.set_limit(MAX_LINE);
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
-            break; // stdin EOF
+            break Ok(()); // stdin EOF
         }
         if buf.last() != Some(&b'\n') {
             // Over-cap line: drain the rest of it (bounded MAX_LINE chunks) up to
@@ -921,11 +1259,15 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
             .and_then(|_| sock.write_all(b"\n"))
             .is_err()
         {
-            anyhow::bail!("daemon closed the pane-view stream");
+            break Err(anyhow::anyhow!("daemon closed the pane-view stream"));
         }
         sock.flush().ok();
-    }
-    Ok(())
+    };
+
+    // Signal the daemon (EOF) so it drops the view; the detached relay thread (if
+    // any) exits on the resulting socket close, or is reaped on process exit.
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+    result
 }
 
 #[cfg(test)]
@@ -940,11 +1282,17 @@ mod tests {
         json!({ "t": 0, "workers": ws })
     }
 
+    // Claim as a socket source, dropping the action back-channel — for the tests
+    // that only exercise the state registry, not action delivery.
+    fn claim<'a>(reg: &Registry, pane: &'a str, view: &'a str) -> Result<ClaimGuard, &'static str> {
+        reg.claim_socket(pane, view).map(|(g, _rx)| g)
+    }
+
     #[test]
     fn claim_update_snapshot_and_rev() {
         let reg = Registry::default();
         assert!(reg.snapshot().is_empty());
-        let g = reg.claim("%1", "taskscope.v1").unwrap();
+        let g = claim(&reg, "%1", "taskscope.v1").unwrap();
         // Claimed but no snapshot yet → not renderable.
         assert!(reg.snapshot().is_empty());
         assert_eq!(g.update(ts(2)), Some(1));
@@ -959,34 +1307,34 @@ mod tests {
     #[test]
     fn one_live_view_per_pane_and_unknown_view_rejected() {
         let reg = Registry::default();
-        let _g = reg.claim("%1", "taskscope.v1").unwrap();
+        let _g = claim(&reg, "%1", "taskscope.v1").unwrap();
         assert_eq!(
-            reg.claim("%1", "taskscope.v1").err(),
+            claim(&reg, "%1", "taskscope.v1").err(),
             Some("pane already has a live view")
         );
-        assert_eq!(reg.claim("%2", "nope.v9").err(), Some("unknown view"));
+        assert_eq!(claim(&reg, "%2", "nope.v9").err(), Some("unknown view"));
     }
 
     #[test]
     fn dropping_the_guard_removes_the_view() {
         let reg = Registry::default();
         {
-            let g = reg.claim("%1", "taskscope.v1").unwrap();
+            let g = claim(&reg, "%1", "taskscope.v1").unwrap();
             g.update(ts(1));
             assert_eq!(reg.snapshot().len(), 1);
         }
         assert!(reg.snapshot().is_empty(), "guard drop must remove the view");
         // Pane is free to re-claim.
-        assert!(reg.claim("%1", "taskscope.v1").is_ok());
+        assert!(claim(&reg, "%1", "taskscope.v1").is_ok());
     }
 
     #[test]
     fn a_stale_guard_never_clobbers_a_reclaimed_pane() {
         let reg = Registry::default();
-        let old = reg.claim("%1", "taskscope.v1").unwrap();
+        let old = claim(&reg, "%1", "taskscope.v1").unwrap();
         // Pane vanished + re-claimed by a new source.
         reg.prune(&HashSet::new());
-        let new = reg.claim("%1", "taskscope.v1").unwrap();
+        let new = claim(&reg, "%1", "taskscope.v1").unwrap();
         new.update(ts(1));
         // The stale guard's update must be a no-op, and its Drop must not remove
         // the new owner's entry.
@@ -999,9 +1347,9 @@ mod tests {
     #[test]
     fn prune_drops_missing_panes() {
         let reg = Registry::default();
-        let _a = reg.claim("%1", "taskscope.v1").unwrap();
+        let _a = claim(&reg, "%1", "taskscope.v1").unwrap();
         _a.update(ts(1));
-        let _b = reg.claim("%2", "taskscope.v1").unwrap();
+        let _b = claim(&reg, "%2", "taskscope.v1").unwrap();
         _b.update(ts(1));
         reg.prune(&HashSet::from(["%1".to_string()]));
         let snap = reg.snapshot();
@@ -1024,6 +1372,156 @@ mod tests {
         .is_err());
         assert!(validate("other.v1", &ts(1)).is_err());
         assert!(validate("taskscope.v1", &ts(MAX_WORKERS + 1)).is_err());
+    }
+
+    fn ts_menu(opts: Value) -> Value {
+        json!({ "workers": [], "menu": { "title": "t", "options": opts } })
+    }
+
+    #[test]
+    fn validate_menu_shapes() {
+        // Good: one option with an explicit session policy.
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "Pause", "action": "pause", "requires": "session"}]))
+        )
+        .is_ok());
+        // Good: danger style.
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "Del", "action": "del:1", "style": "danger"}]))
+        )
+        .is_ok());
+        // No menu at all is fine.
+        assert!(validate("taskscope.v1", &json!({"workers": []})).is_ok());
+        // Bad: empty options, too many options, bad token grammar, dup token,
+        // bad style/requires enums, non-string label.
+        assert!(validate("taskscope.v1", &ts_menu(json!([]))).is_err());
+        let many: Vec<Value> = (0..MAX_MENU_OPTIONS + 1)
+            .map(|i| json!({"label": "x", "action": format!("a{i}")}))
+            .collect();
+        assert!(validate("taskscope.v1", &ts_menu(json!(many))).is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "x", "action": "bad token"}]))
+        )
+        .is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "x", "action": "touch /tmp/p"}]))
+        )
+        .is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([
+                {"label": "a", "action": "dup"},
+                {"label": "b", "action": "dup"}
+            ]))
+        )
+        .is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "x", "action": "ok", "style": "boom"}]))
+        )
+        .is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": "x", "action": "ok", "requires": "root"}]))
+        )
+        .is_err());
+        assert!(validate(
+            "taskscope.v1",
+            &ts_menu(json!([{"label": 1, "action": "ok"}]))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn action_token_grammar() {
+        assert!(is_valid_action_token("pause"));
+        assert!(is_valid_action_token("del:run-123.v2_final"));
+        assert!(!is_valid_action_token("")); // empty
+        assert!(!is_valid_action_token("has space"));
+        assert!(!is_valid_action_token("line\nbreak"));
+        assert!(!is_valid_action_token("sep\u{2028}here")); // U+2028 (is_control misses it)
+        assert!(!is_valid_action_token(&"a".repeat(MAX_ACTION_TOKEN + 1)));
+    }
+
+    #[test]
+    fn socket_source_cannot_claim_internal_view() {
+        let reg = Registry::default();
+        // htop.v1 is internal-only: an external source is rejected...
+        assert_eq!(
+            reg.claim_socket("%1", "htop.v1").err(),
+            Some("view not available to external sources")
+        );
+        // ...but the in-process adapter may claim it.
+        assert!(reg.claim_internal("%1", "htop.v1").is_ok());
+    }
+
+    #[test]
+    fn action_kind_by_provenance() {
+        let reg = Registry::default();
+        let _h = reg.claim_internal("%1", "htop.v1").unwrap();
+        let (_s, _rx) = reg.claim_socket("%2", "taskscope.v1").unwrap();
+        assert_eq!(reg.action_kind("%1"), Some(ActionKind::Htop));
+        assert_eq!(reg.action_kind("%2"), Some(ActionKind::Source));
+        assert_eq!(reg.action_kind("%9"), None);
+    }
+
+    #[test]
+    fn send_action_membership_and_policy() {
+        let reg = Registry::default();
+        let (guard, mut rx) = reg.claim_socket("%1", "taskscope.v1").unwrap();
+        // Advertise: `pause` (session) and `wipe` (danger → approve).
+        guard.update(ts_menu(json!([
+            {"label": "Pause", "action": "pause", "requires": "session"},
+            {"label": "Wipe", "action": "wipe", "style": "danger"}
+        ])));
+
+        // Not advertised → dropped.
+        assert!(!reg.send_action("%1", "nope", true));
+        // Session action: any in-session device (no approve) is OK.
+        assert!(reg.send_action("%1", "pause", false));
+        assert_eq!(rx.try_recv().ok(), Some("pause".to_string()));
+        // Approve action: rejected without approve, accepted with it.
+        assert!(!reg.send_action("%1", "wipe", false));
+        assert!(reg.send_action("%1", "wipe", true));
+        assert_eq!(rx.try_recv().ok(), Some("wipe".to_string()));
+
+        // A new snapshot without the menu revokes both actions.
+        guard.update(json!({"workers": []}));
+        assert!(!reg.send_action("%1", "pause", true));
+    }
+
+    #[test]
+    fn send_action_bounded_queue_drops_when_full() {
+        let reg = Registry::default();
+        let (guard, _rx) = reg.claim_socket("%1", "taskscope.v1").unwrap();
+        guard.update(ts_menu(
+            json!([{"label": "P", "action": "pause", "requires": "session"}]),
+        ));
+        // Never draining rx: the first ACTION_QUEUE sends fit, the next is dropped.
+        for _ in 0..ACTION_QUEUE {
+            assert!(reg.send_action("%1", "pause", true));
+        }
+        assert!(
+            !reg.send_action("%1", "pause", true),
+            "full queue must drop"
+        );
+    }
+
+    #[test]
+    fn internal_htop_has_no_back_channel() {
+        let reg = Registry::default();
+        let guard = reg.claim_internal("%1", "htop.v1").unwrap();
+        // Even if an htop snapshot somehow carried a menu, an internal view has no
+        // action_tx, so send_action can never forward.
+        guard.update(json!({
+            "processes": [],
+            "menu": {"title": "t", "options": [{"label": "x", "action": "ok", "requires": "session"}]}
+        }));
+        assert!(!reg.send_action("%1", "ok", true));
     }
 
     // A real `tmux capture-pane -p` of htop (trimmed), including the meters, the

@@ -38,14 +38,14 @@ use tokio::sync::{broadcast, mpsc};
 pub const SOCKET: &str = "pane-view.sock";
 
 /// Built-in view identifiers the PWA ships a hard-coded renderer for.
-pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1", "htop.v1"];
+pub const KNOWN_VIEWS: &[&str] = &["taskscope.v1", "htop.v1", "claude.v1"];
 
 /// Views produced ONLY by an in-process adapter (the htop capture adapter),
 /// never claimable over the source socket. This is a provenance boundary: the
 /// daemon executes `htop.v1` actions itself (tmux/kill), so an external source
 /// must not be able to impersonate that view and drive the tmux path with a
 /// forged process list (Codex). External sources get `SOCKET_VIEWS` only.
-pub const INTERNAL_VIEWS: &[&str] = &["htop.v1"];
+pub const INTERNAL_VIEWS: &[&str] = &["htop.v1", "claude.v1"];
 
 /// Foreground commands the daemon auto-captures into a pane view (best-effort
 /// "semantic lens" over the real tool's rendered screen — see `parse_htop`).
@@ -98,6 +98,9 @@ enum SourceKind {
     /// The in-process htop capture adapter. Actions run through the tmux/kill
     /// whitelist in this module.
     InternalHtop,
+    /// The in-process Claude projector (`claude.v1`). No pane actions — approvals
+    /// go through the permit decide path, not the pane-view action channel.
+    InternalClaude,
     /// An external `remux stream` source. Actions are forwarded back to it over
     /// the connection's back-channel; the daemon never interprets them.
     Socket,
@@ -218,11 +221,16 @@ impl Registry {
         self.events.subscribe()
     }
 
-    /// Claim `pane` for an in-process (`InternalHtop`) view — the capture
-    /// adapter. No back-channel.
+    /// Claim `pane` for an in-process view — the htop capture adapter or the
+    /// Claude projector. The kind is inferred from the view (both are internal).
+    /// Non-preempting: fails if the pane already has any live view.
     pub fn claim_internal(&self, pane: &str, view: &str) -> Result<ClaimGuard, &'static str> {
-        self.claim_inner(pane, view, SourceKind::InternalHtop, None)
-            .map(|(g, _)| g)
+        let kind = if view == "claude.v1" {
+            SourceKind::InternalClaude
+        } else {
+            SourceKind::InternalHtop
+        };
+        self.claim_inner(pane, view, kind, None).map(|(g, _)| g)
     }
 
     /// Claim `pane` for an external `remux stream` (`Socket`) source. Rejects
@@ -285,10 +293,16 @@ impl Registry {
     /// How a pane's actions should be routed, by provenance — `None` if the pane
     /// has no live view.
     pub fn action_kind(&self, pane: &str) -> Option<ActionKind> {
-        self.inner.lock().unwrap().get(pane).map(|e| match e.kind {
-            SourceKind::InternalHtop => ActionKind::Htop,
-            SourceKind::Socket => ActionKind::Source,
-        })
+        self.inner
+            .lock()
+            .unwrap()
+            .get(pane)
+            .and_then(|e| match e.kind {
+                SourceKind::InternalHtop => Some(ActionKind::Htop),
+                SourceKind::Socket => Some(ActionKind::Source),
+                // Claude has no pane-view actions (approvals go through permit decide).
+                SourceKind::InternalClaude => None,
+            })
     }
 
     /// Forward a chosen menu `token` to the pane's `Socket` source. Returns
@@ -767,6 +781,98 @@ async fn capture_task(app: Arc<App>, pane: String) {
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Claude projector: agent lifecycle state (+ open permit cards) -> claude.v1
+// ---------------------------------------------------------------------------
+
+/// Build the sanitized, broadcast-safe `claude.v1` snapshot for one pane. Carries
+/// ONLY coarse status: pane, session id, status, and a pending ask that is a
+/// *reference* (tool name + permission-card id) — never the command/summary,
+/// which stays in the approve-only permit card the PWA joins by id.
+fn build_claude_v1(v: &crate::agent::AgentView, cards: &[crate::permit::Card]) -> Value {
+    // A pending ask = an active op whose id matches an open permit card for this
+    // pane (Claude's tool_use_id == the card's prompt_id). Prefer the newest op.
+    let ask = v.ops.iter().rev().find_map(|op| {
+        cards
+            .iter()
+            .find(|c| c.pane == v.pane && c.prompt_id.as_deref() == Some(op.op_id.as_str()))
+            .map(|c| serde_json::json!({ "tool_name": op.tool, "permission_card_id": c.id }))
+    });
+    let status = if ask.is_some() {
+        "awaiting-approval"
+    } else {
+        match v.base {
+            crate::agent::BaseStatus::Working => "working",
+            crate::agent::BaseStatus::Idle => "idle",
+        }
+    };
+    serde_json::json!({
+        "pane": v.pane,
+        "session_id": v.session_id,
+        "status": status,
+        "current_tool_ask": ask,   // null when not awaiting approval
+        "recent_tools": [],        // deferred: no honest ok/fail signal yet
+    })
+}
+
+/// Project per-pane agent state (joined with open permit cards) into `claude.v1`
+/// pane views. Non-preempting: it only claims a pane with NO live view, so it
+/// never steals a pane from the htop adapter or a `remux stream` source. Wakes on
+/// agent-state changes, permit-card changes, and topology changes.
+pub fn spawn_claude_projector(app: Arc<App>) {
+    tokio::spawn(async move {
+        let mut agent_rx = app.agents.subscribe();
+        let mut perm_rx = app.perms.subscribe();
+        let mut topo_rx = app.topology.subscribe();
+        let mut guards: HashMap<String, ClaimGuard> = HashMap::new();
+        loop {
+            // GC agent state to live panes (also expires TTL'd entries).
+            let live: HashSet<String> = topo_rx
+                .borrow()
+                .iter()
+                .flat_map(|s| s.windows.iter())
+                .flat_map(|w| w.panes.iter())
+                .map(|p| p.id.clone())
+                .collect();
+            app.agents.prune(&live);
+
+            let cards = app.perms.snapshot();
+            let desired: HashMap<String, Value> = app
+                .agents
+                .views()
+                .iter()
+                .map(|v| (v.pane.clone(), build_claude_v1(v, &cards)))
+                .collect();
+
+            for (pane, state) in &desired {
+                match guards.get(pane) {
+                    // We own it: republish; drop the guard if we lost ownership.
+                    Some(g) => {
+                        if g.update(state.clone()).is_none() {
+                            guards.remove(pane);
+                        }
+                    }
+                    // We don't: claim only if the pane is free (non-preempting).
+                    None => {
+                        if let Ok(g) = app.pane_views.claim_internal(pane, "claude.v1") {
+                            g.update(state.clone());
+                            guards.insert(pane.clone(), g);
+                        }
+                    }
+                }
+            }
+            // Release panes that no longer have agent state (guard drop → view gone).
+            guards.retain(|pane, _| desired.contains_key(pane));
+
+            tokio::select! {
+                r = agent_rx.recv() => { if matches!(r, Err(broadcast::error::RecvError::Closed)) { break } }
+                r = perm_rx.recv() => { if matches!(r, Err(broadcast::error::RecvError::Closed)) { break } }
+                r = topo_rx.changed() => { if r.is_err() { break } }
+            }
+        }
+    });
 }
 
 /// Parse an htop screen (from `capture-pane -p`) into `htop.v1` state. Tolerant
@@ -1522,6 +1628,46 @@ mod tests {
             "menu": {"title": "t", "options": [{"label": "x", "action": "ok", "requires": "session"}]}
         }));
         assert!(!reg.send_action("%1", "ok", true));
+    }
+
+    #[test]
+    fn claude_v1_correlates_card_by_reference_without_leaking() {
+        use crate::agent::{AgentView, BaseStatus, Op};
+        use crate::permit::Card;
+        use std::time::Instant;
+        let card = Card {
+            id: "card-1".into(),
+            session: "main".into(),
+            pane: "%1".into(),
+            source: "claude-code".into(),
+            tool: "Bash".into(),
+            summary: "rm -rf /secret".into(),
+            truncated: false,
+            prompt_id: Some("op-1".into()),
+            created: Instant::now(),
+            deadline: Instant::now(),
+        };
+        let view = AgentView {
+            pane: "%1".into(),
+            session_id: "s1".into(),
+            base: BaseStatus::Working,
+            ops: vec![Op {
+                op_id: "op-1".into(),
+                tool: "Bash".into(),
+            }],
+        };
+        // A matching card → awaiting-approval, exposing only tool name + card id.
+        let v = build_claude_v1(&view, std::slice::from_ref(&card));
+        assert_eq!(v["status"], "awaiting-approval");
+        assert_eq!(v["current_tool_ask"]["tool_name"], "Bash");
+        assert_eq!(v["current_tool_ask"]["permission_card_id"], "card-1");
+        // The command/summary must NEVER appear in the broadcast claude.v1.
+        assert!(!v.to_string().contains("rm -rf"));
+        assert!(!v.to_string().contains("secret"));
+        // No matching card → base status, no ask.
+        let v2 = build_claude_v1(&view, &[]);
+        assert_eq!(v2["status"], "working");
+        assert!(v2["current_tool_ask"].is_null());
     }
 
     // A real `tmux capture-pane -p` of htop (trimmed), including the meters, the

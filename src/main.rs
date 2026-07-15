@@ -329,6 +329,8 @@ async fn main() -> Result<()> {
     paneview::spawn(app.clone(), &state_dir)?;
     // Auto-capture real tools (htop) into a pane view — a lens over the pane.
     paneview::spawn_capture(app.clone());
+    // Project agent lifecycle state (+ open permit cards) into `claude.v1`.
+    paneview::spawn_claude_projector(app.clone());
     server::run(app).await
 }
 
@@ -685,7 +687,14 @@ fn emit_permission(
         "pane": pane, "source": source, "tool": tool,
         "summary": summary, "truncated": truncated,
     });
-    if let Some(pid) = payload["prompt_id"].as_str() {
+    // Correlation id for dedup AND for the claude.v1 dashboard to join this card
+    // to the active operation: prefer the agent's own prompt_id, else its
+    // tool_use_id (Claude Code's PreToolUse payload carries the latter, and the
+    // agent-state `operation-started` uses the same value as its operation id).
+    if let Some(pid) = payload["prompt_id"]
+        .as_str()
+        .or_else(|| payload["tool_use_id"].as_str())
+    {
         body["prompt_id"] = pid.into();
     }
 

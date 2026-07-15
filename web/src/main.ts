@@ -260,6 +260,9 @@ function connect(): void {
   clearTimeout(reconnectTimer); // a pending retry must not race this connect
   setup.hidden = true;
   setStatus("connecting…", "connecting");
+  // A new socket may be a new session/pane — any shell-line sync is stale.
+  shellSynced = "";
+  cancelTabFlight();
 
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const sock = new WebSocket(`${scheme}://${location.host}/ws`);
@@ -365,6 +368,8 @@ interface ControlMsg {
   cards?: PermissionCard[];
   /** command_feed frames (M4c) */
   commands?: FeedCommand[];
+  /** tab_completed frames: the shell's completed command line */
+  text?: string;
 }
 
 /** A shell command in the session feed (M4c). Mirrors the daemon's Cmd view. */
@@ -439,6 +444,19 @@ function handleControl(msg: ControlMsg): void {
     case "command_feed":
       onCommandFeed(msg.commands ?? []);
       break;
+    case "tab_completed": {
+      const completed = msg.text ?? "";
+      shellSynced = completed;
+      // Mirror into the field only if the user didn't type during the
+      // round-trip; either way `shellSynced` records what the shell holds,
+      // so the next submit/Tab reconciles.
+      if (tabDraft !== null && composerInput.value === tabDraft) {
+        composerInput.value = completed;
+        composerInput.setSelectionRange(completed.length, completed.length);
+      }
+      cancelTabFlight();
+      break;
+    }
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
       if (rtt < 10_000) {
@@ -462,6 +480,12 @@ function handleControl(msg: ControlMsg): void {
         // Fall back to the server default; onclose will reconnect.
         localStorage.removeItem(SESSION_KEY);
         showHint("Session unavailable — using default");
+      } else if (msg.code === "tab_complete_failed") {
+        // The draft is still in the field; the shell line state is unknown,
+        // so drop the sync (the next submit rewrites the whole line).
+        cancelTabFlight();
+        shellSynced = "";
+        showHint("Completion failed");
       }
       break;
   }
@@ -551,6 +575,10 @@ function windowAction(action: string, index?: number): void {
     return;
   }
   sendJson({ type: "window_action", action, index });
+  // The active pane may change; a tab-flushed line stays behind in the old
+  // pane's shell, so the composer must stop assuming it's in front of it.
+  shellSynced = "";
+  cancelTabFlight();
 }
 
 // Window switching now lives in the always-visible tab strip (renderTabs);
@@ -1201,24 +1229,39 @@ function recallList(): string[] {
   return out;
 }
 
-/// True after a Tab flushed a draft to the shell: the real command line
-/// lives in the terminal now, partially completed there.
-let shellLinePending = false;
+/// Text a tab-complete left in the shell's input buffer, exactly as the
+/// daemon echoed it back ("" = shell line believed empty). The composer
+/// mirrors it, so submitting unchanged text only needs Enter; divergence
+/// (the user edited the field) is reconciled by sending just the appended
+/// suffix, or rewriting the whole shell line (^U) when earlier text changed.
+let shellSynced = "";
+/// Draft sent with the in-flight tab_complete round-trip; null when idle.
+/// Guards against overlapping requests and against the echo clobbering text
+/// the user typed while waiting.
+let tabDraft: string | null = null;
+let tabTimer: number | undefined;
+
+function cancelTabFlight(): void {
+  tabDraft = null;
+  clearTimeout(tabTimer);
+}
 
 function composerSubmit(): void {
   const text = composerInput.value;
-  if (!text && !shellLinePending) return;
-  if (!text) {
-    // Empty submit finishes the tab-completed line already in the shell.
+  if (!text && !shellSynced) return;
+  if (text === shellSynced) {
+    // The shell already holds exactly this line (tab-completed there).
     sendInput("\r");
-    shellLinePending = false;
-    return;
+  } else if (text.startsWith(shellSynced)) {
+    // Only appended since the last sync — the shell needs just the suffix.
+    sendInput(text.slice(shellSynced.length) + "\r");
+  } else {
+    // Edited inside the synced part (or cleared it): rewrite the shell line.
+    sendInput("\x15" + text + "\r");
   }
-  sendInput(text + "\r");
-  // After a tab-flush the field only holds the suffix — recording it would
-  // pollute history with an invalid partial command.
-  if (!shellLinePending) recordTyped(text);
-  shellLinePending = false;
+  if (text) recordTyped(text);
+  shellSynced = "";
+  cancelTabFlight();
   endRecall();
   composerInput.value = "";
 }
@@ -1231,13 +1274,27 @@ function endRecall(): void {
 }
 
 /// Shell completion from the composer: the draft must live in the shell's
-/// input buffer for Tab to mean anything — flush it un-submitted, then Tab.
-/// The completed line continues in the terminal; the composer clears so a
-/// following submit appends to that same shell line.
+/// input buffer for Tab to mean anything. The daemon types it there, presses
+/// Tab, reads the completed line back off the pane and echoes it
+/// (tab_completed) — so the completion lands in the input field too, not just
+/// the terminal. The draft stays visible while the round-trip is in flight;
+/// a repeat Tab on an unchanged field reaches the shell as consecutive Tabs
+/// (candidate list).
 function composerTabComplete(): void {
-  sendInput(composerInput.value + "\t");
-  shellLinePending = true;
-  composerInput.value = "";
+  if (tabDraft !== null) return; // one round-trip at a time
+  if (!isController) {
+    // Fire-and-forget fallback: flush the draft (buffers + requests control).
+    // No echo comes back; the completion continues in the terminal.
+    const text = composerInput.value;
+    sendInput(text + "\t");
+    shellSynced = text;
+    endRecall();
+    return;
+  }
+  tabDraft = composerInput.value;
+  sendJson({ type: "tab_complete", text: tabDraft, synced: shellSynced });
+  // A lost reply must not wedge Tab forever.
+  tabTimer = window.setTimeout(() => (tabDraft = null), 3000);
   endRecall();
 }
 
@@ -1511,7 +1568,7 @@ function keyRowArrowsRecall(): boolean {
 }
 
 setupKeyRow((data) => {
-  if (data === "\t" && composerInput.value) {
+  if (data === "\t" && (composerInput.value || shellSynced)) {
     composerTabComplete();
   } else if ((data === "\x1b[A" || data === "\x1b[B") && keyRowArrowsRecall()) {
     // At a shell prompt, ↑/↓ recall the session's commands into the editable

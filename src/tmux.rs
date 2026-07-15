@@ -503,6 +503,150 @@ fn ensure_zoom(session: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------- composer tab-completion (shell line readback) ----------
+
+/// Cursor position and pane width of the target pane (viewport-relative).
+fn cursor_state(target: &str) -> Result<(usize, usize, usize)> {
+    let mut cmd = tmux();
+    cmd.args([
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{cursor_x} #{cursor_y} #{pane_width}",
+    ]);
+    let out = run(cmd)?;
+    let mut f = out.split_whitespace();
+    match (
+        f.next().and_then(|s| s.parse().ok()),
+        f.next().and_then(|s| s.parse().ok()),
+        f.next().and_then(|s| s.parse().ok()),
+    ) {
+        (Some(x), Some(y), Some(w)) => Ok((x, y, w)),
+        _ => bail!("unparseable cursor state {out:?}"),
+    }
+}
+
+/// The logical (unwrap-joined) line containing viewport `row`: the last line
+/// of a `-J` capture from the top of the viewport down to that row. `-J`
+/// re-joins what the pane width wrapped — on a phone-sized pane prompt plus
+/// command routinely exceed one row, so a per-row capture would mis-slice.
+/// Ending the capture at `row` keeps anything the shell draws *below* the
+/// command line (e.g. a zsh completion menu) out of the join.
+fn capture_joined_line(target: &str, row: usize) -> Result<String> {
+    let row = row.to_string();
+    let mut cmd = tmux();
+    cmd.args([
+        "capture-pane",
+        "-p",
+        "-J",
+        "-t",
+        target,
+        "-S",
+        "0",
+        "-E",
+        &row,
+    ]);
+    Ok(run(cmd)?.lines().last().unwrap_or("").to_string())
+}
+
+/// The logical line under the cursor plus the cursor's character offset
+/// within it. The offset is reconstructed from the pane width: this flow only
+/// ever has the cursor on the logical line's last screen row (we type at the
+/// end of the line), so offset = full rows above it × width + cursor column.
+fn logical_cursor(target: &str) -> Result<(String, usize)> {
+    let (cx, cy, width) = cursor_state(target)?;
+    let joined = capture_joined_line(target, cy)?;
+    let width = width.max(1);
+    let rows = joined.chars().count().div_ceil(width).max(1);
+    Ok((joined, (rows - 1) * width + cx))
+}
+
+/// Type text into the pane exactly as-is (no key-name interpretation).
+fn send_literal(target: &str, text: &str) -> Result<()> {
+    let mut cmd = tmux();
+    cmd.args(["send-keys", "-t", target, "-l", "--", text]);
+    run(cmd)?;
+    Ok(())
+}
+
+fn send_key(target: &str, key: &str) -> Result<()> {
+    let mut cmd = tmux();
+    cmd.args(["send-keys", "-t", target, key]);
+    run(cmd)?;
+    Ok(())
+}
+
+/// The command-line slice of the logical cursor line: characters
+/// `prompt_col..cursor_offset`. capture-pane may trim trailing spaces but the
+/// cursor offset is authoritative (shells append a space after an unambiguous
+/// completion) — pad back up to it. Cutting at the cursor also keeps
+/// after-cursor ghost text (fish/zsh autosuggestions) out of the result.
+fn line_under_cursor(joined: &str, prompt_col: usize, cursor_offset: usize) -> String {
+    let want = cursor_offset.saturating_sub(prompt_col);
+    let mut out: String = joined.chars().skip(prompt_col).take(want).collect();
+    for _ in out.chars().count()..want {
+        out.push(' ');
+    }
+    out
+}
+
+/// Type the composer draft into the session's active pane, press Tab, and
+/// read the shell-completed command line back off the screen — so the
+/// completion can be mirrored into the client's input field, not just shown
+/// in the terminal.
+///
+/// `text` is the full line the composer wants completed; `synced` is what a
+/// previous call already left in the shell's input buffer ("" if none). The
+/// prompt width is inferred from the cursor offset before typing (the cursor
+/// sits right after `synced`), which is what lets the readback strip the
+/// prompt without knowing anything about the shell or its prompt format.
+pub fn tab_complete(session: &str, text: &str, synced: &str) -> Result<String> {
+    let target = format!("={session}:");
+    let synced_w = synced.chars().count();
+    let (_, cur0) = logical_cursor(&target)?;
+    if cur0 < synced_w {
+        bail!("shell line out of sync with composer (pane changed underneath)");
+    }
+    let prompt_col = cur0 - synced_w;
+    match text.strip_prefix(synced) {
+        // The composer only appended since the last sync: type just the new
+        // suffix. An empty suffix is a repeat Tab, which shells answer with
+        // the candidate list.
+        Some(rest) => {
+            if !rest.is_empty() {
+                send_literal(&target, rest)?;
+            }
+        }
+        // Earlier text was edited: rewrite the whole line. C-u kills it in
+        // bash, zsh and fish alike.
+        None => {
+            send_key(&target, "C-u")?;
+            if !text.is_empty() {
+                send_literal(&target, text)?;
+            }
+        }
+    }
+    send_key(&target, "Tab")?;
+    // The shell echoes the completion asynchronously; sample the cursor line
+    // until two consecutive reads agree (~120ms typical, 600ms worst case).
+    let mut last: Option<String> = None;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let (joined, cur) = logical_cursor(&target)?;
+        if cur < prompt_col {
+            continue; // mid-redraw (e.g. a candidate list being printed)
+        }
+        let val = line_under_cursor(&joined, prompt_col, cur);
+        if last.as_deref() == Some(val.as_str()) {
+            return Ok(val);
+        }
+        last = Some(val);
+    }
+    // Never stabilised (busy pane) — the last sample is still the best answer.
+    last.context("could not read the completed line back")
+}
+
 /// True when any attached tmux client sent input within `within_secs` —
 /// i.e. someone is sitting at a keyboard and does not need a push.
 pub fn any_client_active_within(within_secs: u64) -> Result<bool> {
@@ -635,6 +779,20 @@ mod tests {
         // with a mangled id, rather than mis-assigning fields.
         assert_eq!(parse_pane_line("1 1 vim"), None);
         assert_eq!(parse_pane_line("%x 1 1 vim"), None);
+    }
+
+    #[test]
+    fn line_under_cursor_slices_prompt_and_pads() {
+        // Prompt "u@h $ " occupies 6 columns; cursor after "ls docs/" = col 14.
+        assert_eq!(line_under_cursor("u@h $ ls docs/", 6, 14), "ls docs/");
+        // capture-pane trimmed the completion's trailing space; the cursor
+        // column restores it.
+        assert_eq!(line_under_cursor("u@h $ ls docs/", 6, 15), "ls docs/ ");
+        // Cut at the cursor: after-cursor ghost text must not leak in.
+        assert_eq!(line_under_cursor("u@h $ ls docs/ghost", 6, 8), "ls");
+        assert_eq!(line_under_cursor("", 0, 0), "");
+        // Saturates when the cursor is left of the prompt column (mid-redraw).
+        assert_eq!(line_under_cursor("x", 5, 3), "");
     }
 
     #[test]

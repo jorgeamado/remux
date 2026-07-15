@@ -46,6 +46,15 @@ enum ClientMsg {
         #[serde(default)]
         index: Option<u32>,
     },
+    /// Complete the composer draft in the shell (Tab) and echo the completed
+    /// line back — controller only. `text` is the full desired command line;
+    /// `synced` is what a previous tab-complete already left in the shell's
+    /// input buffer.
+    TabComplete {
+        text: String,
+        #[serde(default)]
+        synced: String,
+    },
     Ping,
 }
 
@@ -69,6 +78,11 @@ enum ServerMsg<'a> {
         reason: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<&'a str>,
+    },
+    /// The shell's command line after a TabComplete, prompt stripped — the
+    /// client mirrors it into the input field.
+    TabCompleted {
+        text: &'a str,
     },
     Pong,
 }
@@ -565,6 +579,53 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                     message: "could not perform window action",
                                 }))
                                 .await;
+                        }
+                    }
+                }
+                Ok(ClientMsg::TabComplete { text, synced }) => {
+                    if !controller {
+                        let _ = out_tx
+                            .send(json(&ServerMsg::Error {
+                                code: "observer",
+                                message: "take control before completing",
+                            }))
+                            .await;
+                    } else if text.len() > 512
+                        || synced.len() > 512
+                        || text.chars().any(|c| c.is_control())
+                        || synced.chars().any(|c| c.is_control())
+                    {
+                        let _ = out_tx
+                            .send(json(&ServerMsg::Error {
+                                code: "tab_complete_failed",
+                                message: "draft too long or invalid",
+                            }))
+                            .await;
+                    } else {
+                        // Awaiting here serialises the round-trip against other
+                        // input — correct (typing mid-completion would corrupt
+                        // the readback) and short (≤ ~700ms; the user is
+                        // waiting on the completion anyway).
+                        let session = session.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            tmux::tab_complete(&session, &text, &synced)
+                        })
+                        .await?;
+                        match res {
+                            Ok(completed) => {
+                                let _ = out_tx
+                                    .send(json(&ServerMsg::TabCompleted { text: &completed }))
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!("tab complete failed: {e:#}");
+                                let _ = out_tx
+                                    .send(json(&ServerMsg::Error {
+                                        code: "tab_complete_failed",
+                                        message: "could not complete in the shell",
+                                    }))
+                                    .await;
+                            }
                         }
                     }
                 }

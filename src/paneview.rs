@@ -825,8 +825,16 @@ pub fn spawn_claude_projector(app: Arc<App>) {
     tokio::spawn(async move {
         let mut agent_rx = app.agents.subscribe();
         let mut perm_rx = app.perms.subscribe();
+        let mut view_rx = app.pane_views.subscribe();
         let mut topo_rx = app.topology.subscribe();
+        // A periodic tick so TTL-expired state is pruned and a freed pane is
+        // reclaimed even when no other event wakes us.
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
         let mut guards: HashMap<String, ClaimGuard> = HashMap::new();
+        // Last state we published per pane — so we only call guard.update() on a
+        // real change. Without this, republishing on our own pane-view wake would
+        // spin (update -> event -> wake -> update ...).
+        let mut last: HashMap<String, Value> = HashMap::new();
         loop {
             // GC agent state to live panes (also expires TTL'd entries).
             let live: HashSet<String> = topo_rx
@@ -848,10 +856,15 @@ pub fn spawn_claude_projector(app: Arc<App>) {
 
             for (pane, state) in &desired {
                 match guards.get(pane) {
-                    // We own it: republish; drop the guard if we lost ownership.
+                    // We own it: republish only on a real change (else we'd spin).
                     Some(g) => {
-                        if g.update(state.clone()).is_none() {
-                            guards.remove(pane);
+                        if last.get(pane) != Some(state) {
+                            if g.update(state.clone()).is_none() {
+                                guards.remove(pane);
+                                last.remove(pane);
+                            } else {
+                                last.insert(pane.clone(), state.clone());
+                            }
                         }
                     }
                     // We don't: claim only if the pane is free (non-preempting).
@@ -859,17 +872,22 @@ pub fn spawn_claude_projector(app: Arc<App>) {
                         if let Ok(g) = app.pane_views.claim_internal(pane, "claude.v1") {
                             g.update(state.clone());
                             guards.insert(pane.clone(), g);
+                            last.insert(pane.clone(), state.clone());
                         }
                     }
                 }
             }
             // Release panes that no longer have agent state (guard drop → view gone).
             guards.retain(|pane, _| desired.contains_key(pane));
+            last.retain(|pane, _| desired.contains_key(pane));
 
             tokio::select! {
                 r = agent_rx.recv() => { if matches!(r, Err(broadcast::error::RecvError::Closed)) { break } }
                 r = perm_rx.recv() => { if matches!(r, Err(broadcast::error::RecvError::Closed)) { break } }
+                // A pane-view change may free a pane we couldn't claim before.
+                r = view_rx.recv() => { if matches!(r, Err(broadcast::error::RecvError::Closed)) { break } }
                 r = topo_rx.changed() => { if r.is_err() { break } }
+                _ = tick.tick() => {}
             }
         }
     });

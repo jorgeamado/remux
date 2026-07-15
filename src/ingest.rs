@@ -49,7 +49,9 @@ const MAX_PANE: usize = 16;
 /// Rate limit: events *offered* per window, across all producers — charged
 /// before parsing, deliberately: malformed floods must not get free parse
 /// work, at the cost that one confused producer can starve the window.
-const RATE_MAX: u32 = 60;
+/// Sized for agent-state lifecycle traffic (2 events per tool use) so a busy
+/// agent can't starve the low-volume-but-critical permission requests (Codex).
+const RATE_MAX: u32 = 300;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Concurrent connections in the read/parse phase; excess connects are dropped
 /// (hooks fail fast and exit non-zero — never queue a slow client). Held

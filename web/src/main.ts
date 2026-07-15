@@ -805,6 +805,9 @@ function renderPermissionCards(cards: PermissionCard[]): void {
   }
   paintPermissionCards(); // may stop the ticker if nothing is live
   refreshClaudeStatus(); // "approval" badge/chip follows the live card set
+  // The claude.v1 dashboard joins a pending card by id — if it rendered before
+  // the card frame arrived, re-render now so Approve/Deny appears inline.
+  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
 }
 
 function clearPermissionCards(): void {

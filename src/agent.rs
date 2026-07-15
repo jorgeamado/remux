@@ -143,6 +143,12 @@ impl Registry {
                         return; // stale event from a superseded session
                     }
                 }
+                // Session matches. SessionEnded REMOVES the entry (so the
+                // projector stops publishing and releases the pane) — everything
+                // else is a state transition.
+                Some(_) if matches!(ev, Event::SessionEnded { .. }) => {
+                    map.remove(pane);
+                }
                 Some(s) => s.apply(ev),
                 // No state yet: bootstrap from any event except SessionEnded
                 // (which on an unknown pane is a no-op) — so a pane still shows
@@ -207,7 +213,13 @@ impl State {
             Event::PromptSubmitted { .. } => self.base = BaseStatus::Working,
             Event::OperationStarted { op_id, tool, .. } => {
                 self.base = BaseStatus::Working;
-                if !self.ops.iter().any(|o| o.op_id == op_id) && self.ops.len() < MAX_OPS {
+                if !self.ops.iter().any(|o| o.op_id == op_id) {
+                    // Evict the oldest so a leaked op (a failed/interrupted tool
+                    // that never sent operation-ended) can't push out the NEWEST
+                    // op — the one most likely to correlate with a pending card.
+                    if self.ops.len() >= MAX_OPS {
+                        self.ops.remove(0);
+                    }
                     self.ops.push(Op { op_id, tool });
                 }
             }
@@ -219,6 +231,7 @@ impl State {
                 self.base = BaseStatus::Idle;
                 self.ops.clear();
             }
+            // SessionEnded is handled by the Registry (it removes the entry).
             Event::SessionEnded { .. } | Event::Touch { .. } => {}
         }
     }
@@ -286,6 +299,56 @@ mod tests {
             },
         );
         assert_eq!(reg.views()[0].base, BaseStatus::Idle);
+    }
+
+    #[test]
+    fn session_ended_removes_state() {
+        let reg = Registry::default();
+        started(&reg, "%1", "s1");
+        reg.apply(
+            "%1",
+            Event::PromptSubmitted {
+                session_id: "s1".into(),
+            },
+        );
+        assert_eq!(reg.views().len(), 1);
+        // SessionEnded from the SAME session clears the entry entirely.
+        reg.apply(
+            "%1",
+            Event::SessionEnded {
+                session_id: "s1".into(),
+            },
+        );
+        assert!(reg.views().is_empty());
+        // A stale SessionEnded from a different session doesn't remove a live one.
+        started(&reg, "%1", "s2");
+        reg.apply(
+            "%1",
+            Event::SessionEnded {
+                session_id: "old".into(),
+            },
+        );
+        assert_eq!(reg.views().len(), 1);
+    }
+
+    #[test]
+    fn oldest_op_evicted_at_cap() {
+        let reg = Registry::default();
+        started(&reg, "%1", "s1");
+        for i in 0..(MAX_OPS + 5) {
+            reg.apply(
+                "%1",
+                Event::OperationStarted {
+                    session_id: "s1".into(),
+                    op_id: format!("op{i}"),
+                    tool: "Bash".into(),
+                },
+            );
+        }
+        let ops = &reg.views()[0].ops;
+        assert_eq!(ops.len(), MAX_OPS);
+        // The NEWEST op survives (most likely to correlate with a card).
+        assert_eq!(ops.last().unwrap().op_id, format!("op{}", MAX_OPS + 4));
     }
 
     #[test]

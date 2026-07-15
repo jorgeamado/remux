@@ -39,8 +39,10 @@ absolute paths). `remux-agent-state` needs `jq`.
       { "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [{ "type": "command", "command": "remux-approve" }] }
     ],
-    "PostToolUse":  [{ "hooks": [{ "type": "command", "command": "remux-agent-state operation-ended" }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "remux-agent-state operation-ended" }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "remux-agent-state operation-ended" }] }],
     "Stop":         [{ "hooks": [{ "type": "command", "command": "remux-agent-state idle" }] }],
+    "StopFailure":  [{ "hooks": [{ "type": "command", "command": "remux-agent-state idle" }] }],
     "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "remux-agent-state session-ended" }] }],
     "PreCompact":   [{ "hooks": [{ "type": "command", "command": "remux-agent-state touch" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "remux emit needs-input --source claude-code --message 'Claude needs you'" }] }]

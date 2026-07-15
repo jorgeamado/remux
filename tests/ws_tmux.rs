@@ -99,8 +99,6 @@ async fn full_terminal_flow_over_tmux() {
     assert_eq!(status["type"], "status", "unexpected: {status}");
     assert_eq!(status["state"], "observer");
     assert_eq!(status["session"], session);
-    // Window dims ride along for observer fit-width.
-    assert!(status["window_cols"].is_u64(), "unexpected: {status}");
 
     // Observers cannot type.
     ws.send(WsMsg::binary(b"ls\r".to_vec())).await.unwrap();
@@ -262,6 +260,57 @@ async fn full_terminal_flow_over_tmux() {
     }
     assert!(split, "split_v did not create a second pane");
 
+    // zoom_pane makes the split window show a single full pane (phones auto-
+    // zoom so no split geometry renders). Idempotent.
+    for _ in 0..2 {
+        ws.send(WsMsg::text(
+            serde_json::json!({"type": "window_action", "action": "zoom_pane"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut zoomed = false;
+        for _ in 0..50 {
+            let z = tmux_sock(
+                &sock,
+                &[
+                    "display-message",
+                    "-t",
+                    session,
+                    "-p",
+                    "#{window_zoomed_flag}",
+                ],
+            );
+            if z == "1" {
+                zoomed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(zoomed, "zoom_pane did not zoom the split window");
+    }
+
+    // select_pane switches the active pane (pane tabs on the phone). split-
+    // window left pane 1 active; select pane 0.
+    ws.send(WsMsg::text(
+        serde_json::json!({"type": "window_action", "action": "select_pane", "index": 0})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut on_pane0 = false;
+    for _ in 0..50 {
+        let active = tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{pane_index}"],
+        );
+        if active == "0" {
+            on_pane0 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(on_pane0, "select_pane did not switch to pane 0");
+
     ws.send(WsMsg::text(
         serde_json::json!({"type": "window_action", "action": "select_window", "index": 0})
             .to_string(),
@@ -361,9 +410,22 @@ async fn full_terminal_flow_over_tmux() {
         .id
         .clone();
     assert!(app.auth.revoke(&dev_id).is_ok());
+    // Input sent after revoke commits but before the broadcast lands must not
+    // reach the shell (synchronous is_active gate). Marker only ever appears
+    // in output if it ran.
+    ws.send(WsMsg::binary(b"echo REVOKED_MARKER$((7+7))\r".to_vec()))
+        .await
+        .unwrap();
     let _ = app.revoked.send(dev_id);
     let err = next_json(&mut ws).await;
     assert_eq!(err["code"], "revoked", "unexpected: {err}");
+    // The pane must not contain the executed marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pane = tmux_sock(&sock, &["capture-pane", "-t", session, "-p"]);
+    assert!(
+        !pane.contains("REVOKED_MARKER14"),
+        "revoked device input reached the shell: {pane:?}"
+    );
     let mut closed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

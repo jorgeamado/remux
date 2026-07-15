@@ -86,6 +86,13 @@ export function setupKeyRow(sendInput: (data: string) => void): void {
   });
 }
 
+/// Drop the sticky Ctrl without consuming it (e.g. a hardware Ctrl+letter
+/// already produced the control code).
+export function disarmCtrl(): void {
+  ctrlArmed = false;
+  document.getElementById("ctrl-key")?.classList.remove("armed");
+}
+
 /// Apply the sticky Ctrl modifier to terminal input. Returns the (possibly
 /// transformed) data to send.
 export function applyCtrl(data: string): string {

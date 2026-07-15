@@ -12,10 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 /// Bytes buffered towards a slow client before the PTY reader blocks.
 /// A blocked reader simply pauses the tmux client; tmux repaints when we resume.
 const OUT_QUEUE: usize = 256;
+/// Each connection spawns a PTY + tmux client + threads; cap concurrency so a
+/// stolen token (or a buggy client) cannot exhaust the host's processes/FDs.
+const MAX_TOTAL_CONNECTIONS: usize = 64;
+const MAX_PER_DEVICE_CONNECTIONS: usize = 8;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -52,17 +56,20 @@ enum ServerMsg<'a> {
         state: &'a str,
         session: &'a str,
         device: &'a str,
-        /// Current tmux window size — lets an observer fit the desktop-sized
-        /// grid on screen (font-size math only, never a resize).
-        window_cols: Option<u16>,
-        window_rows: Option<u16>,
     },
     Error {
         code: &'a str,
         message: &'a str,
     },
-    /// The session was busy and went quiet — likely finished or waiting.
-    Attention,
+    /// Someone/something in this session wants the user: a hook-fed event
+    /// (agent_needs_input) or the busy→quiet heuristic.
+    Attention {
+        kind: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<&'a str>,
+    },
     Pong,
 }
 
@@ -133,29 +140,61 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         Some(name) => name,
         None => app.args.session.clone(),
     };
+
+    // Connection caps FIRST — before ensure_session, so a capped client can't
+    // create new detached tmux sessions (and their shells) by requesting
+    // unique names. Decide under the lock, then release it before any await.
+    let conn_key = (device.id.clone(), session.clone());
+    let admitted = {
+        let mut conns = app.connections.lock().unwrap();
+        let total: usize = conns.values().sum();
+        let per_device: usize = conns
+            .iter()
+            .filter(|((id, _), _)| id == &device.id)
+            .map(|(_, n)| *n)
+            .sum();
+        if total >= MAX_TOTAL_CONNECTIONS || per_device >= MAX_PER_DEVICE_CONNECTIONS {
+            false
+        } else {
+            *conns.entry(conn_key.clone()).or_insert(0) += 1;
+            true
+        }
+    };
+    if !admitted {
+        let _ = ws_tx
+            .send(json(&ServerMsg::Error {
+                code: "too_many_connections",
+                message: "connection limit reached",
+            }))
+            .await;
+        let _ = ws_tx.send(Message::Close(None)).await;
+        return Ok(());
+    }
+    let _conn_guard = ConnGuard {
+        app: app.clone(),
+        key: conn_key,
+    };
+
+    // Now that this connection is admitted under the cap, create/attach the
+    // session and record last-seen.
     tokio::task::spawn_blocking({
         let session = session.clone();
         move || tmux::ensure_session(&session)
     })
     .await??;
 
-    // Track the live (device, session) pair: device management (revocation)
-    // and push delivery ("already gets the in-band frame") both need it.
+    // Attaching resets this session's push throttle so a genuinely new
+    // busy→quiet notifies promptly rather than being suppressed by a lingering
+    // throttle. The pending-attention marker is deliberately NOT cleared here:
+    // it is the deep-link hint another device's notification tap resolves via
+    // /api/attention, and it self-expires. The client already ignores the
+    // session it is currently viewing.
+    app.push.clear_session_throttle(&session);
     tokio::task::spawn_blocking({
         let app = app.clone();
         let id = device.id.clone();
         move || app.auth.touch(&id)
     });
-    let conn_key = (device.id.clone(), session.clone());
-    *app.connections
-        .lock()
-        .unwrap()
-        .entry(conn_key.clone())
-        .or_insert(0) += 1;
-    let _conn_guard = ConnGuard {
-        app: app.clone(),
-        key: conn_key,
-    };
 
     clamp_size(&mut cols, &mut rows);
     let pair = native_pty_system().openpty(PtySize {
@@ -219,6 +258,31 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Forward tmux topology (sessions → windows) to this client: the current
+    // snapshot now, then every update. Metadata only — never in the byte path.
+    let topology_task = tokio::spawn({
+        let mut rx = app.topology.subscribe();
+        let out = out_tx.clone();
+        async move {
+            loop {
+                let snap = rx.borrow_and_update().clone();
+                if !snap.is_empty() {
+                    let msg = Message::Text(
+                        serde_json::json!({ "type": "topology", "sessions": *snap })
+                            .to_string()
+                            .into(),
+                    );
+                    if out.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
     // Close this socket when its device is revoked (management cascade).
     let revoked_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let revoke_task = tokio::spawn({
@@ -261,14 +325,115 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         async move {
             loop {
                 match rx.recv().await {
-                    Ok(name) => {
-                        if name == session && out.send(json(&ServerMsg::Attention)).await.is_err() {
+                    Ok(att) => {
+                        if att.session == session
+                            && out
+                                .send(json(&ServerMsg::Attention {
+                                    kind: &att.kind,
+                                    reason: att.reason.as_deref(),
+                                    source: att.source.as_deref(),
+                                }))
+                                .await
+                                .is_err()
+                        {
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+            }
+        }
+    });
+
+    // Push open permission cards (M4b) to approve-capable devices, and keep
+    // them reconciled. Broadcast is a hint only: on every change (and once at
+    // start, and on lag) we re-read the registry snapshot — a lagged receiver
+    // can't miss state. Capability is re-checked by id each time, so a
+    // grant/revoke takes effect on this live socket. Non-approve devices get an
+    // empty list (details are privileged), never the cards.
+    let permits_task = tokio::spawn({
+        let mut rx = app.perms.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let device_id = device.id.clone();
+        async move {
+            // Skip empty frames until we've actually sent cards, so a fresh
+            // connection with no open cards stays quiet (like topology) — but
+            // once a set was sent, an empty frame is meaningful: it clears the
+            // resolved/expired cards from the UI.
+            let mut sent_nonempty = false;
+            loop {
+                let cards: Vec<serde_json::Value> = if app.auth.can_approve(&device_id) {
+                    app.perms.snapshot().iter().map(|c| c.view()).collect()
+                } else {
+                    Vec::new()
+                };
+                if !cards.is_empty() || sent_nonempty {
+                    sent_nonempty = !cards.is_empty();
+                    let msg = Message::Text(
+                        serde_json::json!({ "type": "permission_cards", "cards": cards })
+                            .to_string()
+                            .into(),
+                    );
+                    if out.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                match rx.recv().await {
+                    Ok(()) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+
+    // Push this session's shell command feed (M4c) and keep it reconciled.
+    // Session-filtered (a feed snapshot is far larger than a permission frame,
+    // and it shares the PTY-byte outgoing queue — so it must not carry other
+    // sessions' commands) and debounced: a fast command loop fires many hints,
+    // but the client only needs the latest snapshot.
+    let feed_task = tokio::spawn({
+        let mut rx = app.feed.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let session = session.clone();
+        async move {
+            // The change hint is global (not per-session), so activity in any
+            // session wakes this task. Only actually send when *this* session's
+            // rendered snapshot changed — otherwise session B would resend its
+            // unchanged (up to 200-entry) feed every time session A ran a
+            // command, competing with PTY bytes on the shared outgoing queue.
+            let mut last_sent: Option<String> = None;
+            loop {
+                let commands = app.feed.snapshot(&session);
+                let is_empty = commands.is_empty();
+                let json =
+                    serde_json::json!({ "type": "command_feed", "commands": commands }).to_string();
+                // Send when it changed, and either non-empty or a clear of a
+                // previously-sent set (a fresh empty connection stays quiet so
+                // it can't race the status frame).
+                if last_sent.as_deref() != Some(json.as_str()) && (!is_empty || last_sent.is_some())
+                {
+                    if out.send(Message::Text(json.clone().into())).await.is_err() {
+                        break;
+                    }
+                    last_sent = Some(json);
+                }
+                // Block for the next change, then coalesce a burst: absorb
+                // further hints for a short window and send one fresh snapshot.
+                match rx.recv().await {
+                    Ok(()) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Drain buffered hints so the next recv() blocks until a genuine
+                // change. Bounded: on lag, stop — the fresh snapshot above
+                // reconciles regardless, so exhaustive draining is unnecessary
+                // (and a Lagged-continue loop could spin).
+                while matches!(rx.try_recv(), Ok(())) {}
             }
         }
     });
@@ -280,33 +445,24 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     }
 
     let mut controller = false;
-    let status = |state: &'static str| {
-        let session = session.clone();
-        let device_name = device.name.clone();
-        async move {
-            let dims = tokio::task::spawn_blocking({
-                let session = session.clone();
-                move || tmux::window_dims(&session)
-            })
-            .await
-            .ok()
-            .flatten();
-            json(&ServerMsg::Status {
-                state,
-                session: &session,
-                device: &device_name,
-                window_cols: dims.map(|d| d.0),
-                window_rows: dims.map(|d| d.1),
-            })
-        }
+    let status = |state: &str| {
+        json(&ServerMsg::Status {
+            state,
+            session: &session,
+            device: &device.name,
+        })
     };
-    let msg = status("observer").await;
-    let _ = out_tx.send(msg).await;
+    let _ = out_tx.send(status("observer")).await;
 
     // ---- Main receive loop. ----
     while let Some(Ok(msg)) = ws_rx.next().await {
-        if revoked_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            break; // no input is accepted after revocation
+        // Revocation gate for EVERY message type (input, resize, take_control,
+        // window_action): synchronous is_active() closes the window between
+        // revoke() committing and the async broadcast setting revoked_flag.
+        if revoked_flag.load(std::sync::atomic::Ordering::Relaxed)
+            || !app.auth.is_active(&device.id)
+        {
+            break;
         }
         match msg {
             Message::Binary(bytes) => {
@@ -356,8 +512,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                     pixel_width: 0,
                                     pixel_height: 0,
                                 });
-                                let msg = status("controller").await;
-                                let _ = out_tx.send(msg).await;
+                                let _ = out_tx.send(status("controller")).await;
                             }
                             Err(e) => {
                                 tracing::warn!("promote failed: {e:#}");
@@ -386,8 +541,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             tokio::task::spawn_blocking(move || tmux::demote_client(&name)).await?;
                     }
                     controller = false;
-                    let msg = status("observer").await;
-                    let _ = out_tx.send(msg).await;
+                    let _ = out_tx.send(status("observer")).await;
                 }
                 Ok(ClientMsg::WindowAction { action, index }) => {
                     if !controller {
@@ -431,7 +585,10 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // remaining clients (e.g. the Mac) immediately get their dimensions back.
     let _ = child.kill();
     attention_task.abort();
+    permits_task.abort();
+    feed_task.abort();
     revoke_task.abort();
+    topology_task.abort();
     sender.abort();
     tracing::info!(device = %device.name, "client disconnected");
     Ok(())

@@ -4,10 +4,19 @@ use anyhow::{bail, Context, Result};
 use std::process::Command;
 
 /// Socket name override so tests can run against an isolated tmux server.
-fn socket_name() -> Option<String> {
+/// Public so the async control-mode client (topology.rs) can target the same
+/// server without duplicating the env convention.
+pub fn socket_name() -> Option<String> {
     std::env::var("REMUX_TMUX_SOCKET")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// Strip control characters and cap length. Window/pane names are set from
+/// terminal output (OSC titles, automatic-rename) — hostile content must not
+/// reach clients as-is even though the client also renders them as text.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 fn tmux() -> Command {
@@ -30,6 +39,52 @@ fn run(mut cmd: Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Does this tmux stderr mean "no server is running yet" (a benign, expected
+/// state → empty result) rather than an operational failure (missing binary,
+/// bad flags, protocol change)? Only benign cases may be mapped to empty; every
+/// other failure must surface, or we'd publish a plausible-but-false empty
+/// topology and skip pushes while someone is active (Codex).
+fn is_no_server(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    // The canonical message, OR the socket-connect error *specifically because
+    // the socket file is absent*. We require BOTH parts of the latter so an
+    // "error connecting to … (Permission denied)" — an operational failure —
+    // is NOT swallowed as no-server (Codex).
+    s.contains("no server running")
+        || (s.contains("error connecting to") && s.contains("no such file or directory"))
+}
+
+/// A *scoped* query (`-t session[:window]`) can also fail benignly because the
+/// target vanished (killed, or never existed) — that's an empty result, not an
+/// operational error. Server-wide queries never see this.
+fn is_missing_target(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("can't find")
+}
+
+/// Like [`run`], but maps benign absence to `Ok(None)`. `tolerate_missing`
+/// additionally treats "can't find <target>" as absence, for session/window
+/// scoped queries. Any other non-zero exit stays `Err`.
+fn run_classified(mut cmd: Command, tolerate_missing: bool) -> Result<Option<String>> {
+    let out = cmd.output().context("failed to run tmux")?;
+    if out.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_no_server(&stderr) || (tolerate_missing && is_missing_target(&stderr)) {
+        return Ok(None);
+    }
+    bail!(
+        "tmux {:?} failed: {}",
+        cmd.get_args().collect::<Vec<_>>(),
+        stderr.trim()
+    );
+}
+
+/// Server-wide query: only "no server" is benign.
+fn run_optional(cmd: Command) -> Result<Option<String>> {
+    run_classified(cmd, false)
+}
+
 /// Create the managed session if missing and apply session-scoped options.
 /// Never touches global tmux configuration.
 pub fn ensure_session(session: &str) -> Result<()> {
@@ -42,7 +97,19 @@ pub fn ensure_session(session: &str) -> Result<()> {
     if !exists {
         let mut cmd = tmux();
         cmd.args(["new-session", "-d", "-s", session]);
-        run(cmd)?;
+        if run(cmd).is_err() {
+            // Race: another caller (e.g. the topology supervisor and a ws
+            // handler both starting up) may have created it between our
+            // has-session check and now. Tolerate if it exists now.
+            let now_exists = tmux()
+                .args(["has-session", "-t", &format!("={session}")])
+                .output()?
+                .status
+                .success();
+            if !now_exists {
+                bail!("failed to create tmux session {session:?}");
+            }
+        }
     }
     // Latest active client drives pane size: this is what makes Mac<->phone
     // handoff work with zero daemon logic. window-size is a *window* option;
@@ -124,6 +191,34 @@ pub struct SessionInfo {
     pub activity: u64,
 }
 
+/// Real (non-control-mode) attached client count per session. `session_attached`
+/// counts our own internal topology control client too, so "attached" (exposed
+/// to the UI) would wrongly show sessions as attached; count only regular
+/// clients here. Keyed by session name.
+fn real_attached_counts() -> Result<std::collections::HashMap<String, u32>> {
+    let mut cmd = tmux();
+    // control_mode is a single 0/1; session name (may contain spaces) is the
+    // remainder. (No tab separator — tmux 3.3a would sanitize it to `_`.)
+    cmd.args([
+        "list-clients",
+        "-F",
+        "#{client_control_mode} #{client_session}",
+    ]);
+    let mut m = std::collections::HashMap::new();
+    // No server → no clients. Any other failure propagates rather than silently
+    // reporting everything as unattached (Codex).
+    if let Some(out) = run_optional(cmd)? {
+        for line in out.lines() {
+            if let Some((ctrl, sess)) = line.split_once(' ') {
+                if ctrl == "0" {
+                    *m.entry(sess.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    Ok(m)
+}
+
 /// All sessions on the tmux server. Empty when no server is running yet.
 /// NB: tmux 3.3a replaces control characters (tabs included) in expanded
 /// formats with `_`, so fields are space-separated and parsed from the right
@@ -135,10 +230,19 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
         "-F",
         "#{session_name} #{session_windows} #{session_attached} #{session_activity}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new()); // no tmux server running
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(Vec::new()); // no tmux server running yet
     };
-    Ok(out.lines().filter_map(parse_session_line).collect())
+    let counts = real_attached_counts()?;
+    Ok(out
+        .lines()
+        .filter_map(parse_session_line)
+        .map(|mut s| {
+            // Override tmux's attached count with real (non-control) clients.
+            s.attached = counts.get(&s.name).copied().unwrap_or(0);
+            s
+        })
+        .collect())
 }
 
 fn parse_session_line(line: &str) -> Option<SessionInfo> {
@@ -165,8 +269,8 @@ pub fn sessions_activity() -> Result<Vec<(String, u64)>> {
         "-F",
         "#{session_name} #{window_activity}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new()); // no tmux server running
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(Vec::new()); // no tmux server running yet
     };
     let mut latest: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for line in out.lines() {
@@ -185,15 +289,31 @@ fn parse_window_activity_line(line: &str) -> Option<(String, u64)> {
     Some((f.next()?.to_string(), activity))
 }
 
-#[derive(serde::Serialize, Debug, PartialEq)]
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
 pub struct WindowInfo {
     pub index: u32,
     pub active: bool,
-    pub panes: u32,
+    /// The active pane is zoomed (fills the window). On phones we auto-zoom
+    /// split windows so no split geometry is rendered on a small screen.
+    pub zoomed: bool,
     pub name: String,
+    /// Panes in this window — surfaced as sub-tabs on the phone so a split can
+    /// be navigated pane-by-pane rather than rendered as split geometry.
+    pub panes: Vec<PaneInfo>,
 }
 
-/// Windows of one session ("tabs" in the mobile UI).
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
+pub struct PaneInfo {
+    /// tmux pane id (`%N`) — stable for the pane's lifetime, unlike `index`.
+    /// Matches `$TMUX_PANE` in the pane's environment, which is how M4
+    /// ingest events are mapped back to a session.
+    pub id: String,
+    pub index: u32,
+    pub active: bool,
+    pub command: String,
+}
+
+/// Windows of one session ("tabs" in the mobile UI), each with its panes.
 pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
     let mut cmd = tmux();
     cmd.args([
@@ -201,24 +321,116 @@ pub fn list_windows(session: &str) -> Result<Vec<WindowInfo>> {
         "-t",
         &format!("={session}"),
         "-F",
-        "#{window_index} #{window_active} #{window_panes} #{window_name}",
+        "#{window_index} #{window_active} #{window_zoomed_flag} #{window_name}",
     ]);
-    let Ok(out) = run(cmd) else {
-        return Ok(Vec::new());
+    let Some(out) = run_classified(cmd, true)? else {
+        return Ok(Vec::new()); // no server, or the session is gone
     };
-    Ok(out.lines().filter_map(parse_window_line).collect())
+    let mut windows = Vec::new();
+    for line in out.lines() {
+        if let Some((index, active, zoomed, name)) = parse_window_line(line) {
+            // A pane-list failure that isn't benign absence is a real error;
+            // propagate rather than silently dropping the window's panes.
+            let panes = list_panes(session, index)?;
+            windows.push(WindowInfo {
+                index,
+                active,
+                zoomed,
+                name,
+                panes,
+            });
+        }
+    }
+    Ok(windows)
 }
 
-/// `<index> <active> <panes> <name (may contain spaces)>` — numerics first,
-/// so the name is simply the remainder.
-fn parse_window_line(line: &str) -> Option<WindowInfo> {
+/// `<index> <active> <zoomed> <name (may contain spaces)>` — numerics first.
+fn parse_window_line(line: &str) -> Option<(u32, bool, bool, String)> {
     let mut f = line.splitn(4, ' ');
-    Some(WindowInfo {
+    Some((
+        f.next()?.parse().ok()?,
+        f.next()? == "1",
+        f.next()? == "1",
+        sanitize(f.next().unwrap_or("")),
+    ))
+}
+
+fn list_panes(session: &str, window_index: u32) -> Result<Vec<PaneInfo>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "list-panes",
+        "-t",
+        &format!("={session}:{window_index}"),
+        "-F",
+        "#{pane_id} #{pane_index} #{pane_active} #{pane_current_command}",
+    ]);
+    // No server, or the window/session vanished mid-capture → no panes. Any
+    // other failure propagates rather than being silently dropped.
+    let Some(out) = run_classified(cmd, true)? else {
+        return Ok(Vec::new());
+    };
+    Ok(out.lines().filter_map(parse_pane_line).collect())
+}
+
+/// `<id> <index> <active> <command>` — command is the remainder (comm has no
+/// spaces in practice, but be permissive). The id must be `%N`-shaped.
+fn parse_pane_line(line: &str) -> Option<PaneInfo> {
+    let mut f = line.splitn(4, ' ');
+    let id = f.next()?;
+    if !id.starts_with('%') || !id[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(PaneInfo {
+        id: id.to_string(),
         index: f.next()?.parse().ok()?,
         active: f.next()? == "1",
-        panes: f.next()?.parse().ok()?,
-        name: f.next().unwrap_or("").to_string(),
+        command: sanitize(f.next().unwrap_or("")),
     })
+}
+
+/// One session with its windows — the topology unit streamed to clients.
+#[derive(serde::Serialize, Debug, PartialEq, Clone)]
+pub struct SessionWindows {
+    pub name: String,
+    pub attached: bool,
+    pub windows: Vec<WindowInfo>,
+}
+
+/// Full server topology: every session and its windows. Rebuilt from scratch
+/// on each control-mode dirty-bit (not parsed incrementally). Empty when no
+/// tmux server is running.
+pub fn capture_topology() -> Result<Vec<SessionWindows>> {
+    let sessions = list_sessions()?;
+    let mut out = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        out.push(SessionWindows {
+            windows: list_windows(&s.name)?,
+            name: sanitize(&s.name),
+            attached: s.attached > 0,
+        });
+    }
+    Ok(out)
+}
+
+/// Argument vector for the read-only control-mode client (topology.rs builds
+/// the async Command; kept here so all tmux flags live in one module).
+/// Verified on tmux 3.3a: these flags keep the client out of window sizing,
+/// suppress %output, and still deliver structural %notifications.
+pub fn control_attach_args(session: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(sock) = socket_name() {
+        args.push("-L".into());
+        args.push(sock);
+    }
+    args.extend([
+        "-C".into(),
+        "attach-session".into(),
+        "-t".into(),
+        format!("={session}"),
+        "-f".into(),
+        "read-only,no-output,ignore-size".into(),
+    ]);
+    args
 }
 
 /// Controller-initiated window/pane operations, whitelisted by name.
@@ -239,11 +451,28 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
             cmd.args(["split-window", "-v", "-t", &format!("{target}:")]);
         }
         "next_pane" => {
+            // Pure pane cycling — NO zoom here: this path affects every
+            // client, and desktop controllers must keep their split layout.
+            // Small screens re-zoom client-side (maybeAutoZoom) via zoom_pane
+            // after the topology update.
             cmd.args(["select-pane", "-t", &format!("{target}:.+")]);
+        }
+        // Ensure the active pane fills the window (phones auto-zoom splits so
+        // they never render split geometry on a small screen). Idempotent, and
+        // only ever sent by small-screen clients.
+        "zoom_pane" => {
+            ensure_zoom(session)?;
+            return Ok(());
         }
         "select_window" => {
             let i = index.context("select_window requires an index")?;
             cmd.args(["select-window", "-t", &format!("{target}:{i}")]);
+        }
+        // Switch to a specific pane in the current window. Pure select — no
+        // zoom (affects all clients); small screens re-zoom client-side.
+        "select_pane" => {
+            let i = index.context("select_pane requires an index")?;
+            cmd.args(["select-pane", "-t", &format!("{target}:.{i}")]);
         }
         other => bail!("unknown window action {other:?}"),
     }
@@ -251,21 +480,27 @@ pub fn window_action(session: &str, action: &str, index: Option<u32>) -> Result<
     Ok(())
 }
 
-/// Current window size (cols, rows) of the session's active window.
-pub fn window_dims(session: &str) -> Option<(u16, u16)> {
-    let mut cmd = tmux();
-    // -t is a *pane* target here: "=session" alone fails like split-window
-    // (tmux 3.3a); "=session:" (current window's active pane) resolves.
-    cmd.args([
+/// Zoom the active pane if the current window is split and not already zoomed.
+/// `resize-pane -Z` toggles, so we check the flag first to stay idempotent.
+fn ensure_zoom(session: &str) -> Result<()> {
+    let mut q = tmux();
+    q.args([
         "display-message",
+        "-p",
         "-t",
         &format!("={session}:"),
-        "-p",
-        "#{window_width} #{window_height}",
+        "#{window_zoomed_flag} #{window_panes}",
     ]);
-    let out = run(cmd).ok()?;
+    let out = run(q)?;
     let mut f = out.split_whitespace();
-    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    let zoomed = f.next() == Some("1");
+    let panes: u32 = f.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if !zoomed && panes > 1 {
+        let mut cmd = tmux();
+        cmd.args(["resize-pane", "-Z", "-t", &format!("={session}:")]);
+        run(cmd)?;
+    }
+    Ok(())
 }
 
 /// True when any attached tmux client sent input within `within_secs` —
@@ -273,8 +508,8 @@ pub fn window_dims(session: &str) -> Option<(u16, u16)> {
 pub fn any_client_active_within(within_secs: u64) -> Result<bool> {
     let mut cmd = tmux();
     cmd.args(["list-clients", "-F", "#{client_activity}"]);
-    let Ok(out) = run(cmd) else {
-        return Ok(false);
+    let Some(out) = run_optional(cmd)? else {
+        return Ok(false); // no server → no clients active
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -305,6 +540,35 @@ pub fn demote_client(client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benign_absence_classification() {
+        // "No server" is benign server-wide → empty, not an error.
+        assert!(is_no_server("no server running on /tmp/tmux-501/default"));
+        assert!(is_no_server(
+            "error connecting to /tmp/tmux-501/default (No such file or directory)"
+        ));
+        assert!(is_no_server("No Server Running On ...")); // case-insensitive
+                                                           // "can't find <target>" is NOT no-server, but IS benign for a scoped
+                                                           // query (the session/window is simply gone → empty).
+        assert!(!is_no_server("can't find session: main"));
+        assert!(is_missing_target("can't find session: main"));
+        assert!(is_missing_target("can't find window: 3"));
+        // Operational failures are neither — they must surface, not become a
+        // false-empty topology. Critically a *permission-denied* socket-connect
+        // error must NOT be mistaken for the absent-socket case, nor a bare
+        // "no such file or directory" without the connect context.
+        for e in [
+            "unknown option -- Q",
+            "lost server",
+            "error connecting to /tmp/tmux-0/default (Permission denied)",
+            "no such file or directory",
+            "",
+        ] {
+            assert!(!is_no_server(e), "{e:?}");
+            assert!(!is_missing_target(e), "{e:?}");
+        }
+    }
 
     #[test]
     fn session_line_parsing() {
@@ -341,17 +605,36 @@ mod tests {
 
     #[test]
     fn window_line_parsing() {
+        // index active zoomed name(may have spaces)
         assert_eq!(
-            parse_window_line("2 1 3 my window"),
-            Some(WindowInfo {
-                index: 2,
+            parse_window_line("2 1 1 my window"),
+            Some((2, true, true, "my window".to_string()))
+        );
+        let (idx, active, zoomed, name) = parse_window_line("0 0 0 bash").unwrap();
+        assert_eq!(
+            (idx, active, zoomed, name.as_str()),
+            (0, false, false, "bash")
+        );
+        assert_eq!(parse_window_line("garbage"), None);
+    }
+
+    #[test]
+    fn pane_line_parsing() {
+        assert_eq!(
+            parse_pane_line("%5 1 1 vim"),
+            Some(PaneInfo {
+                id: "%5".into(),
+                index: 1,
                 active: true,
-                panes: 3,
-                name: "my window".into(),
+                command: "vim".into(),
             })
         );
-        assert!(!parse_window_line("0 0 1 bash").unwrap().active);
-        assert_eq!(parse_window_line("garbage"), None);
+        assert!(!parse_pane_line("%0 0 0 bash").unwrap().active);
+        assert_eq!(parse_pane_line("x"), None);
+        // id must be %N-shaped: reject a line missing it (old format) or
+        // with a mangled id, rather than mis-assigning fields.
+        assert_eq!(parse_pane_line("1 1 vim"), None);
+        assert_eq!(parse_pane_line("%x 1 1 vim"), None);
     }
 
     #[test]

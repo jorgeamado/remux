@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable as a gate from release.yml so a tag can never ship code that
+  # didn't pass the full test suite.
+  workflow_call:
 
 jobs:
   test:
@@ -45,7 +48,7 @@ jobs:
         with:
           fetch-depth: 0 # gitleaks scans full history
       - name: Secrets scan (gitleaks)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: dtolnay/rust-toolchain@stable

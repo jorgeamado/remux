@@ -3,6 +3,34 @@
 > Uncommitted working note (per request). Point-in-time picture of where the
 > project is and what's planned. The durable plan is `docs/PLAN.md`.
 
+## M5 pane views — slice 1 VERIFIED ON DEVICE (2026-07-15)
+
+remux can now render a **custom PWA interface for a pane** from structured
+state a *source* streams — the `source → remux → custom renderer` pipe. First
+slice done on branch `feat/pane-view` (NOT merged), Codex-reviewed across three
+rounds (7 findings → fixed → 2 more → fixed → clean):
+
+- `examples/taskscope/taskscope` — a dependency-free demo monitor (our own
+  htop): live TUI, plus `--json` structured stream.
+- `remux stream --view <id>` + a dedicated persistent `pane-view.sock`: a source
+  claims a pane (verified against topology), streams NDJSON snapshots;
+  latest-state-per-pane registry, one view per pane, EOF + topology-GC cleanup,
+  size/rate/shape caps. (`paneview.rs`, 6 unit + 3 integration tests.)
+- WS `pane_views` frame: session-filtered, topology-aware wake, reconcile.
+- PWA: hard-coded `taskscope.v1` card renderer + Terminal/Dashboard toggle
+  (dashboard releases terminal control so the hidden xterm can't drive size;
+  overlay scrolls natively).
+- Also fixed a latent bug: static assets had **no cache headers**, so browsers
+  pinned a stale `index.html` and never loaded new deploys — now the shell/sw
+  revalidate and hashed assets are immutable.
+
+On-device (iPhone, `remux-mobile` container): ran `taskscope --json | remux
+stream --view taskscope.v1`, tapped **Dashboard**, saw live scrollable worker
+cards. Architecture per the Codex review: compiled-in renderer (no third-party
+JS), terminal stays canonical, popup/agent-source deferred.
+Next options: a `/proc` "real htop" source, the generic popup primitive, or an
+agent-window source.
+
 Repo: `github.com/jorgeamado/remux` (public); `main` builds green on CI. The M3
 control-mode arc and the whole M4 semantic layer (M4a attention → M4b approvals
 → M4c command feed) are done and verified on-device. On top of that, three

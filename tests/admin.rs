@@ -25,6 +25,7 @@ async fn admin_socket_mints_usable_pairing_tokens() {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
@@ -74,6 +75,7 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
@@ -109,6 +111,7 @@ async fn stale_socket_file_is_replaced() {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
@@ -133,6 +136,7 @@ async fn admin_socket_rejects_garbage() {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
@@ -171,6 +175,7 @@ async fn revoke_cascades_and_cancels_pairing() {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });

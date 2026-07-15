@@ -24,6 +24,7 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     })

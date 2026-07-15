@@ -3,6 +3,7 @@ pub mod attention;
 pub mod auth;
 pub mod feed;
 pub mod ingest;
+pub mod paneview;
 pub mod permit;
 pub mod push;
 pub mod server;
@@ -67,6 +68,18 @@ pub enum Cmd {
         /// One-line summary shown on the card (stand-in for a command).
         #[arg(long, default_value = "echo hello from remux   # test approval")]
         summary: String,
+    },
+    /// Stream a pane view: read newline-delimited JSON snapshots on stdin and
+    /// forward them to the running daemon as this pane's structured view, which
+    /// the PWA can render as a custom interface. E.g.
+    /// `taskscope --json | remux stream --view taskscope.v1`.
+    Stream {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Built-in view id the source renders as (e.g. `taskscope.v1`).
+        #[arg(long)]
+        view: String,
     },
 }
 
@@ -265,6 +278,9 @@ pub struct App {
     pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
     /// Open agent permission cards (M4b) awaiting a decision from a device.
     pub perms: permit::Registry,
+    /// Latest structured "pane view" per pane, fed by the `remux stream` socket
+    /// and rendered by the PWA as a custom interface for that pane.
+    pub pane_views: paneview::Registry,
     /// Per-session shell command feed (M4c), fed by the shell datagram socket.
     pub feed: feed::Feed,
     /// Session names whose busy→quiet detector should reset — sent when a

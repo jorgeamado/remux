@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
-    admin, attention, auth, host_of_url, ingest, push, server, shell, tmux, topology, App, Cli,
-    Cmd, DevicesCmd, EmitCmd, SetupCmd,
+    admin, attention, auth, host_of_url, ingest, paneview, push, server, shell, tmux, topology,
+    App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd,
 };
 use std::sync::Arc;
 
@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         },
+        Cmd::Stream { pane, view } => return paneview::stream(&state_dir, pane, view),
     };
 
     std::fs::create_dir_all(&state_dir)?;
@@ -275,6 +276,7 @@ async fn main() -> Result<()> {
         revoked: tokio::sync::broadcast::channel(16).0,
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
+        pane_views: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
@@ -293,6 +295,8 @@ async fn main() -> Result<()> {
     ingest::spawn(app.clone(), &state_dir)?;
     // Shell command feed (M4c): its own datagram socket + a sweeper task.
     shell::spawn(app.clone(), &state_dir)?;
+    // Pane views: the `remux stream` socket + topology-driven GC.
+    paneview::spawn(app.clone(), &state_dir)?;
     server::run(app).await
 }
 

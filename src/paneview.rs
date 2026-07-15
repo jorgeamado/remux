@@ -484,7 +484,17 @@ pub fn stream(state_dir: &Path, pane: Option<String>, view: String) -> Result<()
             break; // stdin EOF
         }
         if buf.last() != Some(&b'\n') {
-            continue; // over-cap line — skip (the daemon would reject it anyway)
+            // Over-cap line: drain the rest of it (bounded MAX_LINE chunks) up to
+            // the real newline, so its suffix isn't forwarded as a bogus new line.
+            loop {
+                reader.set_limit(MAX_LINE);
+                buf.clear();
+                let m = reader.read_until(b'\n', &mut buf)?;
+                if m == 0 || buf.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            continue;
         }
         let line = trim_line(&buf);
         if line.is_empty() {

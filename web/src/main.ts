@@ -478,6 +478,13 @@ function handleControl(msg: ControlMsg): void {
         // Fall back to the server default; onclose will reconnect.
         localStorage.removeItem(SESSION_KEY);
         showHint("Session unavailable — using default");
+      } else if (msg.code === "release_failed") {
+        // We tried to open the dashboard, which releases terminal control — but
+        // tmux didn't demote us, so we're still driving size. Don't leave the
+        // dashboard covering a terminal we still control (the hidden xterm would
+        // keep shrinking the desktop); revert to the terminal.
+        if (dashboardMode) setDashboard(false);
+        showHint("Couldn't switch to Dashboard — still controlling the terminal");
       }
       break;
   }

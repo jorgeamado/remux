@@ -262,6 +262,7 @@ fn process_attention(app: &App, ev: AttentionEvent) -> serde_json::Value {
     let _ = app.attention.send(crate::Attention {
         session: session.clone(),
         kind: "agent_needs_input".into(),
+        pane: Some(ev.pane.clone()),
         reason: (!message.is_empty()).then_some(message),
         source: Some(source),
     });
@@ -360,6 +361,11 @@ async fn handle_permission(
     let _ = app.attention.send(crate::Attention {
         session: card.session.clone(),
         kind: "agent_permission".into(),
+        // Intentionally omitted: this frame reaches every session device, but the
+        // pane→approval association is privileged (it derives from the card, which
+        // only approve-capable devices receive). Non-approve devices see just
+        // "something wants attention", never which pane has a pending approval.
+        pane: None,
         reason: None,
         source: None,
     });

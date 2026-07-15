@@ -40,6 +40,10 @@
       <nav id="window-tabs" hidden></nav>
       <nav id="pane-tabs" hidden></nav>
 
+      <!-- Pane-scoped Claude status for the active pane (waiting / approval).
+           Cross-pane status shows as badges on the tabs above. -->
+      <div id="claude-chip" hidden></div>
+
       <!-- M4b: agent permission cards (Approve/Deny). Populated from the WS
            permission_cards frame; approve-capable devices only. -->
       <div id="permission-cards" hidden></div>

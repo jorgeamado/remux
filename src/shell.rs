@@ -206,6 +206,7 @@ fn on_finished(app: &App, fin: crate::feed::Finished) {
         let _ = app.attention.send(crate::Attention {
             session: fin.session,
             kind: "command_finished".into(),
+            pane: None,
             reason: Some(notable_reason(fin.exit, fin.elapsed_ms)),
             source: Some("shell".into()),
         });

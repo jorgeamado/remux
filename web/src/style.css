@@ -193,6 +193,37 @@ body {
   font-weight: 600;
 }
 
+/* Claude pane status — tab badges + the active-pane chip. */
+.claude-dot {
+  margin-left: 5px;
+  font-size: 10px;
+  vertical-align: middle;
+}
+.claude-dot.claude-approval {
+  color: var(--accent-fg);
+}
+.claude-dot.claude-waiting {
+  color: #d9a441; /* amber — softer than approval */
+}
+#claude-chip {
+  margin: 6px 2px 0;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  width: fit-content;
+}
+#claude-chip.claude-approval {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent-fg);
+}
+#claude-chip.claude-waiting {
+  background: #2a230f;
+  border: 1px solid #6b551d;
+  color: #e0b357;
+}
+
 /* ---------- buttons ---------- */
 
 .btn {
@@ -531,6 +562,12 @@ button {
   color: var(--accent-fg);
   font-size: 13px;
   font-weight: 600;
+  /* now a button (tap → go to pane): strip default chrome. */
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
 }
 
 .perm-countdown {

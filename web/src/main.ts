@@ -360,6 +360,7 @@ interface ControlMsg {
   sessions?: SessionTopo[];
   /** attention frames: event kind + optional hook-fed detail */
   kind?: string;
+  pane?: string;
   reason?: string;
   source?: string;
   /** permission_cards frames (M4b) */
@@ -444,7 +445,7 @@ function handleControl(msg: ControlMsg): void {
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
-      onAttention();
+      onAttention(msg);
       break;
     case "permission_cards":
       renderPermissionCards(msg.cards ?? []);
@@ -641,6 +642,8 @@ function renderTabs(): void {
       tab.className = `wtab${w.active ? " active" : ""}`;
       const panes = w.panes.length > 1 ? ` ·${w.panes.length}` : "";
       tab.textContent = `${w.index}: ${w.name}${panes}`;
+      const badge = statusBadge(windowClaudeStatus(w));
+      if (badge) tab.appendChild(badge);
       tab.addEventListener("click", () => {
         if (!w.active) windowAction("select_window", w.index);
       });
@@ -651,6 +654,7 @@ function renderTabs(): void {
     windowTabs.hidden = true;
   }
   renderPaneTabs();
+  renderClaudeChip();
 }
 
 /// When the active window is split, its panes become tabs — so a split can be
@@ -671,6 +675,8 @@ function renderPaneTabs(): void {
     const tab = document.createElement("button");
     tab.className = `wtab${p.active ? " active" : ""}`;
     tab.textContent = `${p.index}: ${p.command || "sh"}`;
+    const badge = statusBadge(paneClaudeStatus(p.id));
+    if (badge) tab.appendChild(badge);
     tab.addEventListener("click", () => {
       if (!p.active) windowAction("select_pane", p.index);
     });
@@ -678,6 +684,96 @@ function renderPaneTabs(): void {
   }
   paneTabs.hidden = false;
 }
+
+// ---------- Claude pane status (slice 1) ----------
+// A pane-scoped "what is Claude doing" signal, derived entirely from existing
+// hook data — no new store, nothing persisted, no screen-scraping:
+//   • "approval" — a live permission card exists for the pane (approve-only data,
+//     so this badge only appears on approve-capable devices).
+//   • "waiting"  — an agent_needs_input event fired for the pane recently (TTL).
+// Never inferred "working": the daemon can't reliably know that yet.
+type ClaudeStatus = "approval" | "waiting" | null;
+const CLAUDE_WAIT_TTL_MS = 45_000;
+// pane id -> wall-clock ms until which we treat the pane as waiting for input.
+const claudeWaiting = new Map<string, number>();
+
+function paneClaudeStatus(paneId: string): ClaudeStatus {
+  if (permCards.some((c) => c.pane === paneId)) return "approval";
+  const until = claudeWaiting.get(paneId);
+  if (until !== undefined && until > Date.now()) return "waiting";
+  return null;
+}
+
+/** Highest-severity Claude status across a window's panes (approval > waiting). */
+function windowClaudeStatus(w: WindowTopo): ClaudeStatus {
+  let out: ClaudeStatus = null;
+  for (const p of w.panes) {
+    const s = paneClaudeStatus(p.id);
+    if (s === "approval") return "approval";
+    if (s === "waiting") out = "waiting";
+  }
+  return out;
+}
+
+/** A small colored dot badge for a tab, or null when the pane/window is calm. */
+function statusBadge(s: ClaudeStatus): HTMLElement | null {
+  if (!s) return null;
+  const dot = document.createElement("span");
+  dot.className = `claude-dot claude-${s}`;
+  dot.textContent = s === "approval" ? "⌘" : "⏳"; // ⌘ / ⏳
+  dot.title = s === "approval" ? "approval required" : "waiting for input";
+  return dot;
+}
+
+/** Select the window+pane a Claude event/card came from. */
+function navigateToPane(paneId: string): void {
+  const sess = topology.find((s) => s.name === sessionTitle);
+  if (!sess) return;
+  for (const w of sess.windows) {
+    const p = w.panes.find((pp) => pp.id === paneId);
+    if (!p) continue;
+    if (!w.active) windowAction("select_window", w.index);
+    if (!p.active) windowAction("select_pane", p.index);
+    return;
+  }
+}
+
+const claudeChip = $("claude-chip");
+/** The active pane's own status, shown when there's no tab to badge (or as a
+ * quick at-a-glance for the current pane). */
+function renderClaudeChip(): void {
+  const pane = activePaneId();
+  const s = pane ? paneClaudeStatus(pane) : null;
+  claudeChip.textContent = "";
+  if (!s) {
+    claudeChip.hidden = true;
+    return;
+  }
+  claudeChip.className = `claude-chip claude-${s}`;
+  claudeChip.textContent =
+    s === "approval" ? "⌘ approval required" : "⏳ Claude waiting for input";
+  claudeChip.hidden = false;
+}
+
+/** Re-render every surface that reflects Claude status (renderTabs also paints
+ * the pane tabs and the active-pane chip). */
+function refreshClaudeStatus(): void {
+  renderTabs();
+}
+
+// Expire "waiting" entries and repaint. One cheap timer for the whole app.
+window.setInterval(() => {
+  if (claudeWaiting.size === 0) return;
+  const now = Date.now();
+  let changed = false;
+  for (const [pane, until] of claudeWaiting) {
+    if (until <= now) {
+      claudeWaiting.delete(pane);
+      changed = true;
+    }
+  }
+  if (changed) refreshClaudeStatus();
+}, 5000);
 
 // ---------- M4b permission cards ----------
 
@@ -700,6 +796,7 @@ function renderPermissionCards(cards: PermissionCard[]): void {
     permTicker = window.setInterval(paintPermissionCards, 1000);
   }
   paintPermissionCards(); // may stop the ticker if nothing is live
+  refreshClaudeStatus(); // "approval" badge/chip follows the live card set
 }
 
 function clearPermissionCards(): void {
@@ -731,10 +828,13 @@ function permCardEl(card: PermissionCard, left: number): HTMLElement {
 
   const head = document.createElement("div");
   head.className = "perm-head";
-  const title = document.createElement("span");
+  const title = document.createElement("button");
   title.className = "perm-title";
-  // source is the agent, tool is what it wants to run.
-  title.textContent = `${card.source} · ${card.tool}`;
+  // source is the agent, tool is what it wants to run. Tapping jumps to the
+  // originating pane (the terminal is the canonical view for the full context).
+  title.textContent = `${card.source} · ${card.tool} →`;
+  title.title = "go to this pane";
+  title.addEventListener("click", () => navigateToPane(card.pane));
   const countdown = document.createElement("span");
   countdown.className = "perm-countdown";
   countdown.textContent = `${left}s`;
@@ -1649,7 +1749,13 @@ async function checkPendingAttention(): Promise<void> {
   }
 }
 
-function onAttention(): void {
+function onAttention(msg: ControlMsg): void {
+  // Record pane-scoped "waiting for input" status (hook-fed events carry a pane).
+  // This runs regardless of visibility so the chip/badges stay current in-app.
+  if (msg.kind === "agent_needs_input" && msg.pane) {
+    claudeWaiting.set(msg.pane, Date.now() + CLAUDE_WAIT_TTL_MS);
+    refreshClaudeStatus();
+  }
   if (document.visibilityState === "visible") {
     return;
   }

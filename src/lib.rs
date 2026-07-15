@@ -239,6 +239,11 @@ pub struct Attention {
     /// `agent_needs_input` (hook-fed, precise) or `quiet_after_busy`
     /// (the heuristic fallback detector).
     pub kind: String,
+    /// The originating tmux pane (`%N`), for hook-fed events — lets a client show
+    /// a pane-scoped status chip and jump to it. `None` for the session-level
+    /// heuristic, which has no single pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
     /// Producer-supplied detail ("permission prompt"); sanitized at ingest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -253,6 +258,7 @@ impl Attention {
         Self {
             session,
             kind: "quiet_after_busy".into(),
+            pane: None,
             reason: None,
             source: None,
         }

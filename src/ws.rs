@@ -97,6 +97,10 @@ enum ServerMsg<'a> {
     /// (agent_needs_input) or the busy→quiet heuristic.
     Attention {
         kind: &'a str,
+        /// Originating pane (`%N`) for hook-fed events — drives the pane-scoped
+        /// Claude status chip. Absent for the session-level heuristic.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,6 +373,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             && out
                                 .send(json(&ServerMsg::Attention {
                                     kind: &att.kind,
+                                    pane: att.pane.as_deref(),
                                     reason: att.reason.as_deref(),
                                     source: att.source.as_deref(),
                                 }))

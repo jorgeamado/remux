@@ -152,6 +152,19 @@ pub fn send_keys(pane: &str, keys: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send named keys to a pane (e.g. `F5`, `BSpace`, `Enter`) — NOT literal, so
+/// tmux resolves each to the real key. Several in one call to keep it cheap.
+pub fn send_named(pane: &str, keys: &[&str]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut c = tmux();
+    c.args(["send-keys", "-t", pane]);
+    c.args(keys);
+    run_classified(c, true)?;
+    Ok(())
+}
+
 /// The window id (`@N`) a pane belongs to — for window-scoped options.
 pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
     let mut c = tmux();

@@ -782,38 +782,174 @@ button {
   background: var(--danger);
 }
 
-/* ---------- htop.v1 dashboard ---------- */
+/* ---------- htop.v1 dashboard — an instrument panel over the real htop ---- */
+/* Dashboard panel has no padding for htop so the sticky toolbar spans full width. */
+#dashboard-panel:has(.ht) {
+  padding: 0;
+}
 
-.ht-head {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  padding: 2px 2px 12px;
-  margin-bottom: 6px;
-  border-bottom: 1px solid var(--card-border);
-}
-.ht-stat {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
-}
-.ht-stat-l {
-  color: var(--muted);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-.ht-stat-v {
-  font-weight: 600;
-  font-size: 14px;
+.ht {
   font-variant-numeric: tabular-nums;
 }
 
-.ht-row {
-  padding: 7px 2px 8px;
-  border-bottom: 1px solid var(--card-border);
+/* System card: compact CPU + MEM bars, quiet metadata. Scrolls away. */
+.ht-sys {
+  padding: 10px 12px 8px;
 }
-.ht-line {
+.ht-sys-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+.ht-sys-l {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  width: 30px;
+}
+.ht-sys-v {
+  font-size: 13px;
+  font-weight: 600;
+  width: 108px;
+}
+.ht-sys-x {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ht-meter {
+  flex: 1;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.ht-meter-f {
+  height: 100%;
+  background: var(--ok);
+  transition: width 0.5s ease;
+}
+.ht-meter-f.warn {
+  background: var(--accent);
+}
+.ht-meter-f.crit {
+  background: var(--danger);
+}
+.ht-sys-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+/* Sticky toolbar: filter + tree, then the sort row. */
+.ht-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  padding: 6px 12px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ht-tbar-top {
+  display: flex;
+  gap: 8px;
+}
+.ht-filter {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: var(--input);
+  color: var(--fg);
+}
+.ht-filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ht-tool {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+.ht-tool.active {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+}
+.ht-sorts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+.ht-sorts-l {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  margin-right: 4px;
+}
+.ht-sort {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.ht-sort.active {
+  color: var(--accent-fg);
+  border-bottom-color: var(--accent);
+}
+.ht-sort.active::after {
+  content: " ↓";
+}
+
+/* Process list: continuous rows, a 3px CPU rail, no cards. */
+.ht-r {
+  position: relative;
+  padding: 6px 12px 7px 15px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  cursor: pointer;
+}
+.ht-r:active {
+  background: var(--card);
+}
+.ht-rail {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.ht-rail-f {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  background: var(--muted);
+  transition: height 0.5s ease;
+}
+.ht-rail-f.warn {
+  background: var(--accent);
+}
+.ht-rail-f.crit {
+  background: var(--danger);
+}
+.ht-r-line {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -827,53 +963,62 @@ button {
 }
 .ht-cpu {
   flex: none;
+  font-size: 15px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
+  min-width: 3.4em;
+  text-align: right;
 }
-.ht-meta {
+.ht-cpu.warn {
+  color: var(--accent-fg);
+}
+.ht-cpu.crit {
+  color: var(--danger);
+}
+.ht-r-sub {
+  margin-top: 1px;
   color: var(--muted);
   font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  margin-top: 1px;
 }
-.ht-bar {
-  height: 3px;
-  border-radius: 999px;
-  background: var(--bar);
-  overflow: hidden;
-  margin-top: 6px;
-}
-.ht-fill {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.4s ease;
+.ht-nums {
+  flex: none;
+  white-space: nowrap;
 }
 
-.ht-sortbar {
+/* Kill confirmation sheet — deliberate, never one tap. */
+.ht-sheet-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 2px 10px;
+  align-items: flex-end;
 }
-.ht-sortbar-l {
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-right: 2px;
-}
-.ht-sort {
-  font: inherit;
-  font-size: 12px;
-  padding: 4px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--card-border);
+.ht-sheet {
+  width: 100%;
   background: var(--card);
-  color: var(--fg);
-  cursor: pointer;
+  border-top: 1px solid var(--card-border);
+  border-radius: 16px 16px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
 }
-.ht-sort.active {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-fg);
+.ht-sheet-cmd {
+  font-size: 14px;
+  word-break: break-all;
+}
+.ht-sheet-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 6px 0 16px;
+}
+.ht-sheet-btns {
+  display: flex;
+  gap: 10px;
+}
+.ht-sheet-btns .btn {
+  flex: 1;
+  padding: 12px;
+}
+.ht-kill {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
 }

@@ -182,6 +182,22 @@ impl Registry {
         self.inner.lock().unwrap().get(pane).map(|e| e.view.clone())
     }
 
+    /// Whether the pane's current view lists a process with this pid — so a kill
+    /// can be gated to only what the dashboard is actually showing.
+    pub fn pane_has_pid(&self, pane: &str, pid: u32) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(pane)
+            .and_then(|e| e.state.as_ref())
+            .and_then(|s| s.get("processes"))
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|p| p.get("pid").and_then(Value::as_u64) == Some(pid as u64))
+            })
+    }
+
     /// Drop views whose pane is no longer in the live topology set.
     pub fn prune(&self, live: &HashSet<String>) {
         let mut map = self.inner.lock().unwrap();
@@ -239,16 +255,74 @@ impl Drop for ClaimGuard {
     }
 }
 
-/// Map a whitelisted dashboard *action* for a view to the literal key(s) to send
-/// to the real tool. Returns `None` for an unknown (view, action) pair — so a
-/// client can only trigger vetted actions, never arbitrary keystrokes.
-pub fn action_keys(view: &str, action: &str) -> Option<&'static str> {
-    match (view, action) {
-        ("htop.v1", "sort:cpu") => Some("P"),
-        ("htop.v1", "sort:mem") => Some("M"),
-        ("htop.v1", "sort:time") => Some("T"),
-        _ => None,
+/// A vetted dashboard action for htop, parsed from a client's semantic action
+/// string. ONLY these can ever reach the pane — never arbitrary keystrokes.
+#[derive(Debug, PartialEq)]
+pub enum HtopAction {
+    /// A literal character key (`P`/`M`/`T`/`I`).
+    Key(&'static str),
+    /// A named key (`F5`).
+    Named(&'static str),
+    /// Set/replace the incremental filter to this already-sanitized text.
+    Filter(String),
+    /// SIGTERM a process — gated against the pane's visible set by the caller.
+    Kill(u32),
+}
+
+/// Parse a client action string for the `htop.v1` view. `None` for anything not
+/// whitelisted, so a client can only trigger vetted actions.
+pub fn parse_htop_action(action: &str) -> Option<HtopAction> {
+    match action {
+        "sort:cpu" => Some(HtopAction::Key("P")),
+        "sort:mem" => Some(HtopAction::Key("M")),
+        "sort:time" => Some(HtopAction::Key("T")),
+        "invert" => Some(HtopAction::Key("I")),
+        "tree" => Some(HtopAction::Named("F5")),
+        _ => {
+            if let Some(q) = action.strip_prefix("filter:") {
+                // Only printable text reaches htop's filter field; cap length.
+                Some(HtopAction::Filter(
+                    q.chars().filter(|c| !c.is_control()).take(64).collect(),
+                ))
+            } else if let Some(pid) = action.strip_prefix("kill:") {
+                pid.parse::<u32>().ok().map(HtopAction::Kill)
+            } else {
+                None
+            }
+        }
     }
+}
+
+/// Drive a non-kill htop action through tmux. Kill is handled by the caller
+/// (it needs a visibility check first).
+pub fn exec_htop_action(pane: &str, action: &HtopAction) -> Result<()> {
+    match action {
+        HtopAction::Key(k) => crate::tmux::send_keys(pane, k),
+        HtopAction::Named(k) => crate::tmux::send_named(pane, &[k]),
+        HtopAction::Filter(q) => htop_set_filter(pane, q),
+        HtopAction::Kill(_) => Ok(()),
+    }
+}
+
+/// Set (or clear, if empty) htop's incremental filter: F4, clear any existing
+/// text, type the query, Enter.
+fn htop_set_filter(pane: &str, query: &str) -> Result<()> {
+    crate::tmux::send_named(pane, &["F4"])?;
+    let clear = vec!["BSpace"; 48];
+    crate::tmux::send_named(pane, &clear)?;
+    if !query.is_empty() {
+        crate::tmux::send_keys(pane, query)?;
+    }
+    crate::tmux::send_named(pane, &["Enter"])?;
+    Ok(())
+}
+
+/// SIGTERM a process (graceful). Best-effort.
+pub fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
 }
 
 /// Validate a snapshot's shape for `view`. Kept strict but minimal — enough that
@@ -953,15 +1027,28 @@ F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortBy";
     }
 
     #[test]
-    fn dashboard_actions_are_whitelisted_per_view() {
-        assert_eq!(action_keys("htop.v1", "sort:cpu"), Some("P"));
-        assert_eq!(action_keys("htop.v1", "sort:mem"), Some("M"));
-        assert_eq!(action_keys("htop.v1", "sort:time"), Some("T"));
-        // Unknown action / view / a raw keystroke smuggling attempt → nothing.
-        assert_eq!(action_keys("htop.v1", "sort:bogus"), None);
-        assert_eq!(action_keys("htop.v1", "q"), None);
-        assert_eq!(action_keys("htop.v1", "rm -rf /"), None);
-        assert_eq!(action_keys("taskscope.v1", "sort:cpu"), None);
+    fn dashboard_actions_are_whitelisted() {
+        use HtopAction::*;
+        assert_eq!(parse_htop_action("sort:cpu"), Some(Key("P")));
+        assert_eq!(parse_htop_action("sort:mem"), Some(Key("M")));
+        assert_eq!(parse_htop_action("sort:time"), Some(Key("T")));
+        assert_eq!(parse_htop_action("invert"), Some(Key("I")));
+        assert_eq!(parse_htop_action("tree"), Some(Named("F5")));
+        assert_eq!(
+            parse_htop_action("filter:remux"),
+            Some(Filter("remux".into()))
+        );
+        assert_eq!(parse_htop_action("kill:4702"), Some(Kill(4702)));
+        // A filter strips control chars (no smuggling Enter/keys into htop).
+        assert_eq!(
+            parse_htop_action("filter:a\nb\tc"),
+            Some(Filter("abc".into()))
+        );
+        // Rejected: unknown, non-numeric kill, raw keystrokes.
+        assert_eq!(parse_htop_action("sort:bogus"), None);
+        assert_eq!(parse_htop_action("kill:; rm -rf"), None);
+        assert_eq!(parse_htop_action("q"), None);
+        assert_eq!(parse_htop_action("rm -rf /"), None);
     }
 
     #[test]

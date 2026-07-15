@@ -933,12 +933,20 @@ function toggleDashboard(): void {
 
 function renderDashboard(): void {
   const v = currentView();
+  if (!v) {
+    dashboardPanel.textContent = "";
+    htChrome = null;
+    return;
+  }
+  if (v.view === "htop.v1") {
+    // Stateful: keep the toolbar (filter input focus!) across 1.5s updates.
+    renderHtopInto(v.state, v.pane);
+    return;
+  }
+  htChrome = null;
   dashboardPanel.textContent = "";
-  if (!v) return;
   if (v.view === "taskscope.v1") {
     dashboardPanel.appendChild(renderTaskscope(v.state));
-  } else if (v.view === "htop.v1") {
-    dashboardPanel.appendChild(renderHtop(v.state, v.pane));
   } else {
     const unknown = document.createElement("div");
     unknown.className = "dash-empty";
@@ -947,116 +955,278 @@ function renderDashboard(): void {
   }
 }
 
-// --- htop.v1 renderer (a lens over the real htop's rendered screen) ---
+// --- htop.v1 renderer: a live "instrument panel" over the real htop ---
 
-function htStat(label: string, value: string): HTMLElement {
-  const el = document.createElement("div");
-  el.className = "ht-stat";
-  const l = document.createElement("span");
-  l.className = "ht-stat-l";
-  l.textContent = label;
-  const val = document.createElement("span");
-  val.className = "ht-stat-v";
-  val.textContent = value;
-  el.append(l, val);
-  return el;
+interface HtChrome {
+  pane: string;
+  root: HTMLElement;
+  sys: HTMLElement;
+  list: HTMLElement;
+  sorts: Record<string, HTMLButtonElement>;
+}
+let htChrome: HtChrome | null = null;
+let htSortKey = "cpu"; // active sort, remembered for the toolbar highlight
+
+function htAction(pane: string, action: string): void {
+  sendJson({ type: "pane_action", pane, action });
 }
 
-// The active htop sort, remembered client-side just to highlight the button —
-// htop itself is the source of truth (it re-sorts and the next capture reflects
-// it).
-let htSort = "cpu";
-
-function htSortBtn(label: string, key: string, pane: string): HTMLElement {
-  const b = document.createElement("button");
-  b.className = "ht-sort" + (htSort === key ? " active" : "");
-  b.textContent = label;
-  b.addEventListener("click", () => {
-    htSort = key;
-    sendJson({ type: "pane_action", pane, action: `sort:${key}` });
-    renderDashboard(); // move the highlight now; htop reorders within ~1.5s
-  });
-  return b;
+/** "" (calm) | "warn" (violet) | "crit" (red) by threshold — restrained color. */
+function loadClass(v: number, warn: number, crit: number): string {
+  return v >= crit ? "crit" : v >= warn ? "warn" : "";
 }
 
-function renderHtop(state: Record<string, unknown>, pane: string): HTMLElement {
+function updateHtSorts(sorts: Record<string, HTMLButtonElement>): void {
+  for (const [key, b] of Object.entries(sorts)) b.classList.toggle("active", key === htSortKey);
+}
+
+function buildHtChrome(pane: string): HtChrome {
   const root = document.createElement("div");
   root.className = "ht";
-  const summary = (state.summary ?? {}) as Record<string, unknown>;
-  const procs = Array.isArray(state.processes)
-    ? (state.processes as Record<string, unknown>[])
-    : [];
 
-  const head = document.createElement("div");
-  head.className = "ht-head";
-  head.appendChild(htStat("CPU", `${Number(summary.cpu_pct ?? 0).toFixed(1)}%`));
-  if (summary.mem) head.appendChild(htStat("MEM", String(summary.mem)));
-  if (summary.load) head.appendChild(htStat("LOAD", String(summary.load)));
-  if (summary.uptime) head.appendChild(htStat("UP", String(summary.uptime)));
-  root.appendChild(head);
+  const sys = document.createElement("div");
+  sys.className = "ht-sys";
 
-  const sortBar = document.createElement("div");
-  sortBar.className = "ht-sortbar";
-  const l = document.createElement("span");
-  l.className = "ht-sortbar-l";
-  l.textContent = "sort";
-  sortBar.append(
-    l,
-    htSortBtn("CPU", "cpu", pane),
-    htSortBtn("MEM", "mem", pane),
-    htSortBtn("TIME", "time", pane)
-  );
-  root.appendChild(sortBar);
-
-  if (state.confidence === "low" || procs.length === 0) {
-    const note = document.createElement("div");
-    note.className = "dash-empty";
-    note.textContent =
-      "Couldn't read htop's screen — tap Terminal for the live view.";
-    root.appendChild(note);
-    return root;
-  }
-
-  for (const p of procs) root.appendChild(htRow(p));
-  return root;
-}
-
-function htRow(p: Record<string, unknown>): HTMLElement {
-  const cpu = Number(p.cpu ?? 0);
-  const mem = Number(p.mem ?? 0);
-
-  const row = document.createElement("div");
-  row.className = "ht-row";
+  // Sticky toolbar: filter + tree on top, sort row below.
+  const bar = document.createElement("div");
+  bar.className = "ht-toolbar";
 
   const top = document.createElement("div");
-  top.className = "ht-line";
+  top.className = "ht-tbar-top";
+  const filter = document.createElement("input");
+  filter.className = "ht-filter";
+  filter.type = "text";
+  filter.placeholder = "Filter processes…";
+  filter.autocapitalize = "off";
+  filter.autocomplete = "off";
+  filter.spellcheck = false;
+  filter.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      htAction(pane, `filter:${filter.value}`);
+      filter.blur();
+    }
+  });
+  const tree = document.createElement("button");
+  tree.className = "ht-tool";
+  tree.textContent = "Tree";
+  tree.addEventListener("click", () => {
+    tree.classList.toggle("active");
+    htAction(pane, "tree");
+  });
+  top.append(filter, tree);
+
+  const sortRow = document.createElement("div");
+  sortRow.className = "ht-sorts";
+  const sl = document.createElement("span");
+  sl.className = "ht-sorts-l";
+  sl.textContent = "sort";
+  sortRow.appendChild(sl);
+  const sorts: Record<string, HTMLButtonElement> = {};
+  for (const [key, label] of [
+    ["cpu", "CPU"],
+    ["mem", "MEM"],
+    ["time", "TIME"],
+  ] as const) {
+    const b = document.createElement("button");
+    b.className = "ht-sort";
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      if (htSortKey === key) htAction(pane, "invert"); // tap active → reverse
+      else {
+        htSortKey = key;
+        htAction(pane, `sort:${key}`);
+      }
+      updateHtSorts(sorts);
+    });
+    sorts[key] = b;
+    sortRow.appendChild(b);
+  }
+  bar.append(top, sortRow);
+
+  const list = document.createElement("div");
+  list.className = "ht-list";
+
+  root.append(sys, bar, list);
+  return { pane, root, sys, list, sorts };
+}
+
+function renderHtopInto(state: Record<string, unknown>, pane: string): void {
+  if (!htChrome || htChrome.pane !== pane) {
+    dashboardPanel.textContent = "";
+    htChrome = buildHtChrome(pane);
+    dashboardPanel.appendChild(htChrome.root);
+    updateHtSorts(htChrome.sorts);
+  }
+  const summary = (state.summary ?? {}) as Record<string, unknown>;
+  const procs = Array.isArray(state.processes) ? (state.processes as Record<string, unknown>[]) : [];
+  renderHtSys(htChrome.sys, summary, procs.length);
+  renderHtList(htChrome.list, procs, pane, state.confidence === "low");
+}
+
+function htMeter(pct: number, cls: string): HTMLElement {
+  const m = document.createElement("div");
+  m.className = "ht-meter";
+  const f = document.createElement("div");
+  f.className = "ht-meter-f " + cls;
+  f.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  m.appendChild(f);
+  return m;
+}
+
+/** "2.27G/3.83G" → percent used, for the memory bar. */
+function memPercent(mem: string): number {
+  const m = mem.match(/([\d.]+)\s*([KMGT]?)\s*\/\s*([\d.]+)\s*([KMGT]?)/);
+  if (!m) return 0;
+  const u: Record<string, number> = { K: 1, M: 1024, G: 1024 ** 2, T: 1024 ** 3, "": 1 };
+  const used = parseFloat(m[1]) * (u[m[2]] ?? 1);
+  const total = parseFloat(m[3]) * (u[m[4]] ?? 1);
+  return total > 0 ? (used / total) * 100 : 0;
+}
+
+function renderHtSys(sys: HTMLElement, s: Record<string, unknown>, tasks: number): void {
+  sys.textContent = "";
+  const cpu = Number(s.cpu_pct ?? 0);
+
+  const cpuRow = document.createElement("div");
+  cpuRow.className = "ht-sys-row";
+  cpuRow.append(htSysL("CPU"), htSysV(`${cpu.toFixed(1)}%`), htMeter(cpu, loadClass(cpu, 60, 90)));
+  const tk = document.createElement("span");
+  tk.className = "ht-sys-x";
+  tk.textContent = `${tasks} tasks`;
+  cpuRow.append(tk);
+  sys.appendChild(cpuRow);
+
+  if (s.mem) {
+    const memPct = memPercent(String(s.mem));
+    const memRow = document.createElement("div");
+    memRow.className = "ht-sys-row";
+    memRow.append(htSysL("MEM"), htSysV(String(s.mem)), htMeter(memPct, loadClass(memPct, 75, 90)));
+    sys.appendChild(memRow);
+  }
+
+  const meta: string[] = [];
+  if (s.load) meta.push(`load ${s.load}`);
+  if (s.uptime) meta.push(`up ${s.uptime}`);
+  if (meta.length) {
+    const m = document.createElement("div");
+    m.className = "ht-sys-meta";
+    m.textContent = meta.join("   ·   ");
+    sys.appendChild(m);
+  }
+}
+
+function htSysL(t: string): HTMLElement {
+  const e = document.createElement("span");
+  e.className = "ht-sys-l";
+  e.textContent = t;
+  return e;
+}
+function htSysV(t: string): HTMLElement {
+  const e = document.createElement("span");
+  e.className = "ht-sys-v";
+  e.textContent = t;
+  return e;
+}
+
+function renderHtList(
+  list: HTMLElement,
+  procs: Record<string, unknown>[],
+  pane: string,
+  low: boolean
+): void {
+  list.textContent = "";
+  if (low || procs.length === 0) {
+    const note = document.createElement("div");
+    note.className = "dash-empty";
+    note.textContent = "Couldn't read htop's screen — tap Terminal for the live view.";
+    list.appendChild(note);
+    return;
+  }
+  for (const p of procs) list.appendChild(htRow(p, pane));
+}
+
+function htRow(p: Record<string, unknown>, pane: string): HTMLElement {
+  const cpu = Number(p.cpu ?? 0);
+  const mem = Number(p.mem ?? 0);
+  const cpuCls = loadClass(cpu, 60, 90);
+
+  const row = document.createElement("div");
+  row.className = "ht-r";
+
+  const rail = document.createElement("div");
+  rail.className = "ht-rail";
+  const rf = document.createElement("div");
+  rf.className = "ht-rail-f " + cpuCls;
+  rf.style.height = `${Math.max(2, Math.min(100, cpu))}%`;
+  rail.appendChild(rf);
+
+  const body = document.createElement("div");
+  body.className = "ht-r-body";
+
+  const l1 = document.createElement("div");
+  l1.className = "ht-r-line";
   const cmd = document.createElement("span");
   cmd.className = "ht-cmd";
-  // Narrow panes drop htop's Command column; fall back to the pid so the row
-  // still has a title.
   cmd.textContent = String(p.command || `pid ${p.pid ?? "?"}`);
   const cpuEl = document.createElement("span");
-  cpuEl.className = "ht-cpu";
-  cpuEl.textContent = `${cpu.toFixed(1)}%`;
-  top.append(cmd, cpuEl);
+  cpuEl.className = "ht-cpu " + cpuCls;
+  cpuEl.textContent = cpu.toFixed(1);
+  l1.append(cmd, cpuEl);
 
-  const meta = document.createElement("div");
-  meta.className = "ht-line ht-meta";
+  const l2 = document.createElement("div");
+  l2.className = "ht-r-line ht-r-sub";
   const who = document.createElement("span");
-  who.textContent = `${p.pid ?? "?"} · ${String(p.user ?? "")} · ${String(p.res ?? "")}`;
-  const memEl = document.createElement("span");
-  memEl.textContent = `mem ${mem.toFixed(1)}%`;
-  meta.append(who, memEl);
+  who.className = "ht-who";
+  who.textContent = `${p.pid ?? "?"} ${String(p.user ?? "")}`;
+  const nums = document.createElement("span");
+  nums.className = "ht-nums";
+  nums.textContent = `${String(p.res ?? "")}   M ${mem.toFixed(1)}   ${String(p.time ?? "")}`;
+  l2.append(who, nums);
 
-  const bar = document.createElement("div");
-  bar.className = "ht-bar";
-  const fill = document.createElement("div");
-  fill.className = "ht-fill";
-  fill.style.width = `${Math.max(0, Math.min(100, cpu))}%`;
-  bar.appendChild(fill);
-
-  row.append(top, meta, bar);
+  body.append(l1, l2);
+  row.append(rail, body);
+  row.addEventListener("click", () => openKillSheet(p, pane));
   return row;
+}
+
+/** Deliberate, confirmed kill — never a one-tap action. */
+function openKillSheet(p: Record<string, unknown>, pane: string): void {
+  const pid = Number(p.pid ?? 0);
+  if (!pid) return;
+  const bg = document.createElement("div");
+  bg.className = "ht-sheet-bg";
+  const sheet = document.createElement("div");
+  sheet.className = "ht-sheet";
+  const cmd = document.createElement("div");
+  cmd.className = "ht-sheet-cmd";
+  cmd.textContent = String(p.command || `pid ${pid}`);
+  const meta = document.createElement("div");
+  meta.className = "ht-sheet-meta";
+  meta.textContent = `pid ${pid} · ${String(p.user ?? "")} · cpu ${Number(p.cpu ?? 0).toFixed(
+    1
+  )}% · mem ${Number(p.mem ?? 0).toFixed(1)}%`;
+  const btns = document.createElement("div");
+  btns.className = "ht-sheet-btns";
+  const cancel = document.createElement("button");
+  cancel.className = "btn";
+  cancel.textContent = "Cancel";
+  const kill = document.createElement("button");
+  kill.className = "btn ht-kill";
+  kill.textContent = `Kill ${pid}`;
+  const close = (): void => bg.remove();
+  cancel.addEventListener("click", close);
+  bg.addEventListener("click", (e) => {
+    if (e.target === bg) close();
+  });
+  kill.addEventListener("click", () => {
+    htAction(pane, `kill:${pid}`);
+    close();
+  });
+  btns.append(cancel, kill);
+  sheet.append(cmd, meta, btns);
+  bg.appendChild(sheet);
+  $("app").appendChild(bg);
 }
 
 // --- taskscope.v1 renderer (hard-coded; one built-in view) ---

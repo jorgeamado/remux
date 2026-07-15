@@ -702,25 +702,35 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     }
                 }
                 Ok(ClientMsg::PaneAction { pane, action }) => {
-                    // Only for a pane in THIS session that has a live view, and
-                    // only whitelisted actions → mapped keys. Compute the checks
-                    // before any await (don't hold the topology borrow across it).
+                    // Only for an htop pane in THIS session, and only whitelisted
+                    // actions. Compute the checks before any await (don't hold the
+                    // topology borrow across it).
                     let in_session = app.topology.borrow().iter().any(|s| {
                         s.name == session
                             && s.windows
                                 .iter()
                                 .any(|w| w.panes.iter().any(|p| p.id == pane))
                     });
-                    let keys = app
-                        .pane_views
-                        .view_of(&pane)
-                        .and_then(|v| paneview::action_keys(&v, &action));
-                    if in_session {
-                        if let Some(keys) = keys {
-                            let p = pane.clone();
-                            let k = keys.to_string();
-                            let _ =
-                                tokio::task::spawn_blocking(move || tmux::send_keys(&p, &k)).await;
+                    let is_htop = app.pane_views.view_of(&pane).as_deref() == Some("htop.v1");
+                    if in_session && is_htop {
+                        match paneview::parse_htop_action(&action) {
+                            Some(paneview::HtopAction::Kill(pid)) => {
+                                // Only kill a process the dashboard is showing.
+                                if app.pane_views.pane_has_pid(&pane, pid) {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        paneview::kill_process(pid)
+                                    })
+                                    .await;
+                                }
+                            }
+                            Some(act) => {
+                                let p = pane.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    paneview::exec_htop_action(&p, &act)
+                                })
+                                .await;
+                            }
+                            None => {}
                         }
                     }
                 }

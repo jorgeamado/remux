@@ -2,11 +2,23 @@
 
 > Your persistent tmux session, on your phone.
 
+[![CI](https://github.com/jorgeamado/remux/actions/workflows/ci.yml/badge.svg)](https://github.com/jorgeamado/remux/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jorgeamado/remux?sort=semver)](https://github.com/jorgeamado/remux/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+
 remux is a small self-hosted daemon that exposes your tmux session to your own
 devices as a mobile-friendly web terminal (PWA). Start work on your computer
 (mosh/ssh → tmux), glance at a running job or Claude Code from your phone, type
 a reply, put the phone down, and keep typing at your desk — the session never
 restarts, and the terminal resizes to whichever device is active.
+
+![remux — the same tmux session on your desktop and your phone](docs/media/demo-placeholder.svg)
+
+<!-- TODO: replace docs/media/demo-placeholder.svg with a real screenshot or a
+     short screen recording (GIF/MP4). Good things to capture: the resize
+     handoff desktop→phone, the session/window picker, an Approve/Deny card,
+     the command feed panel, and a lock-screen notification. -->
 
 See [DESIGN.md](DESIGN.md) for the architecture and design review.
 
@@ -245,3 +257,29 @@ approval cards ships as a small Claude Code plugin (a `PermissionRequest`
 command hook) — see `docs/STATUS.md`. Still exploratory: OSC 133 shell
 integration and streamed command *output* (built only if command metadata
 proves insufficient).
+
+## FAQ
+
+**Is this exposed to the internet?** No. remux binds to your Tailscale IP or
+localhost; WireGuard is the network boundary. Never bind it to a public address.
+
+**Does it store my terminal output?** No. The daemon never logs terminal I/O,
+and nothing is persisted except your hashed device tokens and push keys.
+
+**Do I need Tailscale?** It's the zero-config path (private network + one-command
+TLS certs). Any VPN or reverse proxy that gives you a private hostname works;
+Tailscale is just what the docs assume.
+
+**Windows?** Run it inside WSL2 — the daemon needs `tmux`, which has no native
+Windows build.
+
+## Contributing
+
+Issues and PRs welcome. The whole project builds and tests in the devcontainer
+(see [Development](#development)); please run `cargo test`, `cargo clippy`,
+`cargo fmt --check`, and the web build before opening a PR — CI enforces all of
+them. Security reports: see [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE) © George Lemeshko.

@@ -14,6 +14,13 @@
       "label": "remux daemon"
     }
   },
+  // Persist Claude Code state (config + login credentials) on the bind-mounted
+  // repo so a container rebuild doesn't require re-login. Contents are gitignored
+  // (.devcontainer/data/). Applies to every process, incl. the daemon's tmux
+  // panes, so `claude` in a pane picks it up automatically.
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "${containerWorkspaceFolder}/.devcontainer/data/claude"
+  },
   "customizations": {
     "vscode": {
       "extensions": [

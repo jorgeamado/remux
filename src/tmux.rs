@@ -143,6 +143,46 @@ pub fn ensure_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// The window id (`@N`) a pane belongs to — for window-scoped options.
+pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
+    let mut c = tmux();
+    c.args(["display-message", "-p", "-t", pane, "#{window_id}"]);
+    Ok(run_classified(c, true)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Force a large fixed "capture resolution" on a window so a full-screen tool
+/// (e.g. htop) renders all its columns and rows regardless of a small phone
+/// client. Used only while a dashboard view is on screen — the terminal itself
+/// is hidden then, so the oversized render is invisible. Reverted by
+/// [`clear_capture_size`].
+pub fn set_capture_size(window: &str, cols: u16, rows: u16) -> Result<()> {
+    let mut c = tmux();
+    c.args(["set-option", "-w", "-t", window, "window-size", "manual"]);
+    run_classified(c, true)?;
+    let mut c = tmux();
+    c.args([
+        "resize-window",
+        "-t",
+        window,
+        "-x",
+        &cols.to_string(),
+        "-y",
+        &rows.to_string(),
+    ]);
+    run_classified(c, true)?;
+    Ok(())
+}
+
+/// Restore client-driven sizing (remux's `latest` default) on a window.
+pub fn clear_capture_size(window: &str) -> Result<()> {
+    let mut c = tmux();
+    c.args(["set-option", "-w", "-t", window, "window-size", "latest"]);
+    run_classified(c, true)?;
+    Ok(())
+}
+
 /// Command line for the per-connection attach client, spawned inside a PTY.
 /// Starts as an observer: not participating in window sizing.
 ///

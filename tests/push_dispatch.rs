@@ -62,6 +62,7 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
         pane_views: Default::default(),
+        dash_windows: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });

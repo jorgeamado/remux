@@ -20,6 +20,11 @@ const OUT_QUEUE: usize = 256;
 /// stolen token (or a buggy client) cannot exhaust the host's processes/FDs.
 const MAX_TOTAL_CONNECTIONS: usize = 64;
 const MAX_PER_DEVICE_CONNECTIONS: usize = 8;
+/// The large fixed size a window is forced to while a client views its dashboard,
+/// so a full-screen tool (htop) renders every column/row for the capture. The
+/// terminal is hidden then, so the oversized render is invisible.
+const DASH_COLS: u16 = 210;
+const DASH_ROWS: u16 = 60;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,6 +45,15 @@ enum ClientMsg {
     },
     TakeControl,
     ReleaseControl,
+    /// The client entered (or left) the custom dashboard for a pane. While ≥1
+    /// client is on a pane's dashboard, its window is forced to a large capture
+    /// resolution so a full-screen tool renders all its info; `pane` is unused
+    /// when leaving.
+    ViewMode {
+        #[serde(default)]
+        pane: String,
+        dashboard: bool,
+    },
     /// Window/pane operations (new window, splits, switching) — controller only.
     WindowAction {
         action: String,
@@ -510,6 +524,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     }
 
     let mut controller = false;
+    // The window (if any) this client is holding at dashboard capture size.
+    let mut current_dash: Option<String> = None;
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
@@ -650,6 +666,34 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                         }
                     }
                 }
+                Ok(ClientMsg::ViewMode { pane, dashboard }) => {
+                    // Force this pane's window to the big capture resolution while
+                    // the dashboard is shown, and restore it on leave/switch.
+                    let target = if dashboard {
+                        match tokio::task::spawn_blocking(move || tmux::window_of_pane(&pane)).await
+                        {
+                            Ok(Ok(w)) => w,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    match target {
+                        Some(win) if current_dash.as_deref() != Some(&win) => {
+                            if let Some(old) = current_dash.take() {
+                                dash_leave(&app, old).await;
+                            }
+                            dash_enter(&app, win.clone()).await;
+                            current_dash = Some(win);
+                        }
+                        Some(_) => {} // already sized for this window
+                        None => {
+                            if let Some(old) = current_dash.take() {
+                                dash_leave(&app, old).await;
+                            }
+                        }
+                    }
+                }
                 Ok(ClientMsg::Ping) => {
                     let _ = out_tx.send(json(&ServerMsg::Pong)).await;
                 }
@@ -661,6 +705,12 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
             Message::Close(_) => break,
             _ => {}
         }
+    }
+
+    // Release any dashboard capture-size hold so the window returns to normal
+    // sizing (the client left without a clean ViewMode{false}).
+    if let Some(win) = current_dash.take() {
+        dash_leave(&app, win).await;
     }
 
     // Connection gone: kill the attach client. tmux drops it from sizing and the
@@ -675,6 +725,47 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     sender.abort();
     tracing::info!(device = %device.name, "client disconnected");
     Ok(())
+}
+
+/// A client is now viewing `window`'s dashboard: bump the count and, if it's the
+/// first, force the big capture resolution.
+async fn dash_enter(app: &Arc<App>, window: String) {
+    let first = {
+        let mut m = app.dash_windows.lock().unwrap();
+        let n = m.entry(window.clone()).or_insert(0);
+        *n += 1;
+        *n == 1
+    };
+    if first {
+        let w = window;
+        let _ =
+            tokio::task::spawn_blocking(move || tmux::set_capture_size(&w, DASH_COLS, DASH_ROWS))
+                .await;
+    }
+}
+
+/// A client left `window`'s dashboard: drop the count and, if it's the last,
+/// restore client-driven sizing.
+async fn dash_leave(app: &Arc<App>, window: String) {
+    let last = {
+        let mut m = app.dash_windows.lock().unwrap();
+        match m.get_mut(&window) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&window);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    };
+    if last {
+        let w = window;
+        let _ = tokio::task::spawn_blocking(move || tmux::clear_capture_size(&w)).await;
+    }
 }
 
 /// Decrements the live-connection registry on any exit path.

@@ -281,6 +281,10 @@ pub struct App {
     /// Latest structured "pane view" per pane, fed by the `remux stream` socket
     /// and rendered by the PWA as a custom interface for that pane.
     pub pane_views: paneview::Registry,
+    /// Windows forced to a large "capture resolution" while a dashboard view is
+    /// on screen: window id → count of clients viewing it. When it hits zero the
+    /// window returns to client-driven sizing.
+    pub dash_windows: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Per-session shell command feed (M4c), fed by the shell datagram socket.
     pub feed: feed::Feed,
     /// Session names whose busy→quiet detector should reset — sent when a

@@ -54,6 +54,7 @@ async fn https_listener_serves_health() {
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
         pane_views: Default::default(),
+        dash_windows: Default::default(),
         feed: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });

@@ -915,8 +915,13 @@ function setDashboard(on: boolean): void {
     // controller, hand control back so the now-hidden xterm can't keep shrinking
     // the desktop layout (window-size latest).
     if (isController) sendJson({ type: "release_control" });
+    // Ask the daemon to render this pane at a big "capture resolution" so a
+    // full-screen tool (htop) exposes all its info to the dashboard. The
+    // terminal is hidden now, so the oversized render isn't seen.
+    sendJson({ type: "view_mode", pane: currentView()?.pane ?? "", dashboard: true });
     renderDashboard();
   } else {
+    sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
     handle.fit(); // terminal is visible again — remeasure the grid
   }
 }

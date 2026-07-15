@@ -597,6 +597,19 @@ a real gap.
   remux fully VPN-agnostic (today Tailscale is only "special" because
   `tailscale cert` is the zero-config way to satisfy iOS's trusted-TLS
   requirement — there is no code dependency on it).
+- **Voice input for the composer** (idea, decide later) — dictate commands to the
+  phone composer by speech, but with a *domain-adapted* recognizer rather than a
+  generic dictation engine: bias/condition the speech-to-text on the CLI
+  vocabulary actually in play — installed tools' names, their subcommands/flags
+  (from `--help`/completion specs/man pages), symbols and paths visible in the
+  pane, and recent shell history — so it transcribes `git rebase -i HEAD~3`, not
+  "git rebase eye head three". Open questions to resolve when we pick this up:
+  (a) contextual biasing / hotword lists over a general STT vs. a small
+  fine-tuned model; (b) where the dictionary comes from and how it's kept current
+  per session/host; (c) on-device vs server inference under the secrets posture —
+  spoken commands and their transcripts can carry secrets, so audio/text should
+  stay memory-only and most likely on-device. Fits the composer, not the raw
+  terminal (the composer is already the edit-before-send surface).
 
 ## Sequencing rationale
 

@@ -319,10 +319,7 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
 /// Blocking read of any new complete lines from `path`, given prior tail state.
 /// Returns (rendered messages, new state, reset?) — `reset` is true when the
 /// file was truncated/rotated/first-seen so the caller starts a new generation.
-fn read_new(
-    path: &str,
-    prev: Option<Tailer>,
-) -> Option<ReadOutput> {
+fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
     use std::os::unix::fs::MetadataExt;
     let mut file = open_validated(path)?;
     let md = file.metadata().ok()?;

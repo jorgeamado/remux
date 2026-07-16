@@ -185,6 +185,7 @@ function setRole(controller: boolean): void {
   // The window tabs make the status line redundant anyway.
   handle.setHideStatusRow(controller);
   maybeAutoZoom(); // a split active window auto-zooms once we can drive it
+  refreshClaudeDashboard(); // mode chip is controller-gated — repaint on role flip
 }
 
 /// The control row: a role chip on the left, the takeover button on the right.
@@ -824,6 +825,14 @@ function refreshClaudeStatus(): void {
   renderTabs();
 }
 
+/** Re-render the open Claude dashboard, if one is showing. The Claude view's
+ * chrome (mode chip enabled/disabled, waiting banner) reflects role and
+ * attention state that change independently of pane-view frames, so those
+ * handlers must repaint it explicitly. */
+function refreshClaudeDashboard(): void {
+  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+}
+
 // Expire "waiting" entries and repaint. One cheap timer for the whole app.
 window.setInterval(() => {
   if (claudeWaiting.size === 0) return;
@@ -835,7 +844,10 @@ window.setInterval(() => {
       changed = true;
     }
   }
-  if (changed) refreshClaudeStatus();
+  if (changed) {
+    refreshClaudeStatus();
+    refreshClaudeDashboard(); // clear the "waiting" banner when its TTL expires
+  }
 }, 5000);
 
 // ---------- M4b permission cards ----------
@@ -862,7 +874,7 @@ function renderPermissionCards(cards: PermissionCard[]): void {
   refreshClaudeStatus(); // "approval" badge/chip follows the live card set
   // The claude.v1 dashboard joins a pending card by id — if it rendered before
   // the card frame arrived, re-render now so Approve/Deny appears inline.
-  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+  refreshClaudeDashboard();
 }
 
 function clearPermissionCards(): void {
@@ -1089,21 +1101,31 @@ let chatPane: string | null = null; // the pane we're subscribed to
 let chatMessages: ChatMsg[] = [];
 let chatLogEl: HTMLElement | null = null; // the open log element, repainted in place
 // Mode-switch reconciliation: after tapping the mode chip we show "switching…"
-// until the observed mode actually changes (or a timeout).
-let chatModeSwitching = false;
-let chatModeBefore = "";
+// until the observed mode actually changes (or a timeout). Scoped to a specific
+// pane + attempt so a pending switch for pane A can't be cleared by opening pane
+// B, and a fired timeout can't clear a newer attempt.
+let chatModeSwitch: { pane: string; before: string; attempt: number } | null =
+  null;
+let chatModeAttemptSeq = 0;
+
+/** Abandon any pending mode switch (on pane change / unsubscribe / reconnect). */
+function cancelModeSwitch(): void {
+  chatModeSwitch = null;
+}
 
 /** Subscribe to a pane's chat (idempotent); resets the local model so the fresh
  * snapshot replaces cleanly. */
 function subscribeChat(pane: string): void {
   if (chatPane === pane) return;
   if (chatPane) sendJson({ type: "chat_unsubscribe" });
+  cancelModeSwitch(); // a pending switch belonged to the pane we're leaving
   chatPane = pane;
   chatMessages = [];
   sendJson({ type: "chat_subscribe", pane });
 }
 function unsubscribeChat(): void {
   chatLogEl = null;
+  cancelModeSwitch();
   if (!chatPane) return;
   sendJson({ type: "chat_unsubscribe" });
   chatPane = null;
@@ -1619,8 +1641,17 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
     | null
     | undefined;
 
-  // The observed mode changed → our pending switch is reconciled.
-  if (chatModeSwitching && mode && mode !== chatModeBefore) chatModeSwitching = false;
+  // A pending switch is for THIS pane only; the observed mode changing reconciles
+  // it (a switch pending for another pane is left untouched).
+  if (
+    chatModeSwitch &&
+    chatModeSwitch.pane === pane &&
+    mode &&
+    mode !== chatModeSwitch.before
+  ) {
+    chatModeSwitch = null;
+  }
+  const switching = chatModeSwitch?.pane === pane;
 
   // Sticky header: status pill + observed/switch-able mode.
   const head = document.createElement("div");
@@ -1630,22 +1661,26 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
   pill.textContent =
     status === "awaiting-approval" ? "Awaiting approval" : status === "working" ? "Working…" : "Idle";
   head.appendChild(pill);
-  if (mode || chatModeSwitching) {
+  if (mode || switching) {
     const modeEl = document.createElement("button");
     modeEl.className = "cc-mode";
-    modeEl.textContent = chatModeSwitching ? "switching…" : mode;
+    modeEl.textContent = switching ? "switching…" : mode;
     modeEl.title = "cycle Claude's permission mode (Shift+Tab)";
-    if (isController) {
+    // Only a controller may switch; disable while a switch is already pending so
+    // a double-tap can't queue a second BTab.
+    if (isController && !switching) {
       modeEl.addEventListener("click", () => {
-        chatModeBefore = mode;
-        chatModeSwitching = true;
+        const attempt = ++chatModeAttemptSeq;
+        chatModeSwitch = { pane, before: mode, attempt };
         sendJson({ type: "chat_mode", pane });
         modeEl.textContent = "switching…";
-        // Give up the "switching…" label if no mode change is observed.
+        modeEl.disabled = true;
+        // Give up the "switching…" label if no mode change is observed — but only
+        // if THIS attempt is still the pending one (a newer tap supersedes it).
         window.setTimeout(() => {
-          if (chatModeSwitching) {
-            chatModeSwitching = false;
-            if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+          if (chatModeSwitch?.attempt === attempt) {
+            chatModeSwitch = null;
+            refreshClaudeDashboard();
           }
         }, 8000);
       });
@@ -1976,6 +2011,7 @@ function onAttention(msg: ControlMsg): void {
   if (msg.kind === "agent_needs_input" && msg.pane) {
     claudeWaiting.set(msg.pane, Date.now() + CLAUDE_WAIT_TTL_MS);
     refreshClaudeStatus();
+    refreshClaudeDashboard(); // "Claude is waiting" banner is attention-driven
   }
   if (document.visibilityState === "visible") {
     return;

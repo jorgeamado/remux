@@ -231,6 +231,30 @@ impl Registry {
         let _ = self.events.send(());
     }
 
+    /// Reconcile the permission mode for `pane` *only if* its current session
+    /// still equals `session_id`. Unlike `set_session`, this never inserts a
+    /// fresh entry: a tailer that reads a mode, then loses a race to a newer
+    /// session taking over the pane, must not resurrect or overwrite it. Returns
+    /// true if anything changed.
+    pub fn set_mode(&self, pane: &str, session_id: &str, mode: String) -> bool {
+        let changed = {
+            let mut map = self.inner.lock().unwrap();
+            match map.get_mut(pane) {
+                Some(s) if s.session_id == session_id => {
+                    let differs = s.permission_mode.as_deref() != Some(mode.as_str());
+                    s.permission_mode = Some(mode);
+                    s.updated = Instant::now();
+                    differs
+                }
+                _ => false, // absent, or a different session now owns the pane
+            }
+        };
+        if changed {
+            let _ = self.events.send(());
+        }
+        changed
+    }
+
     /// Drop entries whose pane is no longer live, or that have gone stale (TTL).
     pub fn prune(&self, live: &std::collections::HashSet<String>) {
         let now = Instant::now();
@@ -417,6 +441,27 @@ mod tests {
         assert_eq!(v.session_id, "s2");
         assert_eq!(v.transcript_path.as_deref(), Some("/t/s2.jsonl"));
         assert_eq!(v.permission_mode, None);
+    }
+
+    #[test]
+    fn set_mode_is_session_conditional_and_never_resurrects() {
+        let reg = Registry::default();
+        started(&reg, "%1", "s1");
+        // Matching session: mode applies, reports changed.
+        assert!(reg.set_mode("%1", "s1", "plan".into()));
+        assert_eq!(reg.views()[0].permission_mode.as_deref(), Some("plan"));
+        // Idempotent re-apply reports no change.
+        assert!(!reg.set_mode("%1", "s1", "plan".into()));
+        // A newer session takes over the pane...
+        reg.set_session("%1", "s2", Some("/t/s2.jsonl".into()), None);
+        // ...a stale tailer's late mode for s1 must NOT resurrect/overwrite s2.
+        assert!(!reg.set_mode("%1", "s1", "acceptEdits".into()));
+        let v = &reg.views()[0];
+        assert_eq!(v.session_id, "s2");
+        assert_eq!(v.permission_mode, None);
+        // An unknown pane is a no-op (never inserts).
+        assert!(!reg.set_mode("%9", "sX", "plan".into()));
+        assert!(reg.views().iter().all(|v| v.pane != "%9"));
     }
 
     #[test]

@@ -38,8 +38,11 @@ const READ_CHUNK: u64 = 1024 * 1024;
 /// A rendered message before it enters the ring: (role, kind, text).
 pub type Rendered = (&'static str, &'static str, String);
 /// read_new output: (rendered messages, new tail state, reset?, latest observed
-/// permission mode this read, if any).
-type ReadOutput = (Vec<Rendered>, Tailer, bool, Option<String>);
+/// permission mode *this read* if any, caught-up-to-EOF?). The mode is only a
+/// candidate: the caller carries it across catch-up polls and applies it once
+/// `at_eof` is true, so a stale historical mode in an early chunk never briefly
+/// overrides the current one.
+type ReadOutput = (Vec<Rendered>, Tailer, bool, Option<String>, bool);
 
 /// One rendered chat message. `seq` is monotonic *within a generation*.
 #[derive(Clone, Serialize, Debug, PartialEq)]
@@ -197,17 +200,22 @@ impl ChatStore {
 // Transcript parsing (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// The permission modes Claude Code can be in. Any other string in a
+/// `permission-mode` record is rejected: `permissionMode` flows straight into the
+/// broadcast `claude.v1` view, so an unbounded/unknown value must never pass —
+/// only these fixed, non-secret tokens are allowed onto the wire.
+const KNOWN_MODES: &[&str] = &["default", "acceptEdits", "plan", "bypassPermissions"];
+
 /// Extract the permission mode from a transcript `permission-mode` record (Claude
 /// writes one when the mode changes), for honest mode reconciliation after a
-/// Shift+Tab. `None` for any other record.
+/// Shift+Tab. `None` for any other record, or any mode not in `KNOWN_MODES`.
 pub fn parse_mode_record(line: &str) -> Option<String> {
     let v = serde_json::from_str::<Value>(line).ok()?;
     if v.get("type").and_then(Value::as_str) != Some("permission-mode") {
         return None;
     }
-    v.get("permissionMode")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    let m = v.get("permissionMode").and_then(Value::as_str)?;
+    KNOWN_MODES.contains(&m).then(|| m.to_string())
 }
 
 /// Render one transcript JSONL record into 0+ chat messages. Only user/assistant
@@ -301,6 +309,10 @@ struct Tailer {
 async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
     let mut state: Option<Tailer> = None;
     let mut gen_counter: u64 = 0;
+    // Latest mode seen but not yet applied: carried across catch-up polls of a
+    // long transcript and flushed only once we reach EOF, so an old mode from an
+    // early chunk never transiently overrides the current one.
+    let mut pending_mode: Option<String> = None;
     let mut ticker = tokio::time::interval(TAIL_POLL);
     loop {
         ticker.tick().await;
@@ -315,7 +327,7 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
         let p2 = pane.clone();
         let prev = state.take();
         let read = tokio::task::spawn_blocking(move || read_new(&path, prev)).await;
-        let (msgs, new_state, reset, mode) = match read {
+        let (msgs, new_state, reset, mode, at_eof) = match read {
             Ok(Some(r)) => r,
             _ => {
                 state = None;
@@ -330,9 +342,16 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
             app.chat.append(&p2, gen_counter.max(1), msgs);
         }
         // Reconcile the observed permission mode from the transcript (Shift+Tab
-        // writes a permission-mode record but fires no agent_session hook).
-        if let Some(m) = mode {
-            app.agents.set_session(&p2, &session_id, None, Some(m));
+        // writes a permission-mode record but fires no agent_session hook). Only
+        // apply once caught up to EOF, and only if this session still owns the
+        // pane (set_mode never resurrects a superseded session).
+        if mode.is_some() {
+            pending_mode = mode;
+        }
+        if at_eof {
+            if let Some(m) = pending_mode.take() {
+                app.agents.set_mode(&p2, &session_id, m);
+            }
         }
         state = Some(new_state);
     }
@@ -385,6 +404,8 @@ fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
             }
         }
     }
+    // Caught up when we've consumed the whole file and hold no partial line.
+    let at_eof = offset >= len && partial.is_empty();
     Some((
         out,
         Tailer {
@@ -394,6 +415,7 @@ fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
         },
         reset,
         latest_mode,
+        at_eof,
     ))
 }
 
@@ -504,6 +526,15 @@ mod tests {
             None
         );
         assert_eq!(parse_mode_record("not json"), None);
+        // Unknown / unbounded mode strings must NOT pass onto the broadcast view.
+        assert_eq!(
+            parse_mode_record(r#"{"type":"permission-mode","permissionMode":"<secret>"}"#),
+            None
+        );
+        assert_eq!(
+            parse_mode_record(r#"{"type":"permission-mode","permissionMode":"plan"}"#),
+            Some("plan".into())
+        );
     }
 
     #[test]

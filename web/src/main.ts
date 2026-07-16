@@ -2274,6 +2274,16 @@ applyDebug();
 };
 (window as unknown as { __termCols?: () => number }).__termCols = () =>
   handle.size().cols;
+// Visible screen only (no scrollback) — lets tests assert that ^L actually
+// cleared, which __termText can't (cleared lines persist in scrollback).
+(window as unknown as { __termScreen?: () => string }).__termScreen = () => {
+  const b = handle.term.buffer.active;
+  let out = "";
+  for (let i = 0; i < handle.term.rows; i++) {
+    out += (b.getLine(b.baseY + i)?.translateToString(true) ?? "") + "\n";
+  }
+  return out;
+};
 (window as unknown as { __topology?: () => SessionTopo[] }).__topology = () =>
   topology;
 

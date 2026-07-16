@@ -248,6 +248,20 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await page.locator("#keys-toggle").click();
   await expect(page.locator("#keypanel")).toBeVisible();
 
+  // --- Agent row "clear" (^L) wipes the visible screen. Assert on the
+  // viewport (scrollback keeps history), and run this BEFORE the seq-1-200
+  // block below: later reload/session sections re-assert that "200" content,
+  // which a ^L after it would erase. ---
+  const screenText = () =>
+    page.evaluate(
+      () => (window as unknown as { __termScreen?: () => string }).__termScreen?.() ?? ""
+    );
+  await page.locator("#composer-input").fill("echo clear$((7+7))mark");
+  await page.locator("#composer-input").press("Enter");
+  await expect.poll(screenText, { timeout: 10_000 }).toContain("clear14mark");
+  await page.locator('.key[data-key="ctrl-l"]').click();
+  await expect.poll(screenText, { timeout: 5_000 }).not.toContain("clear14mark");
+
   // --- Scrollback: generate history, then scroll up into tmux copy-mode. ---
   await page.locator(".xterm").click(); // regain focus after the button press
   await page.keyboard.type("seq 1 200\n");

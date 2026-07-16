@@ -115,6 +115,9 @@
              keyboard is down (auto deck) — that's when you're steering, not
              typing. Word caps teach the chords. -->
         <div id="keyrow-agent" hidden>
+          <button class="key capkey danger" data-key="ctrl-c" title="interrupt (ctrl+c)"
+                  aria-label="interrupt (ctrl+c)">
+            <span class="cap">stop</span>^c</button>
           <button class="key capkey" data-key="shift-tab" title="cycle agent mode (shift+tab)"
                   aria-label="cycle agent mode (shift+tab)">
             <span class="cap">mode</span>&#x21E7;&#x21E5;</button>
@@ -153,7 +156,6 @@
           <button class="key" data-key="left">&#x2190;</button>
           <button class="key" data-key="right">&#x2192;</button>
           <button class="key" data-key="enter">&#x21B5;</button>
-          <button class="key danger" data-key="ctrl-c" aria-label="interrupt (ctrl+c)">^c</button>
           <button class="key" id="more-key" aria-label="more keys">&#x2026;</button>
         </div>
       </footer>

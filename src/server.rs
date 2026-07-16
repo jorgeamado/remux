@@ -436,6 +436,20 @@ async fn static_handler(uri: Uri) -> Response {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             let mut resp = ([(header::CONTENT_TYPE, mime.as_ref())], file.data).into_response();
+            // Cache policy: the hashed build assets (assets/index-<hash>.js/css)
+            // are immutable, so let clients cache them forever. Everything else —
+            // the HTML shell and the service worker especially — must revalidate,
+            // or a new deploy is never picked up (the old index.html keeps
+            // pointing at the old, cached-away JS bundle).
+            let cache = if path.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static(cache),
+            );
             if path == "index.html" {
                 resp.headers_mut().insert(
                     header::CONTENT_SECURITY_POLICY,

@@ -1,8 +1,11 @@
 pub mod admin;
+pub mod agent;
 pub mod attention;
 pub mod auth;
+pub mod chat;
 pub mod feed;
 pub mod ingest;
+pub mod paneview;
 pub mod permit;
 pub mod push;
 pub mod server;
@@ -68,6 +71,23 @@ pub enum Cmd {
         #[arg(long, default_value = "echo hello from remux   # test approval")]
         summary: String,
     },
+    /// Stream a pane view: read newline-delimited JSON snapshots on stdin and
+    /// forward them to the running daemon as this pane's structured view, which
+    /// the PWA can render as a custom interface. E.g.
+    /// `taskscope --json | remux stream --view taskscope.v1`.
+    Stream {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Built-in view id the source renders as (e.g. `taskscope.v1`).
+        #[arg(long)]
+        view: String,
+        /// Optional path (e.g. a FIFO) to write chosen menu actions to, one JSON
+        /// line each (`{"action":"..."}`) — the daemon→source back-channel for an
+        /// interactive dashboard. Omit for a display-only source.
+        #[arg(long)]
+        actions: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -85,19 +105,22 @@ pub enum EmitCmd {
         message: Option<String>,
     },
     /// An agent permission prompt: block until a device approves/denies, then
-    /// print Claude Code's decision JSON on stdout. Reads the hook's
-    /// PermissionRequest payload (tool_name, tool_input, prompt_id) from stdin
-    /// — the install snippet pipes it straight through, so no fragile shell
-    /// extraction. On any failure (no decision, expiry, daemon down) prints a
-    /// diagnostic to stderr and exits non-zero, which makes Claude Code fall
-    /// back to its own dialog on the Mac.
+    /// print the neutral decision word (`allow` or `deny`) on stdout. Reads a
+    /// permission payload (tool_name, tool_input, optional prompt_id) from
+    /// stdin — an agent adapter (e.g. the remux Claude Code plugin) pipes its
+    /// hook payload in and maps the decision back to its own format, so remux
+    /// stays agent-agnostic. On any failure (no decision, expiry, daemon down)
+    /// prints a diagnostic to stderr and exits non-zero, so the agent falls
+    /// back to its own prompt.
     Permission {
         /// tmux pane id (%N). Defaults to $TMUX_PANE (read here, not from the
         /// hook payload, which doesn't carry it).
         #[arg(long)]
         pane: Option<String>,
-        /// Producer label.
-        #[arg(long, default_value = "claude-code")]
+        /// Producer label shown on the card (which agent is asking). Neutral by
+        /// default; an agent's adapter passes its own, e.g. `--source
+        /// claude-code`.
+        #[arg(long, default_value = "agent")]
         source: String,
         /// Present for symmetry with the docs; the wait is implied for this
         /// subcommand (a permission prompt with no blocking makes no sense).
@@ -135,6 +158,73 @@ pub enum EmitCmd {
         #[arg(long)]
         exit: i32,
     },
+    /// A generic agent lifecycle event (fed to the `claude.v1` dashboard).
+    /// Fire-and-forget: the daemon updates in-memory status only — no secrets,
+    /// no blocking. An agent adapter (e.g. the Claude Code hooks) maps its own
+    /// events onto these; remux stays agent-agnostic.
+    AgentState {
+        /// The lifecycle transition.
+        #[arg(value_enum)]
+        kind: AgentStateKind,
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Agent session id (guards against stale events from an old session).
+        #[arg(long)]
+        session_id: String,
+        /// Operation id, for `operation-started`/`operation-ended` — correlated
+        /// with a permission card's prompt_id to surface the pending ask.
+        #[arg(long)]
+        operation_id: Option<String>,
+        /// Coarse tool name for `operation-started` (e.g. `Bash`) — the only
+        /// tool detail this event may carry; never the tool input.
+        #[arg(long)]
+        tool_name: Option<String>,
+    },
+    /// Session metadata for the chat companion: the transcript file + the
+    /// current permission mode. Low-frequency (session start + mode change),
+    /// separate from the hot `agent-state` path. Fire-and-forget.
+    AgentSession {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Agent session id.
+        #[arg(long)]
+        session_id: String,
+        /// Path to the session's transcript JSONL (validated by the daemon).
+        #[arg(long)]
+        transcript_path: Option<String>,
+        /// Current permission mode (default / acceptEdits / auto …).
+        #[arg(long)]
+        permission_mode: Option<String>,
+    },
+}
+
+/// The lifecycle transitions an `agent-state` event can carry.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum AgentStateKind {
+    SessionStart,
+    PromptSubmitted,
+    OperationStarted,
+    OperationEnded,
+    Idle,
+    SessionEnded,
+    Touch,
+}
+
+impl AgentStateKind {
+    /// The wire `verb` string sent to the ingest socket.
+    pub fn verb(self) -> &'static str {
+        match self {
+            AgentStateKind::SessionStart => "session-start",
+            AgentStateKind::PromptSubmitted => "prompt-submitted",
+            AgentStateKind::OperationStarted => "operation-started",
+            AgentStateKind::OperationEnded => "operation-ended",
+            AgentStateKind::Idle => "idle",
+            AgentStateKind::SessionEnded => "session-ended",
+            AgentStateKind::Touch => "touch",
+        }
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -218,6 +308,11 @@ pub struct Attention {
     /// `agent_needs_input` (hook-fed, precise) or `quiet_after_busy`
     /// (the heuristic fallback detector).
     pub kind: String,
+    /// The originating tmux pane (`%N`), for hook-fed events — lets a client show
+    /// a pane-scoped status chip and jump to it. `None` for the session-level
+    /// heuristic, which has no single pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
     /// Producer-supplied detail ("permission prompt"); sanitized at ingest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -232,6 +327,7 @@ impl Attention {
         Self {
             session,
             kind: "quiet_after_busy".into(),
+            pane: None,
             reason: None,
             source: None,
         }
@@ -262,6 +358,19 @@ pub struct App {
     pub topology: tokio::sync::watch::Sender<topology::Snapshot>,
     /// Open agent permission cards (M4b) awaiting a decision from a device.
     pub perms: permit::Registry,
+    /// Per-pane agent lifecycle state (fed by `remux emit agent-state`), projected
+    /// into a `claude.v1` pane view.
+    pub agents: agent::Registry,
+    /// Per-pane rendered Claude transcript (the chat companion). Served
+    /// per-connection over the WS, never broadcast (it holds secrets-class text).
+    pub chat: chat::ChatStore,
+    /// Latest structured "pane view" per pane, fed by the `remux stream` socket
+    /// and rendered by the PWA as a custom interface for that pane.
+    pub pane_views: paneview::Registry,
+    /// Windows forced to a large "capture resolution" while a dashboard view is
+    /// on screen: window id → count of clients viewing it. When it hits zero the
+    /// window returns to client-driven sizing.
+    pub dash_windows: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Per-session shell command feed (M4c), fed by the shell datagram socket.
     pub feed: feed::Feed,
     /// Session names whose busy→quiet detector should reset — sent when a

@@ -3,6 +3,116 @@
 > Uncommitted working note (per request). Point-in-time picture of where the
 > project is and what's planned. The durable plan is `docs/PLAN.md`.
 
+## M5 pane views / custom dashboards — VERIFIED ON DEVICE (2026-07-15)
+
+remux can render a **custom, phone-adapted PWA interface for a pane** — a
+"semantic lens" over the pane, the terminal always one tap away. On branch
+`feat/pane-view` (NOT merged), ~2.7k lines, multiple Codex review rounds.
+Architecture (Codex-guided): compiled-in renderers over a versioned schema (NO
+third-party JS), terminal stays canonical, one pane-view registry that any
+*source* feeds.
+
+**The pipe** — `source → remux (pane_views registry) → session-filtered WS frame
+→ compiled-in PWA renderer`, with a Terminal/Dashboard toggle:
+- `remux stream --view <id>` + a dedicated persistent `pane-view.sock`: latest-
+  state-per-pane registry, one view/pane, EOF + topology-GC cleanup, size/rate/
+  shape caps.
+
+**Two source kinds proven:**
+- **`taskscope`** (`examples/taskscope`) — our demo monitor; run it plain and it
+  self-streams to remux (bg process-sub) so a Dashboard appears with no piping.
+- **htop capture adapter** — the daemon auto-detects a pane running `htop`
+  (topology `pane_current_command`) and reads its RENDERED screen via
+  `tmux capture-pane` on a timer, parses the visible process table + meters into
+  `htop.v1` (tolerant, visible-slice-only, low-confidence fallback). No /proc,
+  no reimplementation — uses htop's own output.
+
+**Dashboard "capture resolution"**: entering the dashboard forces that pane's
+window to 210×60 (window-size manual) so a full-screen tool exposes all
+columns/rows for the capture; restored to `latest` on leave/disconnect. Terminal
+hidden then, so the oversized render is invisible.
+
+**Interactions** — the phone sends a *whitelisted semantic action*, the daemon
+maps it to the tool's real keys and `tmux send-keys` (never raw keystrokes),
+only for an htop pane in the client's session:
+- sort CPU/MEM/TIME (P/M/T) + invert (I), tree (F5), filter (F4+clear+text+Enter,
+  control-stripped/capped), kill:<pid> (SIGTERM, gated to a pid in the pane's
+  captured view, behind a confirmation sheet).
+
+**htop UI redesign** (Codex-reviewed): instrument-panel — compact CPU/MEM bars,
+sticky filter/tree/sort toolbar, two-line rows with a 3px CPU rail, restrained
+color thresholds, stateful renderer that keeps the filter input focused across
+live updates.
+
+Also fixed a latent bug: static assets had no cache headers, so a stale
+`index.html` pinned the old JS bundle — now the shell/sw revalidate and hashed
+assets are immutable.
+
+On device (iPhone, `remux-mobile` container): taskscope dashboard, htop dashboard
+with command names (via capture-resolution), and sort/filter/kill all verified.
+Tree renders but is cosmetically rough at phone width (kept as-is).
+
+**Two Codex security rounds addressed** (fix → re-verify → fix). Final posture:
+- Command-execution path closed: `filter` types attacker-controlled literal text,
+  and check-then-send to a foreground tool is fundamentally non-atomic (if htop
+  exits mid-sequence the text can reach the shell for the user's next Enter). So
+  `filter` and `kill` now require the host-granted `approve` capability — a device
+  already trusted to approve arbitrary command execution — plus per-phase htop
+  re-verification. Fixed keys (sort/invert/tree) carry no attacker content and
+  stay open to any in-session device.
+- Capture lifecycle: poll-driven (independent 2 s `pane_current_command` poll,
+  not the structural topology feed), each task re-verifies ownership per 1.5 s
+  tick and drops its view the instant htop exits, and a task whose claim is pruned
+  out from under it (`guard.update` → `None`) now exits so the poller re-claims
+  (previously it could wedge capture permanently).
+- Kill: `approve`-gated AND restricted to a pid the pane's view is showing.
+- ViewMode sizing: gated to the client's own in-session pane with a live view.
+- PWA re-sends `view_mode` and closes the kill sheet on any pane switch.
+
+Accepted residuals (documented, within the same-uid / trusted-approver model):
+capture verification has a ≤1.5 s tick (a lingering htop.v1 view can only drive
+harmless fixed keys — filter/kill are approve-gated); kill-by-pid has an inherent
+PID-reuse window; a daemon crash mid-dashboard can leave a window at `manual`
+sizing (self-inflicted, same-uid, cleared by re-entering the dashboard — an
+earlier startup-sweep fix was reverted because it clobbered a user's deliberate
+`window-size manual`). Branch is merge-ready.
+**Generic popup primitive (slice 1 done).** A pane-view renderer (and, later, a
+plugin) declares a title + options; each option maps to an *already-whitelisted*
+pane action. The popup is pure presentation over the action whitelist — it never
+sends raw input, and the daemon re-validates every action on receipt, so the
+security model is untouched. Core PWA component `openPopup(spec)`/`closePopup()`
+(bottom sheet, `default`/`danger`/`cancel` styles, backdrop-dismiss, lifecycle
+tied to pane switch / dashboard exit / view clear). First consumer: the htop
+process-signal sheet, refactored onto it and now offering **SIGTERM / SIGKILL**
+(action whitelist extended to `kill:<pid>:TERM|KILL`, signal a closed whitelist,
+still `approve`-gated + `pane_has_pid`).
+**Generic popup primitive (slice 2 done — the plugin interaction loop).** A
+streaming *source* can now declare an interactive `menu` in its view state, and
+the user's choice is routed back to that source over a duplex back-channel — so a
+plugin can offer actions without shipping UI or reaching tmux/shell. Design and
+implementation went through **three Codex security rounds**. Shape:
+- Schema: a snapshot may carry a generic `menu {title, detail?, options:[{label,
+  action, style?, requires?}]}`, validated for any view. Action tokens use an
+  ASCII grammar `[A-Za-z0-9._:-]{1,64}` (no newline/separator → safe to relay as
+  one JSON line), deduped, bounded.
+- Provenance boundary: `htop.v1` is internal-only (daemon executes its actions
+  via tmux/kill); external `remux stream` sources get socket views only and can
+  never claim `htop.v1` or drive the tmux path. Actions route by provenance, not
+  view id. The htop kill gate checks `InternalHtop` + pid under one lock.
+- Capability: each option carries `requires: approve|session` (default `approve`;
+  `danger` forces `approve`); the daemon enforces it and only forwards a token
+  that is in the pane's *current* menu. Sources use nonced/target-bound tokens;
+  the PWA also drops an open popup when the underlying menu changes.
+- Back-channel: bounded (16) channel, write-timeout, fair (non-biased) select,
+  prompt prune-release; `remux stream --actions <fifo>` relays choices to the
+  source (O_RDWR FIFO, detached relay, EOF-clean). WS hardened with a 64 KiB
+  message cap + a pre-parse text-message token bucket (CPU-flood bound).
+- Demo: taskscope advertises Pause/Resume and reacts via a FIFO; PWA renders a
+  generic Actions button + the shared popup.
+
+Other next options: `docker stats` (native-JSON command adapter — Codex's robust
+pick), or an agent-window source.
+
 Repo: `github.com/jorgeamado/remux` (public); `main` builds green on CI. The M3
 control-mode arc and the whole M4 semantic layer (M4a attention → M4b approvals
 → M4c command feed) are done and verified on-device. On top of that, three
@@ -28,6 +138,31 @@ editing, M4b decision/EOF race) now have real tests.
   self-heals. Durable fix worth doing: recreate the container to exec from
   `target-linux/debug/remux` so host and container builds never collide.
 - Mint a pairing link: `docker exec remux-mobile /workspaces/remux/target/debug/remux pair`.
+- **Recreate recipe (2026-07-15).** The container is launched by a custom command,
+  NOT stock `devcontainer up`. State that survives a recreate lives on external
+  mounts: pairing/devices on the `remux-state` named volume (`/root/.local/share`)
+  and the TLS cert on the `~/.remux-certs` bind (`/certs`, ro). The repo bind
+  carries the binary + PWA + persisted Claude config. To recreate:
+  ```sh
+  docker rm -f remux-mobile
+  docker run -d --name remux-mobile --restart unless-stopped -p 7777:7777 \
+    -e CLAUDE_CONFIG_DIR=/workspaces/remux/.devcontainer/data/claude \
+    -v remux-state:/root/.local/share \
+    -v $PWD:/workspaces/remux \
+    -v ~/.remux-certs:/certs:ro \
+    vsc-remux-f67888504cc9283453a2e1f4b49fb4445a96be485d44774ed0d6a30d70bf5fa4 \
+    bash -c 'exec /workspaces/remux/target/debug/remux serve --listen 0.0.0.0:7777 \
+      --url https://georges-macbook-air.shrew-fort.ts.net:7777 \
+      --allowed-host georges-macbook-air.shrew-fort.ts.net \
+      --tls-cert /certs/georges-macbook-air.shrew-fort.ts.net.crt \
+      --tls-key /certs/georges-macbook-air.shrew-fort.ts.net.key'
+  docker exec remux-mobile npm install -g @anthropic-ai/claude-code   # ephemeral fs → reinstall
+  docker exec remux-mobile ln -sf /workspaces/remux/target/debug/remux /usr/local/bin/remux  # PATH symlink (hooks call bare `remux`)
+  ```
+  `CLAUDE_CONFIG_DIR` points at the bind-mounted repo so Claude Code's login
+  persists across recreates; `.devcontainer/data/` is gitignored. Claude Code
+  itself lives on the ephemeral fs (npm -g), so reinstall after a recreate — the
+  `devcontainer.json` `postCreateCommand` does this on a real `devcontainer up`.
 
 ## Done (this arc)
 

@@ -1,4 +1,4 @@
-use crate::{tmux, App};
+use crate::{paneview, tmux, App};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -20,6 +20,29 @@ const OUT_QUEUE: usize = 256;
 /// stolen token (or a buggy client) cannot exhaust the host's processes/FDs.
 const MAX_TOTAL_CONNECTIONS: usize = 64;
 const MAX_PER_DEVICE_CONNECTIONS: usize = 8;
+/// The large fixed size a window is forced to while a client views its dashboard,
+/// so a full-screen tool (htop) renders every column/row for the capture. The
+/// terminal is hidden then, so the oversized render is invisible.
+const DASH_COLS: u16 = 210;
+const DASH_ROWS: u16 = 60;
+/// Min spacing between pane actions from one connection — a rate cap applied
+/// BEFORE any registry/topology work, so a client can't CPU-flood the daemon
+/// (Codex). Comfortably faster than any human tap.
+const PANE_ACTION_MIN_INTERVAL: Duration = Duration::from_millis(50);
+/// Cap on any inbound WebSocket message/frame.
+const MAX_WS_MESSAGE: usize = 64 * 1024;
+/// Text-message token bucket: burst size and refill rate (msgs/sec). Control
+/// messages (resize/ping/taps) are well under this; a flood is bounded before
+/// the JSON parse. Keystrokes/scroll are Binary and not counted here.
+const TEXT_MSG_BURST: f64 = 32.0;
+const TEXT_MSG_REFILL_PER_SEC: f64 = 32.0;
+/// Copy-overlay capture: scrollback lines requested, response byte cap (most
+/// recent kept), and min spacing between captures on one connection. A capture
+/// response is large (unlike other frames) and OUT_QUEUE counts messages, so
+/// captures get their own rate cap on top of the text token bucket.
+const CAPTURE_LINES: u32 = 2000;
+const CAPTURE_MAX_BYTES: usize = 256 * 1024;
+const CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,11 +63,32 @@ enum ClientMsg {
     },
     TakeControl,
     ReleaseControl,
+    /// The client entered (or left) the custom dashboard for a pane. While ≥1
+    /// client is on a pane's dashboard, its window is forced to a large capture
+    /// resolution so a full-screen tool renders all its info; `pane` is unused
+    /// when leaving.
+    ViewMode {
+        #[serde(default)]
+        pane: String,
+        dashboard: bool,
+    },
+    /// A semantic action from a pane's dashboard (e.g. `sort:mem`). The daemon
+    /// maps it to the real tool's key(s) via a per-view whitelist and sends them
+    /// through tmux — a client can never send raw keystrokes this way.
+    PaneAction {
+        pane: String,
+        action: String,
+    },
     /// Window/pane operations (new window, splits, switching) — controller only.
     WindowAction {
         action: String,
         #[serde(default)]
         index: Option<u32>,
+    },
+    /// Capture a pane's screen + scrollback as plain text for the copy overlay.
+    /// The client sends the pane id it was viewing at tap time (snapshot).
+    Capture {
+        pane: String,
     },
     Ping,
 }
@@ -61,10 +105,22 @@ enum ServerMsg<'a> {
         code: &'a str,
         message: &'a str,
     },
+    /// A pane's captured text (screen + scrollback) for the copy overlay.
+    /// `truncated` = the capture exceeded the byte cap and only the most recent
+    /// portion is included.
+    PaneCapture {
+        pane: &'a str,
+        text: &'a str,
+        truncated: bool,
+    },
     /// Someone/something in this session wants the user: a hook-fed event
     /// (agent_needs_input) or the busy→quiet heuristic.
     Attention {
         kind: &'a str,
+        /// Originating pane (`%N`) for hook-fed events — drives the pane-scoped
+        /// Claude status chip. Absent for the session-level heuristic.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,11 +134,18 @@ fn json(msg: &ServerMsg) -> Message {
 }
 
 pub async fn handler(State(app): State<Arc<App>>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| async move {
-        if let Err(e) = handle(socket, app).await {
-            tracing::debug!("ws session ended: {e:#}");
-        }
-    })
+    // Cap inbound frames/messages. Axum defaults to 64 MiB per message; every
+    // client message (control frames, pane actions) is small, so a tight bound
+    // stops a paired device from forcing huge transient allocations by padding a
+    // message (Codex). Well above any legitimate client payload.
+    upgrade
+        .max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = handle(socket, app).await {
+                tracing::debug!("ws session ended: {e:#}");
+            }
+        })
 }
 
 async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
@@ -330,6 +393,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             && out
                                 .send(json(&ServerMsg::Attention {
                                     kind: &att.kind,
+                                    pane: att.pane.as_deref(),
                                     reason: att.reason.as_deref(),
                                     source: att.source.as_deref(),
                                 }))
@@ -438,6 +502,71 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Push this session's pane views (structured state a source streams for a
+    // pane, rendered by the PWA as a custom interface) and keep them reconciled.
+    // Session-filtered like the feed — only panes in *this* session — and
+    // debounced to coalesce a fast source. A full-set frame each time so
+    // add/update/remove all reconcile client-side.
+    let paneview_task = tokio::spawn({
+        let mut rx = app.pane_views.subscribe();
+        // Also wake on topology changes: a pane moving between sessions (or a
+        // window closing) shifts which views belong here WITHOUT a pane-view
+        // hint, so the filter must re-run then too — otherwise a moved pane's
+        // frame goes stale in the old session and never appears in the new one.
+        let mut topo_rx = app.topology.subscribe();
+        let out = out_tx.clone();
+        let app = app.clone();
+        let session = session.clone();
+        async move {
+            let mut last_sent: Option<String> = None;
+            loop {
+                // Pane ids that belong to this session right now. borrow_and_update
+                // marks this topology version seen so `topo_rx.changed()` only
+                // fires on a genuinely new one.
+                let session_panes: std::collections::HashSet<String> = topo_rx
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|s| s.name == session)
+                    .flat_map(|s| s.windows.iter())
+                    .flat_map(|w| w.panes.iter())
+                    .map(|p| p.id.clone())
+                    .collect();
+                let views: Vec<_> = app
+                    .pane_views
+                    .snapshot()
+                    .into_iter()
+                    .filter(|v| session_panes.contains(&v.pane))
+                    .collect();
+                let is_empty = views.is_empty();
+                let json = serde_json::json!({ "type": "pane_views", "views": views }).to_string();
+                // Send on change; stay quiet on a fresh empty connection, but do
+                // send an empty set to clear a previously-sent one.
+                if last_sent.as_deref() != Some(json.as_str()) && (!is_empty || last_sent.is_some())
+                {
+                    if out.send(Message::Text(json.clone().into())).await.is_err() {
+                        break;
+                    }
+                    last_sent = Some(json);
+                }
+                // Wake on either a pane-view change or a topology change.
+                tokio::select! {
+                    r = rx.recv() => match r {
+                        Ok(()) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    c = topo_rx.changed() => {
+                        if c.is_err() {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                while matches!(rx.try_recv(), Ok(())) {}
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -445,6 +574,18 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     }
 
     let mut controller = false;
+    // The window (if any) this client is holding at dashboard capture size.
+    let mut current_dash: Option<String> = None;
+    // Rate-limit pane actions from this connection (applied before any registry/
+    // topology work) so a client can't flood a source's back-channel (Codex).
+    let mut last_pane_action: Option<std::time::Instant> = None;
+    // Token bucket over ALL inbound text messages, spent before the JSON parse,
+    // so a client can't CPU-flood the daemon with large/malformed control frames.
+    let mut text_tokens: f64 = TEXT_MSG_BURST;
+    let mut text_refill = std::time::Instant::now();
+    // Last copy-overlay capture on this connection (separate rate cap — a capture
+    // response is large and OUT_QUEUE counts messages, not bytes).
+    let mut last_capture: Option<std::time::Instant> = None;
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
@@ -482,103 +623,310 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                         .await;
                 }
             }
-            Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
-                Ok(ClientMsg::Resize {
-                    cols: mut c,
-                    rows: mut r,
-                }) => {
-                    clamp_size(&mut c, &mut r);
-                    (cols, rows) = (c, r);
-                    let _ = master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+            Message::Text(text) => {
+                // Token-bucket EVERY text message before the (relatively costly)
+                // JSON parse, so an authenticated client can't CPU-flood the daemon
+                // with a stream of large/malformed JSON control frames (Codex). All
+                // legitimate control messages (resize, ping, taps) are far below
+                // this rate; keystrokes/scroll are Binary and unaffected.
+                let now = std::time::Instant::now();
+                text_tokens = (text_tokens
+                    + now.duration_since(text_refill).as_secs_f64() * TEXT_MSG_REFILL_PER_SEC)
+                    .min(TEXT_MSG_BURST);
+                text_refill = now;
+                if text_tokens < 1.0 {
+                    continue; // over budget — drop before parsing
                 }
-                Ok(ClientMsg::TakeControl) => match &client_name {
-                    Some(name) => {
-                        let name = name.clone();
-                        let res = tokio::task::spawn_blocking(move || tmux::promote_client(&name))
-                            .await?;
-                        match res {
-                            Ok(()) => {
-                                controller = true;
-                                // Nudge the size so tmux re-evaluates layout now that
-                                // this client participates in sizing.
-                                let _ = master.resize(PtySize {
-                                    rows,
-                                    cols,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                });
-                                let _ = out_tx.send(status("controller")).await;
+                text_tokens -= 1.0;
+                match serde_json::from_str::<ClientMsg>(&text) {
+                    Ok(ClientMsg::Resize {
+                        cols: mut c,
+                        rows: mut r,
+                    }) => {
+                        clamp_size(&mut c, &mut r);
+                        (cols, rows) = (c, r);
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    Ok(ClientMsg::TakeControl) => match &client_name {
+                        Some(name) => {
+                            let name = name.clone();
+                            let res =
+                                tokio::task::spawn_blocking(move || tmux::promote_client(&name))
+                                    .await?;
+                            match res {
+                                Ok(()) => {
+                                    controller = true;
+                                    // Nudge the size so tmux re-evaluates layout now that
+                                    // this client participates in sizing.
+                                    let _ = master.resize(PtySize {
+                                        rows,
+                                        cols,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    });
+                                    let _ = out_tx.send(status("controller")).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("promote failed: {e:#}");
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::Error {
+                                            code: "take_control_failed",
+                                            message: "could not take control",
+                                        }))
+                                        .await;
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("promote failed: {e:#}");
+                        }
+                        None => {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "take_control_failed",
+                                    message: "tmux client not resolved",
+                                }))
+                                .await;
+                        }
+                    },
+                    Ok(ClientMsg::ReleaseControl) => {
+                        // Only drop the controller role if tmux actually demoted us.
+                        // Otherwise the client stays a sizing participant (window-size
+                        // latest) and reporting "observer" would be a lie — the exact
+                        // failure the pane-view dashboard relies on NOT happening.
+                        let demoted = match &client_name {
+                            Some(name) => {
+                                let name = name.clone();
+                                tokio::task::spawn_blocking(move || tmux::demote_client(&name))
+                                    .await?
+                                    .is_ok()
+                            }
+                            None => true, // no client name → never really driving size
+                        };
+                        if demoted {
+                            controller = false;
+                            let _ = out_tx.send(status("observer")).await;
+                        } else {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "release_failed",
+                                    message: "could not release control",
+                                }))
+                                .await;
+                        }
+                    }
+                    Ok(ClientMsg::WindowAction { action, index }) => {
+                        if !controller {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::Error {
+                                    code: "observer",
+                                    message: "take control before changing windows",
+                                }))
+                                .await;
+                        } else {
+                            let session = session.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                tmux::window_action(&session, &action, index)
+                            })
+                            .await?;
+                            if let Err(e) = res {
+                                tracing::warn!("window action failed: {e:#}");
                                 let _ = out_tx
                                     .send(json(&ServerMsg::Error {
-                                        code: "take_control_failed",
-                                        message: "could not take control",
+                                        code: "window_action_failed",
+                                        message: "could not perform window action",
                                     }))
                                     .await;
                             }
                         }
                     }
-                    None => {
-                        let _ = out_tx
-                            .send(json(&ServerMsg::Error {
-                                code: "take_control_failed",
-                                message: "tmux client not resolved",
-                            }))
-                            .await;
-                    }
-                },
-                Ok(ClientMsg::ReleaseControl) => {
-                    if let Some(name) = &client_name {
-                        let name = name.clone();
-                        let _ =
-                            tokio::task::spawn_blocking(move || tmux::demote_client(&name)).await?;
-                    }
-                    controller = false;
-                    let _ = out_tx.send(status("observer")).await;
-                }
-                Ok(ClientMsg::WindowAction { action, index }) => {
-                    if !controller {
-                        let _ = out_tx
-                            .send(json(&ServerMsg::Error {
-                                code: "observer",
-                                message: "take control before changing windows",
-                            }))
-                            .await;
-                    } else {
-                        let session = session.clone();
-                        let res = tokio::task::spawn_blocking(move || {
-                            tmux::window_action(&session, &action, index)
-                        })
-                        .await?;
-                        if let Err(e) = res {
-                            tracing::warn!("window action failed: {e:#}");
-                            let _ = out_tx
-                                .send(json(&ServerMsg::Error {
-                                    code: "window_action_failed",
-                                    message: "could not perform window action",
-                                }))
-                                .await;
+                    Ok(ClientMsg::ViewMode { pane, dashboard }) => {
+                        // Force this pane's window to the big capture resolution while
+                        // the dashboard is shown, and restore it on leave/switch. Only
+                        // a pane in THIS session that actually has a view may be
+                        // forced — else a client could resize another session's window.
+                        let target = if dashboard {
+                            let in_session = app.topology.borrow().iter().any(|s| {
+                                s.name == session
+                                    && s.windows
+                                        .iter()
+                                        .any(|w| w.panes.iter().any(|p| p.id == pane))
+                            });
+                            let has_view = app.pane_views.view_of(&pane).is_some();
+                            if in_session && has_view {
+                                match tokio::task::spawn_blocking(move || {
+                                    tmux::window_of_pane(&pane)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(w)) => w,
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(win) if current_dash.as_deref() != Some(&win) => {
+                                if let Some(old) = current_dash.take() {
+                                    dash_leave(&app, old).await;
+                                }
+                                dash_enter(&app, win.clone()).await;
+                                current_dash = Some(win);
+                            }
+                            Some(_) => {} // already sized for this window
+                            None => {
+                                if let Some(old) = current_dash.take() {
+                                    dash_leave(&app, old).await;
+                                }
+                            }
                         }
                     }
+                    Ok(ClientMsg::PaneAction { pane, action }) => {
+                        // Rate-limit BEFORE any registry/topology work so a flood of
+                        // tiny frames can't spin the daemon (Codex). Too-soon → drop.
+                        let now = std::time::Instant::now();
+                        if last_pane_action
+                            .is_some_and(|t| now.duration_since(t) < PANE_ACTION_MIN_INTERVAL)
+                        {
+                            continue;
+                        }
+                        last_pane_action = Some(now);
+                        // Only for a pane in THIS session. Compute before any await
+                        // (don't hold the topology borrow across it). Route by the
+                        // view's PROVENANCE, not its id: an internal-htop view runs the
+                        // tmux whitelist; a socket (plugin) view forwards to the source.
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        let kind = app.pane_views.action_kind(&pane);
+                        if in_session && kind == Some(paneview::ActionKind::Source) {
+                            // A plugin action: the daemon does not interpret it. Cap
+                            // its size (matches the token grammar); send_action
+                            // enforces membership + policy.
+                            if action.len() <= paneview::MAX_ACTION_TOKEN {
+                                app.pane_views.send_action(
+                                    &pane,
+                                    &action,
+                                    app.auth.can_approve(&device.id),
+                                );
+                            }
+                        } else if in_session && kind == Some(paneview::ActionKind::Htop) {
+                            match paneview::parse_htop_action(&action) {
+                                Some(paneview::HtopAction::Kill { pid, signal }) => {
+                                    // Killing is destructive → require the host-granted
+                                    // `approve` capability (not just any paired device),
+                                    // and only a pid the dashboard is actually showing.
+                                    if app.auth.can_approve(&device.id)
+                                        && app.pane_views.pane_has_pid(&pane, pid)
+                                    {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            paneview::kill_process(pid, signal)
+                                        })
+                                        .await;
+                                    }
+                                }
+                                Some(act @ paneview::HtopAction::Filter(_)) => {
+                                    // Filter types attacker-controlled LITERAL text into
+                                    // the pane. send-keys -l stops tmux key interpretation
+                                    // but not shell syntax, and check-then-send is not
+                                    // atomic: if htop exits mid-sequence the text can land
+                                    // at the shell for the user's next Enter. So restrict
+                                    // it — like kill — to a device holding the host-granted
+                                    // `approve` capability, which is already trusted to
+                                    // approve arbitrary command execution. exec_htop_action
+                                    // additionally re-verifies htop owns the pane per phase.
+                                    if app.auth.can_approve(&device.id) {
+                                        let p = pane.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            paneview::exec_htop_action(&p, &act)
+                                        })
+                                        .await;
+                                    }
+                                }
+                                Some(act) => {
+                                    // sort/invert/tree: fixed single keys, no attacker-
+                                    // controlled content. exec re-verifies htop owns the
+                                    // pane right before sending (no junk at a shell).
+                                    let p = pane.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        paneview::exec_htop_action(&p, &act)
+                                    })
+                                    .await;
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    Ok(ClientMsg::Capture { pane }) => {
+                        // Read access to this session's pane contents + recent
+                        // scrollback (more than just bytes already streamed to
+                        // THIS device — incl. pre-connect history and full-screen
+                        // apps), but never another session. In-session gate, no
+                        // `approve` (read-only, like scrolling). Own rate cap.
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        let now = std::time::Instant::now();
+                        let spaced = last_capture
+                            .is_none_or(|t| now.duration_since(t) >= CAPTURE_MIN_INTERVAL);
+                        if in_session && spaced {
+                            last_capture = Some(now);
+                            let p = pane.clone();
+                            let captured = tokio::task::spawn_blocking(move || {
+                                tmux::capture_scrollback(&p, CAPTURE_LINES)
+                            })
+                            .await;
+                            match captured {
+                                Ok(Ok(Some(raw))) => {
+                                    let (text, truncated) = cap_capture(&raw);
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::PaneCapture {
+                                            pane: &pane,
+                                            text: &text,
+                                            truncated,
+                                        }))
+                                        .await;
+                                }
+                                _ => {
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::Error {
+                                            code: "capture_unavailable",
+                                            message: "could not capture the pane",
+                                        }))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ClientMsg::Ping) => {
+                        let _ = out_tx.send(json(&ServerMsg::Pong)).await;
+                    }
+                    Ok(ClientMsg::Auth { .. }) => {} // already authed; ignore
+                    Err(e) => {
+                        tracing::debug!("bad client message: {e}");
+                    }
                 }
-                Ok(ClientMsg::Ping) => {
-                    let _ = out_tx.send(json(&ServerMsg::Pong)).await;
-                }
-                Ok(ClientMsg::Auth { .. }) => {} // already authed; ignore
-                Err(e) => {
-                    tracing::debug!("bad client message: {e}");
-                }
-            },
+            }
             Message::Close(_) => break,
             _ => {}
         }
+    }
+
+    // Release any dashboard capture-size hold so the window returns to normal
+    // sizing (the client left without a clean ViewMode{false}).
+    if let Some(win) = current_dash.take() {
+        dash_leave(&app, win).await;
     }
 
     // Connection gone: kill the attach client. tmux drops it from sizing and the
@@ -587,11 +935,53 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     attention_task.abort();
     permits_task.abort();
     feed_task.abort();
+    paneview_task.abort();
     revoke_task.abort();
     topology_task.abort();
     sender.abort();
     tracing::info!(device = %device.name, "client disconnected");
     Ok(())
+}
+
+/// A client is now viewing `window`'s dashboard: bump the count and, if it's the
+/// first, force the big capture resolution.
+async fn dash_enter(app: &Arc<App>, window: String) {
+    let first = {
+        let mut m = app.dash_windows.lock().unwrap();
+        let n = m.entry(window.clone()).or_insert(0);
+        *n += 1;
+        *n == 1
+    };
+    if first {
+        let w = window;
+        let _ =
+            tokio::task::spawn_blocking(move || tmux::set_capture_size(&w, DASH_COLS, DASH_ROWS))
+                .await;
+    }
+}
+
+/// A client left `window`'s dashboard: drop the count and, if it's the last,
+/// restore client-driven sizing.
+async fn dash_leave(app: &Arc<App>, window: String) {
+    let last = {
+        let mut m = app.dash_windows.lock().unwrap();
+        match m.get_mut(&window) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&window);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    };
+    if last {
+        let w = window;
+        let _ = tokio::task::spawn_blocking(move || tmux::clear_capture_size(&w)).await;
+    }
 }
 
 /// Decrements the live-connection registry on any exit path.
@@ -615,6 +1005,27 @@ impl Drop for ConnGuard {
 fn clamp_size(cols: &mut u16, rows: &mut u16) {
     *cols = (*cols).clamp(20, 500);
     *rows = (*rows).clamp(5, 300);
+}
+
+/// Prepare a captured pane for the copy overlay: trim trailing whitespace on
+/// every line (tmux pads cells with spaces), then keep at most
+/// `CAPTURE_MAX_BYTES` of the MOST RECENT text (the tail), cut on a char
+/// boundary so the JSON stays valid UTF-8. Returns `(text, truncated)`.
+fn cap_capture(raw: &str) -> (String, bool) {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    if out.len() <= CAPTURE_MAX_BYTES {
+        return (out, false);
+    }
+    // Keep the tail; advance to the next char boundary so we never split a char.
+    let mut start = out.len() - CAPTURE_MAX_BYTES;
+    while start < out.len() && !out.is_char_boundary(start) {
+        start += 1;
+    }
+    (out[start..].to_string(), true)
 }
 
 /// True when the payload is nothing but SGR mouse *wheel* press reports
@@ -666,6 +1077,27 @@ async fn resolve_client_name(pid: Option<u32>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_capture_trims_and_bounds() {
+        // Per-line trailing whitespace is trimmed; each line ends with \n.
+        let (text, trunc) = cap_capture("ls   \n  hi \t\n");
+        assert_eq!(text, "ls\n  hi\n");
+        assert!(!trunc);
+
+        // Over-cap keeps the most-recent tail and flags truncation.
+        let big = "x".repeat(CAPTURE_MAX_BYTES + 5000);
+        let (text, trunc) = cap_capture(&big);
+        assert!(trunc);
+        assert!(text.len() <= CAPTURE_MAX_BYTES + 1); // +1 for the appended \n
+
+        // A multibyte char straddling the cut boundary is never split.
+        let mut s = "é".repeat(CAPTURE_MAX_BYTES); // 2 bytes each
+        s.push('\n');
+        let (text, trunc) = cap_capture(&s);
+        assert!(trunc);
+        assert!(text.is_char_boundary(0) && std::str::from_utf8(text.as_bytes()).is_ok());
+    }
 
     #[test]
     fn wheel_report_whitelist() {

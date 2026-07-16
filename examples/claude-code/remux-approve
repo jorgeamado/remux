@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# remux-approve — Claude Code PreToolUse hook adapter for phone approvals (M4b).
+#
+# When Claude Code is about to use a tool, this routes the decision to your phone
+# via remux: it pipes Claude Code's PreToolUse payload into `remux emit
+# permission`, which shows an Approve/Deny card on paired devices and BLOCKS
+# until one decides. It then maps remux's neutral `allow`/`deny` back into Claude
+# Code's PreToolUse decision.
+#
+# `remux emit permission` reads `tool_name` and `tool_input` straight from the
+# hook payload (the field names match), so no reshaping is needed.
+#
+# Fail-safe: on ANY failure — daemon down, no paired device, the request
+# expired, or Claude isn't running in a remux-served tmux pane — this returns
+# "ask", so Claude Code falls back to its own prompt. remux never silently
+# allows or blocks a tool.
+#
+# Install: see README.md. Scope the hook (matcher) to the tools you actually want
+# phone approval for, e.g. Bash|Edit|Write|MultiEdit|NotebookEdit — routing every
+# read-only tool (Read/Grep/Glob) through the phone would be tedious.
+set -u
+
+# Emit "ask" (defer to Claude Code's normal permission flow) and exit cleanly.
+ask() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}\n'
+  exit 0
+}
+
+payload="$(cat)"
+[ -n "$payload" ] || ask
+
+bin="${REMUX_BIN:-remux}"
+command -v "$bin" >/dev/null 2>&1 || ask
+
+# Blocks until a device decides; prints `allow` or `deny`, or exits non-zero on
+# no decision (daemon down / no device / expiry / not in a remux pane).
+decision="$(printf '%s' "$payload" | "$bin" emit permission --source claude-code 2>/dev/null)" || ask
+
+case "$decision" in
+  allow)
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"approved on remux"}}\n'
+    ;;
+  deny)
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"denied on remux"}}\n'
+    ;;
+  *)
+    ask
+    ;;
+esac

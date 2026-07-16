@@ -85,6 +85,34 @@ fn run_optional(cmd: Command) -> Result<Option<String>> {
     run_classified(cmd, false)
 }
 
+/// Capture the *rendered* visible screen of a pane (`capture-pane -p`), as plain
+/// text (no escapes). `Ok(None)` if the server or the pane is gone. This is how
+/// the pane-view capture adapter reads a real tool's output (e.g. htop) without
+/// touching the running program.
+pub fn capture_pane(pane: &str) -> Result<Option<String>> {
+    let mut cmd = tmux();
+    cmd.args(["capture-pane", "-p", "-t", pane]);
+    run_classified(cmd, true)
+}
+
+/// Capture a pane's visible screen plus up to `back` lines of scrollback, as
+/// plain text with wrapped lines joined (`-J`, so a wrapped command/URL is one
+/// line the phone can copy cleanly). For the copy overlay. `Ok(None)` if the
+/// pane/server is gone. tmux clamps `back` to the available history.
+pub fn capture_scrollback(pane: &str, back: u32) -> Result<Option<String>> {
+    let mut cmd = tmux();
+    cmd.args([
+        "capture-pane",
+        "-p",
+        "-J",
+        "-t",
+        pane,
+        "-S",
+        &format!("-{back}"),
+    ]);
+    run_classified(cmd, true)
+}
+
 /// Create the managed session if missing and apply session-scoped options.
 /// Never touches global tmux configuration.
 pub fn ensure_session(session: &str) -> Result<()> {
@@ -130,6 +158,108 @@ pub fn ensure_session(session: &str) -> Result<()> {
     let mut cmd = tmux();
     cmd.args(["set-option", "-t", session, "mouse", "on"]);
     run(cmd)?;
+    Ok(())
+}
+
+/// Send literal key(s) to a pane — for whitelisted dashboard actions. Literal
+/// (`-l`) so the string is never interpreted as a tmux key-name.
+pub fn send_keys(pane: &str, keys: &str) -> Result<()> {
+    let mut c = tmux();
+    c.args(["send-keys", "-t", pane, "-l", keys]);
+    run_classified(c, true)?;
+    Ok(())
+}
+
+/// Send named keys to a pane (e.g. `F5`, `BSpace`, `Enter`) — NOT literal, so
+/// tmux resolves each to the real key. Several in one call to keep it cheap.
+pub fn send_named(pane: &str, keys: &[&str]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut c = tmux();
+    c.args(["send-keys", "-t", pane]);
+    c.args(keys);
+    run_classified(c, true)?;
+    Ok(())
+}
+
+/// All panes whose *current* foreground command is one of `tools`, server-wide.
+/// A fresh poll — unlike topology's cached `pane_current_command`, which is not
+/// refreshed on a foreground-process change, so it can't be trusted to detect a
+/// tool starting/exiting.
+pub fn panes_running(tools: &[&str]) -> Result<std::collections::HashSet<String>> {
+    let mut c = tmux();
+    c.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id} #{pane_current_command}",
+    ]);
+    let out = run_optional(c)?.unwrap_or_default();
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let (id, cmd) = l.split_once(' ')?;
+            tools.contains(&cmd).then(|| id.to_string())
+        })
+        .collect())
+}
+
+/// The current foreground command of a pane (freshly polled), or `None` if the
+/// pane/server is gone. Used to re-verify a tool owns the pane before an action.
+pub fn pane_command(pane: &str) -> Option<String> {
+    let mut c = tmux();
+    c.args([
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_current_command}",
+    ]);
+    run_classified(c, true)
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The window id (`@N`) a pane belongs to — for window-scoped options.
+pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
+    let mut c = tmux();
+    c.args(["display-message", "-p", "-t", pane, "#{window_id}"]);
+    Ok(run_classified(c, true)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Force a large fixed "capture resolution" on a window so a full-screen tool
+/// (e.g. htop) renders all its columns and rows regardless of a small phone
+/// client. Used only while a dashboard view is on screen — the terminal itself
+/// is hidden then, so the oversized render is invisible. Reverted by
+/// [`clear_capture_size`].
+pub fn set_capture_size(window: &str, cols: u16, rows: u16) -> Result<()> {
+    let mut c = tmux();
+    c.args(["set-option", "-w", "-t", window, "window-size", "manual"]);
+    run_classified(c, true)?;
+    let mut c = tmux();
+    c.args([
+        "resize-window",
+        "-t",
+        window,
+        "-x",
+        &cols.to_string(),
+        "-y",
+        &rows.to_string(),
+    ]);
+    run_classified(c, true)?;
+    Ok(())
+}
+
+/// Restore client-driven sizing (remux's `latest` default) on a window.
+pub fn clear_capture_size(window: &str) -> Result<()> {
+    let mut c = tmux();
+    c.args(["set-option", "-w", "-t", window, "window-size", "latest"]);
+    run_classified(c, true)?;
     Ok(())
 }
 

@@ -10,3 +10,9 @@
 /target-host
 /web/test-results
 test-results/
+
+# Claude Code local worktrees/state
+.claude/
+
+# Devcontainer persisted state (Claude Code login/config, etc.) — never commit
+.devcontainer/data/

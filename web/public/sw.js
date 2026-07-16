@@ -1,7 +1,7 @@
 // Minimal service worker: enough for PWA installability. The app is useless
 // offline (it is a live terminal), so we only cache the shell as a fallback
 // and always prefer the network.
-const CACHE = "remux-shell-v1";
+const CACHE = "remux-shell-v2";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/"])));
@@ -133,8 +133,15 @@ self.addEventListener("notificationclick", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.pathname.startsWith("/api")) return;
+  // The app shell (a navigation to "/") must come from the network bypassing the
+  // browser's HTTP cache, so a new deploy is picked up immediately. Hashed
+  // assets are immutable, so a normal (cache-respecting) fetch is fine for them.
+  const req =
+    event.request.mode === "navigate"
+      ? new Request(event.request, { cache: "reload" })
+      : event.request;
   event.respondWith(
-    fetch(event.request)
+    fetch(req)
       .then((resp) => {
         const copy = resp.clone();
         caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});

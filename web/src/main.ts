@@ -753,6 +753,54 @@ function navigateToPane(paneId: string): void {
   }
 }
 
+/** A picker of the Claude sessions in this tmux session (panes with a claude.v1
+ * view). Tapping one jumps to that pane and shows its chat. */
+function openClaudeSessions(): void {
+  const claudes = paneViews.filter((v) => v.view === "claude.v1");
+  const bg = document.createElement("div");
+  bg.className = "rx-popup-bg";
+  const sheet = document.createElement("div");
+  sheet.className = "rx-popup";
+  const title = document.createElement("div");
+  title.className = "rx-popup-title";
+  title.textContent = "Claude sessions";
+  sheet.appendChild(title);
+  const btns = document.createElement("div");
+  btns.className = "rx-popup-btns";
+  if (!claudes.length) {
+    const note = document.createElement("div");
+    note.className = "rx-popup-detail";
+    note.textContent = "No Claude sessions in this tmux session.";
+    sheet.appendChild(note);
+  }
+  const active = activePaneId();
+  for (const v of claudes) {
+    const st = v.state as { session_id?: string; status?: string };
+    const b = document.createElement("button");
+    b.className = "btn rx-popup-btn";
+    const sid = String(st.session_id ?? "").slice(0, 8);
+    const dot = v.pane === active ? " ●" : "";
+    b.textContent = `${String(st.status ?? "idle")} · ${sid || v.pane}${dot}`;
+    b.addEventListener("click", () => {
+      bg.remove();
+      navigateToPane(v.pane);
+      if (!dashboardMode) setDashboard(true);
+    });
+    btns.appendChild(b);
+  }
+  const close = document.createElement("button");
+  close.className = "btn rx-popup-btn rx-cancel";
+  close.textContent = "Close";
+  close.addEventListener("click", () => bg.remove());
+  btns.appendChild(close);
+  sheet.appendChild(btns);
+  bg.addEventListener("click", (e) => {
+    if (e.target === bg) bg.remove();
+  });
+  bg.appendChild(sheet);
+  $("app").appendChild(bg);
+}
+
 const claudeChip = $("claude-chip");
 /** The active pane's own status, shown when there's no tab to badge (or as a
  * quick at-a-glance for the current pane). */
@@ -1597,48 +1645,15 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
     }
   }
 
-  // The conversation. Repainted in place on each chat_update (so the input
-  // below keeps focus); stored so onChatUpdate can find it.
+  // The conversation. Repainted in place on each chat_update; stored so
+  // onChatUpdate can find it. Replies are typed in the normal composer below
+  // (which types to the pane) — no dedicated chat input.
   const log = document.createElement("div");
   log.className = "cc-log";
   log.setAttribute("data-native-scroll", "");
   chatLogEl = log;
   paintChatLog(log);
   root.appendChild(log);
-
-  // Reply input — CONTROLLER only (typing to Claude is terminal-input authority).
-  if (isController) {
-    const bar = document.createElement("div");
-    bar.className = "cc-input";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.placeholder = "Message Claude…";
-    input.autocomplete = "off";
-    input.setAttribute("enterkeyhint", "send");
-    const send = (): void => {
-      const t = input.value.trim();
-      if (!t || !chatPane) return;
-      sendJson({ type: "chat_send", pane: chatPane, text: t });
-      input.value = "";
-    };
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        send();
-      }
-    });
-    const btn = document.createElement("button");
-    btn.className = "btn primary";
-    btn.textContent = "➤";
-    btn.addEventListener("click", send);
-    bar.append(input, btn);
-    root.appendChild(bar);
-  } else {
-    const note = document.createElement("div");
-    note.className = "cc-note cc-input";
-    note.textContent = "Take control to reply.";
-    root.appendChild(note);
-  }
   return root;
 }
 
@@ -2461,6 +2476,14 @@ setupKeyRow((data) => {
   } else {
     sendInput(data);
   }
+}, (key) => {
+  // In the Claude chat view, ← opens the Claude sessions picker (the terminal is
+  // hidden there, so its own left-arrow isn't needed). Elsewhere it passes through.
+  if (key === "left" && dashboardMode && currentView()?.view === "claude.v1") {
+    openClaudeSessions();
+    return true;
+  }
+  return false;
 });
 composer.hidden = false;
 setupTouchScroll($("terminal"), handle.term, (data) =>

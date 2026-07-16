@@ -32,7 +32,12 @@ function haptic(): void {
   (navigator as any).vibrate?.(8); // Android; harmless no-op on iOS
 }
 
-export function setupKeyRow(sendInput: (data: string) => void): void {
+export function setupKeyRow(
+  sendInput: (data: string) => void,
+  // Optional per-key intercept: return true to consume the key (don't send it
+  // to the terminal). Used so e.g. left-arrow opens a picker in the chat view.
+  intercept?: (key: string) => boolean
+): void {
   const row = document.getElementById("keyrow")!;
   const more = document.getElementById("keyrow-more")!;
   row.hidden = false;
@@ -53,9 +58,11 @@ export function setupKeyRow(sendInput: (data: string) => void): void {
     let delayTimer: number | undefined;
     let repeatTimer: number | undefined;
 
-    const fire = () => {
+    const fire = (): boolean => {
+      if (intercept?.(key)) return true; // consumed (e.g. opened a picker)
       const data = KEY_BYTES[key];
       if (data) sendInput(data);
+      return false;
     };
     const stop = () => {
       clearTimeout(delayTimer);
@@ -65,8 +72,8 @@ export function setupKeyRow(sendInput: (data: string) => void): void {
     btn.addEventListener("pointerdown", (ev) => {
       ev.preventDefault(); // keep terminal focus + kill double-tap zoom
       haptic();
-      fire();
-      if (REPEATABLE.has(key)) {
+      const consumed = fire();
+      if (!consumed && REPEATABLE.has(key)) {
         delayTimer = window.setTimeout(() => {
           repeatTimer = window.setInterval(fire, REPEAT_INTERVAL_MS);
         }, REPEAT_DELAY_MS);

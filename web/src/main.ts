@@ -1039,6 +1039,7 @@ interface ChatMsg {
 }
 let chatPane: string | null = null; // the pane we're subscribed to
 let chatMessages: ChatMsg[] = [];
+let chatLogEl: HTMLElement | null = null; // the open log element, repainted in place
 
 /** Subscribe to a pane's chat (idempotent); resets the local model so the fresh
  * snapshot replaces cleanly. */
@@ -1050,6 +1051,7 @@ function subscribeChat(pane: string): void {
   sendJson({ type: "chat_subscribe", pane });
 }
 function unsubscribeChat(): void {
+  chatLogEl = null;
   if (!chatPane) return;
   sendJson({ type: "chat_unsubscribe" });
   chatPane = null;
@@ -1061,7 +1063,8 @@ function onChatUpdate(msg: ControlMsg): void {
   const incoming = msg.messages ?? [];
   chatMessages = msg.full ? incoming.slice() : chatMessages.concat(incoming);
   if (chatMessages.length > 300) chatMessages = chatMessages.slice(-300);
-  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+  // Repaint only the log so the reply input keeps focus.
+  if (chatLogEl) paintChatLog(chatLogEl);
 }
 
 /** Drop all pane views and leave dashboard mode — on reconnect / session switch. */
@@ -1594,10 +1597,54 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
     }
   }
 
-  // The conversation.
+  // The conversation. Repainted in place on each chat_update (so the input
+  // below keeps focus); stored so onChatUpdate can find it.
   const log = document.createElement("div");
   log.className = "cc-log";
   log.setAttribute("data-native-scroll", "");
+  chatLogEl = log;
+  paintChatLog(log);
+  root.appendChild(log);
+
+  // Reply input — CONTROLLER only (typing to Claude is terminal-input authority).
+  if (isController) {
+    const bar = document.createElement("div");
+    bar.className = "cc-input";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Message Claude…";
+    input.autocomplete = "off";
+    input.setAttribute("enterkeyhint", "send");
+    const send = (): void => {
+      const t = input.value.trim();
+      if (!t || !chatPane) return;
+      sendJson({ type: "chat_send", pane: chatPane, text: t });
+      input.value = "";
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        send();
+      }
+    });
+    const btn = document.createElement("button");
+    btn.className = "btn primary";
+    btn.textContent = "➤";
+    btn.addEventListener("click", send);
+    bar.append(input, btn);
+    root.appendChild(bar);
+  } else {
+    const note = document.createElement("div");
+    note.className = "cc-note cc-input";
+    note.textContent = "Take control to reply.";
+    root.appendChild(note);
+  }
+  return root;
+}
+
+/** Fill the chat log element with the current messages, scrolled to newest. */
+function paintChatLog(log: HTMLElement): void {
+  log.textContent = "";
   if (!chatMessages.length) {
     const empty = document.createElement("div");
     empty.className = "cc-note";
@@ -1607,15 +1654,12 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
   for (const m of chatMessages) {
     const el = document.createElement("div");
     el.className = `cc-msg cc-${m.role}${m.kind === "tool" ? " cc-tool" : ""}`;
-    el.textContent = m.kind === "tool" ? m.text : m.text;
+    el.textContent = m.text;
     log.appendChild(el);
   }
-  root.appendChild(log);
-  // Open scrolled to the newest message.
   requestAnimationFrame(() => {
     log.scrollTop = log.scrollHeight;
   });
-  return root;
 }
 
 function renderTaskscope(state: Record<string, unknown>): HTMLElement {

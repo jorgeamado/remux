@@ -43,6 +43,8 @@ const TEXT_MSG_REFILL_PER_SEC: f64 = 32.0;
 const CAPTURE_LINES: u32 = 2000;
 const CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Max bytes of a single chat message typed to Claude.
+const CHAT_SEND_MAX: usize = 8 * 1024;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -97,6 +99,11 @@ enum ClientMsg {
     },
     /// Stop receiving chat updates.
     ChatUnsubscribe,
+    /// Type a message to Claude in `pane` (controller-only, like terminal input).
+    ChatSend {
+        pane: String,
+        text: String,
+    },
     Ping,
 }
 
@@ -992,6 +999,35 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                     }
                     Ok(ClientMsg::ChatUnsubscribe) => {
                         let _ = chat_sub_tx.send(None);
+                    }
+                    Ok(ClientMsg::ChatSend { pane, text }) => {
+                        // Typing to Claude is CONTROLLER-only (same authority as
+                        // terminal input), this session's pane, rate-limited and
+                        // length-capped. send-keys -l (literal) so the message is
+                        // never interpreted as tmux keys, then a separate Enter.
+                        let now = std::time::Instant::now();
+                        let spaced = last_pane_action
+                            .is_none_or(|t| now.duration_since(t) >= PANE_ACTION_MIN_INTERVAL);
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        if controller
+                            && in_session
+                            && spaced
+                            && !text.is_empty()
+                            && text.len() <= CHAT_SEND_MAX
+                        {
+                            last_pane_action = Some(now);
+                            let p = pane.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                tmux::send_keys(&p, &text)
+                                    .and_then(|_| tmux::send_named(&p, &["Enter"]))
+                            })
+                            .await;
+                        }
                     }
                     Ok(ClientMsg::Ping) => {
                         let _ = out_tx.send(json(&ServerMsg::Pong)).await;

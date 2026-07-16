@@ -1102,6 +1102,25 @@ button {
   font-size: 13px;
   padding: 4px;
 }
+.cc-input {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--card-border);
+}
+.cc-input input {
+  flex: 1;
+  background: var(--input);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  color: var(--fg);
+  font-size: 15px;
+  padding: 8px 12px;
+}
+.cc-input .btn {
+  padding: 8px 14px;
+}
 
 /* (legacy status dashboard styles kept for the chip) */
 .claude-dash {

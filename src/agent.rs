@@ -172,6 +172,16 @@ impl Registry {
         let _ = self.events.send(());
     }
 
+    /// The (session id, transcript path) for a pane — for the chat tailer to
+    /// know which file to read and when the session has been superseded.
+    pub fn transcript_of(&self, pane: &str) -> Option<(String, Option<String>)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(pane)
+            .map(|s| (s.session_id.clone(), s.transcript_path.clone()))
+    }
+
     /// Current agent views (for the projector to reconcile).
     pub fn views(&self) -> Vec<AgentView> {
         self.inner
@@ -379,14 +389,24 @@ mod tests {
     fn set_session_stores_metadata_and_is_session_guarded() {
         let reg = Registry::default();
         started(&reg, "%1", "s1");
-        reg.apply("%1", Event::PromptSubmitted { session_id: "s1".into() });
+        reg.apply(
+            "%1",
+            Event::PromptSubmitted {
+                session_id: "s1".into(),
+            },
+        );
         // Session metadata for the current session updates in place.
-        reg.set_session("%1", "s1", Some("/t/s1.jsonl".into()), Some("default".into()));
+        reg.set_session(
+            "%1",
+            "s1",
+            Some("/t/s1.jsonl".into()),
+            Some("default".into()),
+        );
         let v = &reg.views()[0];
         assert_eq!(v.transcript_path.as_deref(), Some("/t/s1.jsonl"));
         assert_eq!(v.permission_mode.as_deref(), Some("default"));
         assert_eq!(v.base, BaseStatus::Working); // didn't clobber status
-        // A mode-only update keeps the known path.
+                                                 // A mode-only update keeps the known path.
         reg.set_session("%1", "s1", None, Some("acceptEdits".into()));
         let v = &reg.views()[0];
         assert_eq!(v.transcript_path.as_deref(), Some("/t/s1.jsonl"));

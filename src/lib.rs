@@ -2,6 +2,7 @@ pub mod admin;
 pub mod agent;
 pub mod attention;
 pub mod auth;
+pub mod chat;
 pub mod feed;
 pub mod ingest;
 pub mod paneview;
@@ -360,6 +361,9 @@ pub struct App {
     /// Per-pane agent lifecycle state (fed by `remux emit agent-state`), projected
     /// into a `claude.v1` pane view.
     pub agents: agent::Registry,
+    /// Per-pane rendered Claude transcript (the chat companion). Served
+    /// per-connection over the WS, never broadcast (it holds secrets-class text).
+    pub chat: chat::ChatStore,
     /// Latest structured "pane view" per pane, fed by the `remux stream` socket
     /// and rendered by the PWA as a custom interface for that pane.
     pub pane_views: paneview::Registry,

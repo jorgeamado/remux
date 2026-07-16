@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
-    admin, attention, auth, host_of_url, ingest, paneview, push, server, shell, tmux, topology,
-    App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd,
+    admin, attention, auth, chat, host_of_url, ingest, paneview, push, server, shell, tmux,
+    topology, App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd,
 };
 use std::sync::Arc;
 
@@ -326,6 +326,7 @@ async fn main() -> Result<()> {
         topology: tokio::sync::watch::channel(std::sync::Arc::new(Vec::new())).0,
         perms: Default::default(),
         agents: Default::default(),
+        chat: Default::default(),
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
@@ -352,6 +353,8 @@ async fn main() -> Result<()> {
     paneview::spawn_capture(app.clone());
     // Project agent lifecycle state (+ open permit cards) into `claude.v1`.
     paneview::spawn_claude_projector(app.clone());
+    // Tail Claude transcripts into the per-pane chat store (served per-connection).
+    chat::spawn(app.clone());
     server::run(app).await
 }
 

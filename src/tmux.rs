@@ -232,6 +232,62 @@ pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
+/// Press-relevant geometry and flags for a pane in a session's current
+/// window — the window every attached client displays (window selection is
+/// per-session, so a client's view is always the session's active window).
+/// Rects are 0-based inclusive window coordinates as tmux reports them.
+#[derive(Debug, PartialEq)]
+pub struct PressPane {
+    pub id: String,
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+    /// Pane is in a tmux mode (copy-mode etc.) — a click there would drive
+    /// the mode (move the selection cursor, exit copy-mode), not the app.
+    pub in_mode: bool,
+    /// The foreground application requested mouse reporting; without it a
+    /// click never reaches the app, only tmux's own pane bindings.
+    pub mouse_any: bool,
+}
+
+/// Freshly polled panes of `session`'s current window (see [`PressPane`]).
+/// Polled per press, right before delivery — pane layout and foreground
+/// mouse mode can change at any moment.
+pub fn press_panes(session: &str) -> Result<Vec<PressPane>> {
+    let mut c = tmux();
+    c.args([
+        "list-panes",
+        "-t",
+        &format!("{session}:"),
+        "-F",
+        "#{pane_id} #{pane_left} #{pane_top} #{pane_right} #{pane_bottom} #{pane_in_mode} #{mouse_any_flag}",
+    ]);
+    Ok(parse_press_panes(
+        &run_classified(c, true)?.unwrap_or_default(),
+    ))
+}
+
+fn parse_press_panes(out: &str) -> Vec<PressPane> {
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() != 7 || !f[0].starts_with('%') {
+                return None;
+            }
+            Some(PressPane {
+                id: f[0].to_string(),
+                left: f[1].parse().ok()?,
+                top: f[2].parse().ok()?,
+                right: f[3].parse().ok()?,
+                bottom: f[4].parse().ok()?,
+                in_mode: f[5] != "0",
+                mouse_any: f[6] != "0",
+            })
+        })
+        .collect()
+}
+
 /// Force a large fixed "capture resolution" on a window so a full-screen tool
 /// (e.g. htop) renders all its columns and rows regardless of a small phone
 /// client. Used only while a dashboard view is on screen — the terminal itself
@@ -670,6 +726,28 @@ pub fn demote_client(client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn press_pane_parsing() {
+        // Two-pane vertical split of an 80×24 window plus a malformed line.
+        let out = "%1 0 0 39 23 0 1\n%2 41 0 79 23 1 0\ngarbage\n%3 0 0 79\n";
+        let panes = parse_press_panes(out);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(
+            panes[0],
+            PressPane {
+                id: "%1".into(),
+                left: 0,
+                top: 0,
+                right: 39,
+                bottom: 23,
+                in_mode: false,
+                mouse_any: true,
+            }
+        );
+        assert!(panes[1].in_mode);
+        assert!(!panes[1].mouse_any);
+    }
 
     #[test]
     fn benign_absence_classification() {

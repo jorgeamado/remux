@@ -1,7 +1,7 @@
 import "./style.css";
 import { createTerminal } from "./term";
 import { setupKeyRow, applyCtrl, disarmCtrl } from "./keys";
-import { setupTouchScroll } from "./scroll";
+import { cellFromPoint, setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
 
@@ -64,6 +64,7 @@ const connInfo = $("conn-info");
 const controlBanner = $("control-banner");
 const controlText = $("control-text");
 const controlBtn = $<HTMLButtonElement>("control-btn");
+const pressBtn = $<HTMLButtonElement>("press-btn");
 const menuBtn = $<HTMLButtonElement>("menu-btn");
 const menu = $("menu");
 const hint = $<HTMLButtonElement>("hint");
@@ -97,6 +98,11 @@ let intentionalClose = false;
 // server grants control ("type to take control").
 let pendingInput = "";
 let controlRequested = false;
+
+// Press mode: armed = the next single tap on the terminal is sent as a
+// structured one-shot click (terminal_press) — no take-control, no resize,
+// no keyboard. One gesture, then it disarms itself.
+let pressArmed = false;
 
 // Clamp the stored font to the readable range. Earlier builds (auto-fit-width,
 // a too-low FONT_MIN) could persist a tiny value like 6px; treat anything
@@ -197,10 +203,12 @@ function renderBanner(): void {
     controlBtn.textContent = "Release";
     controlBtn.classList.remove("primary");
   } else {
-    controlText.textContent = "Observer";
+    controlText.textContent = pressArmed ? "Observer · tap one control" : "Observer";
     controlBtn.textContent = "Take control";
     controlBtn.classList.add("primary");
   }
+  // Pressing is an observer affordance; a controller's taps are real input.
+  pressBtn.hidden = isController;
 }
 
 // ---------- connection ----------
@@ -372,6 +380,9 @@ interface ControlMsg {
   commands?: FeedCommand[];
   /** pane_views frames: structured per-pane state for custom renderers */
   views?: PaneView[];
+  /** terminal_press_result frames: echoed request id + outcome */
+  request_id?: string;
+  status?: string;
 }
 
 /** A pane's structured view state, rendered as a custom interface. */
@@ -461,6 +472,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "pane_capture":
       openCopyOverlay(msg.text ?? "", msg.truncated ?? false);
+      break;
+    case "terminal_press_result":
+      onPressResult(msg);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -2190,6 +2204,8 @@ handle.onResize((cols, rows) => {
   // report to tmux.
   sendJson({ type: "resize", cols, rows });
   if (isController) renderBanner();
+  // The grid an armed press would aim at no longer exists.
+  if (pressArmed) setPressArmed(false);
 });
 
 controlBtn.addEventListener("click", () => {
@@ -2199,6 +2215,112 @@ controlBtn.addEventListener("click", () => {
     requestControl();
   }
 });
+
+// ---------- Press mode (one-shot tap without taking control) ----------
+// Arm-first: tap Press, then tap ONE element in the terminal. The client
+// sends structured terminal_press JSON — never raw mouse bytes — and the
+// daemon synthesizes a validated SGR click into this connection's own PTY,
+// so pressing never takes control, never resizes the session, and never
+// opens the mobile keyboard (docs/design-tap.md).
+
+const terminalEl = $("terminal");
+// The armed overlay owns the gesture: it sits above xterm so the tap never
+// reaches xterm's textarea, and data-native-scroll opts it out of touch
+// wheel synthesis in scroll.ts.
+const pressOverlay = document.createElement("div");
+pressOverlay.id = "press-overlay";
+pressOverlay.setAttribute("data-native-scroll", "");
+terminalEl.appendChild(pressOverlay);
+
+let pressTimer: number | undefined;
+let pressSeq = 0;
+let pressPending: string | null = null; // request_id awaiting its result
+let pressStart: { x: number; y: number } | null = null;
+
+function setPressArmed(on: boolean): void {
+  pressArmed = on;
+  pressStart = null;
+  clearTimeout(pressTimer);
+  if (on) {
+    // One gesture or nothing: a forgotten armed state must not turn a
+    // scroll-tap minutes later into a click.
+    pressTimer = window.setTimeout(() => setPressArmed(false), 5000);
+  }
+  terminalEl.classList.toggle("press-armed", on);
+  pressBtn.classList.toggle("active", on);
+  renderBanner();
+}
+
+pressBtn.addEventListener("click", () => setPressArmed(!pressArmed));
+
+pressOverlay.addEventListener("pointerdown", (ev) => {
+  if (!pressArmed) return;
+  ev.preventDefault();
+  pressOverlay.setPointerCapture(ev.pointerId);
+  pressStart = { x: ev.clientX, y: ev.clientY };
+});
+pressOverlay.addEventListener("pointermove", (ev) => {
+  // Movement means scroll intent, not a press — disarm rather than guess.
+  if (pressStart && Math.hypot(ev.clientX - pressStart.x, ev.clientY - pressStart.y) > 8) {
+    setPressArmed(false);
+  }
+});
+pressOverlay.addEventListener("pointerup", (ev) => {
+  if (!pressArmed || !pressStart) return;
+  ev.preventDefault();
+  const cell = cellFromPoint(terminalEl, handle.term, pressStart.x, pressStart.y);
+  setPressArmed(false);
+  if (!cell) return;
+  const { cols, rows } = handle.size();
+  pressPending = `p${++pressSeq}-${Date.now().toString(36)}`;
+  sendJson({
+    type: "terminal_press",
+    request_id: pressPending,
+    cols,
+    rows,
+    col: cell.col,
+    row: cell.row,
+  });
+  flashPressCell(cell.col, cell.row);
+});
+pressOverlay.addEventListener("pointercancel", () => setPressArmed(false));
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && pressArmed) setPressArmed(false);
+});
+
+/// Briefly highlight the tapped cell so a press is never silent.
+function flashPressCell(col: number, row: number): void {
+  const screen = terminalEl.querySelector(".xterm-screen");
+  if (!screen) return;
+  const rect = screen.getBoundingClientRect();
+  const host = terminalEl.getBoundingClientRect();
+  const w = rect.width / handle.term.cols;
+  const h = rect.height / handle.term.rows;
+  const el = document.createElement("div");
+  el.className = "press-flash";
+  el.style.left = `${rect.left - host.left + (col - 1) * w}px`;
+  el.style.top = `${rect.top - host.top + (row - 1) * h}px`;
+  el.style.width = `${w}px`;
+  el.style.height = `${h}px`;
+  terminalEl.appendChild(el);
+  window.setTimeout(() => el.remove(), 400);
+}
+
+function onPressResult(msg: ControlMsg): void {
+  if (!msg.request_id || msg.request_id !== pressPending) return;
+  pressPending = null;
+  const text: Record<string, string> = {
+    delivered: "Tap sent",
+    stale: "Screen changed — arm Press and tap again",
+    copy_mode: "Scroll back to the live view before pressing",
+    mouse_off: "This app doesn't take clicks — take control instead",
+    outside_pane: "That spot isn't inside a pane",
+    rate_limited: "Too fast — try again",
+    failed: "Couldn't deliver the tap",
+  };
+  showHint(text[msg.status ?? ""] ?? "Couldn't deliver the tap");
+}
 
 hint.addEventListener("click", () => {
   hint.hidden = true;

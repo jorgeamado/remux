@@ -257,12 +257,15 @@ pub fn render_record(line: &str) -> Vec<Rendered> {
 /// same-uid hook can supply the path), but it stops a stray/rewritten path from
 /// reading arbitrary files.
 fn open_validated(path: &str) -> Option<std::fs::File> {
-    let home = std::env::var_os("HOME")?;
-    let base = Path::new(&home)
-        .join(".claude")
-        .join("projects")
-        .canonicalize()
-        .ok()?;
+    // Transcripts live under Claude Code's config dir: $CLAUDE_CONFIG_DIR/projects
+    // if set (our container points it at a persisted dir), else ~/.claude/projects.
+    let base = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => Path::new(&dir).join("projects"),
+        None => Path::new(&std::env::var_os("HOME")?)
+            .join(".claude")
+            .join("projects"),
+    };
+    let base = base.canonicalize().ok()?;
     let canon = Path::new(path).canonicalize().ok()?;
     if !canon.starts_with(&base) {
         return None;
@@ -319,10 +322,7 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
 /// Blocking read of any new complete lines from `path`, given prior tail state.
 /// Returns (rendered messages, new state, reset?) — `reset` is true when the
 /// file was truncated/rotated/first-seen so the caller starts a new generation.
-fn read_new(
-    path: &str,
-    prev: Option<Tailer>,
-) -> Option<ReadOutput> {
+fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
     use std::os::unix::fs::MetadataExt;
     let mut file = open_validated(path)?;
     let md = file.metadata().ok()?;

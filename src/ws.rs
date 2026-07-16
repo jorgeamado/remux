@@ -90,6 +90,13 @@ enum ClientMsg {
     Capture {
         pane: String,
     },
+    /// Subscribe this connection to a pane's rendered Claude chat (opt-in;
+    /// transcript content is never broadcast). Replaces any prior subscription.
+    ChatSubscribe {
+        pane: String,
+    },
+    /// Stop receiving chat updates.
+    ChatUnsubscribe,
     Ping,
 }
 
@@ -567,6 +574,68 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
         }
     });
 
+    // Per-connection Claude chat: opt-in (the main loop sets the subscribed pane
+    // via this watch). Transcript content is served ONLY here, never broadcast;
+    // reading is gated on session membership (checked before the watch is set),
+    // NOT the `approve` capability.
+    let (chat_sub_tx, chat_sub_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let chat_task = tokio::spawn({
+        let mut hint = app.chat.subscribe();
+        let mut sub_rx = chat_sub_rx.clone();
+        let out = out_tx.clone();
+        let app = app.clone();
+        async move {
+            let mut cur: Option<String> = None;
+            let mut cursor_gen: u64 = 0;
+            let mut cursor_seq: u64 = 0;
+            let mut sent_gen: Option<u64> = None;
+            loop {
+                // Reconcile to the currently-subscribed pane; a change resets the
+                // cursor so the new pane gets a fresh snapshot.
+                let want = sub_rx.borrow().clone();
+                if want != cur {
+                    cur = want;
+                    cursor_gen = 0;
+                    cursor_seq = 0;
+                    sent_gen = None;
+                }
+                if let Some(pane) = cur.clone() {
+                    if let Some(u) = app.chat.update_since(&pane, cursor_gen, cursor_seq) {
+                        let deliver =
+                            !u.messages.is_empty() || (u.full && sent_gen != Some(u.generation));
+                        if deliver {
+                            cursor_gen = u.generation;
+                            if let Some(last) = u.messages.last() {
+                                cursor_seq = last.seq + 1;
+                            }
+                            sent_gen = Some(u.generation);
+                            let msg = Message::Text(
+                                serde_json::json!({
+                                    "type": "chat_update", "pane": u.pane,
+                                    "generation": u.generation, "full": u.full,
+                                    "messages": u.messages,
+                                })
+                                .to_string()
+                                .into(),
+                            );
+                            if out.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                tokio::select! {
+                    r = hint.recv() => match r {
+                        Ok(()) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    c = sub_rx.changed() => { if c.is_err() { break } }
+                }
+            }
+        }
+    });
+
     // Resolve our tmux client name (needed to toggle observer/controller flags).
     let client_name = resolve_client_name(child_pid).await;
     if client_name.is_none() {
@@ -909,6 +978,21 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Ok(ClientMsg::ChatSubscribe { pane }) => {
+                        // Gate on SESSION MEMBERSHIP (not approve) — the terminal
+                        // already shows this pane's text to any in-session device.
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        // The chat push task sends a fresh snapshot on this change.
+                        let _ = chat_sub_tx.send(in_session.then_some(pane));
+                    }
+                    Ok(ClientMsg::ChatUnsubscribe) => {
+                        let _ = chat_sub_tx.send(None);
+                    }
                     Ok(ClientMsg::Ping) => {
                         let _ = out_tx.send(json(&ServerMsg::Pong)).await;
                     }
@@ -936,6 +1020,7 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     permits_task.abort();
     feed_task.abort();
     paneview_task.abort();
+    chat_task.abort();
     revoke_task.abort();
     topology_task.abort();
     sender.abort();

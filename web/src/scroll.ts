@@ -7,6 +7,29 @@
 
 import type { Terminal } from "@xterm/xterm";
 
+/// The 1-based grid cell under a viewport point, from the rendered
+/// .xterm-screen geometry. Shared by touch scrollback and Press mode.
+export function cellFromPoint(
+  container: HTMLElement,
+  term: Terminal,
+  x: number,
+  y: number
+): { col: number; row: number } | null {
+  const screen = container.querySelector(".xterm-screen");
+  if (!screen) return null;
+  const rect = screen.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return null;
+  const col = Math.min(
+    term.cols,
+    Math.max(1, Math.floor(((x - rect.left) / rect.width) * term.cols) + 1)
+  );
+  const row = Math.min(
+    term.rows,
+    Math.max(1, Math.floor(((y - rect.top) / rect.height) * term.rows) + 1)
+  );
+  return { col, row };
+}
+
 export function setupTouchScroll(
   container: HTMLElement,
   term: Terminal,
@@ -14,21 +37,8 @@ export function setupTouchScroll(
 ): void {
   let lastY: number | null = null;
 
-  const cellAt = (touch: Touch): { col: number; row: number } | null => {
-    const screen = container.querySelector(".xterm-screen");
-    if (!screen) return null;
-    const rect = screen.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-    const col = Math.min(
-      term.cols,
-      Math.max(1, Math.floor(((touch.clientX - rect.left) / rect.width) * term.cols) + 1)
-    );
-    const row = Math.min(
-      term.rows,
-      Math.max(1, Math.floor(((touch.clientY - rect.top) / rect.height) * term.rows) + 1)
-    );
-    return { col, row };
-  };
+  const cellAt = (touch: Touch): { col: number; row: number } | null =>
+    cellFromPoint(container, term, touch.clientX, touch.clientY);
 
   const cellHeight = () => {
     const screen = container.querySelector(".xterm-screen");

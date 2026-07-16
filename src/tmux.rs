@@ -232,6 +232,106 @@ pub fn window_of_pane(pane: &str) -> Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
+/// Press-relevant flags for a pane in a session's current window — the
+/// window every attached client displays (window selection is per-session,
+/// so a client's view is always the session's active window).
+#[derive(Debug, PartialEq)]
+pub struct PressPane {
+    pub id: String,
+    pub active: bool,
+    /// Pane is in a tmux mode (copy-mode etc.) — a click there would drive
+    /// the mode (move the selection cursor, exit copy-mode), not the app.
+    pub in_mode: bool,
+    /// The foreground application requested mouse reporting; without it a
+    /// click never reaches the app, only tmux's own pane bindings.
+    pub mouse_any: bool,
+}
+
+/// Press-relevant state of a session's current window. Deliberately NO pane
+/// rectangles: tmux routes a client's click itself (cursor-following pan
+/// when the client is smaller than the window, zoom, top/multi-line status),
+/// and the daemon cannot reproduce that per-client mapping — validation that
+/// pretends to would approve the wrong pane (Codex). The press gate instead
+/// checks the status rows on the client grid and requires every pane the
+/// click could land in to be pressable.
+#[derive(Debug, PartialEq)]
+pub struct PressWindow {
+    pub zoomed: bool,
+    /// Status-line rows drawn at the top / bottom of the CLIENT grid. tmux
+    /// draws status on the client's own rows regardless of window panning,
+    /// so client-coordinate guards against these are exact.
+    pub status_top: u16,
+    pub status_bottom: u16,
+    pub panes: Vec<PressPane>,
+}
+
+/// Freshly polled press state of `session`'s current window. Polled per
+/// press, right before delivery — layout, zoom, and foreground mouse mode
+/// change at any moment. `Ok(None)` if the server/session is gone.
+pub fn press_window(session: &str) -> Result<Option<PressWindow>> {
+    let target = format!("{session}:");
+    let mut c = tmux();
+    // Option values (#{status}, #{status-position}) expand in formats.
+    c.args([
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        "#{window_zoomed_flag} #{status} #{status-position}",
+    ]);
+    let Some(header) = run_classified(c, true)? else {
+        return Ok(None);
+    };
+    let mut c = tmux();
+    c.args([
+        "list-panes",
+        "-t",
+        &target,
+        "-F",
+        "#{pane_id} #{pane_active} #{pane_in_mode} #{mouse_any_flag}",
+    ]);
+    let Some(panes) = run_classified(c, true)? else {
+        return Ok(None);
+    };
+    Ok(parse_press_window(&header, &panes))
+}
+
+fn parse_press_window(header: &str, panes: &str) -> Option<PressWindow> {
+    let f: Vec<&str> = header.split_whitespace().collect();
+    if f.len() != 3 {
+        return None;
+    }
+    let zoomed = f[0] != "0";
+    // status option: off | on | 2..=5 (number of lines).
+    let lines: u16 = match f[1] {
+        "off" => 0,
+        "on" => 1,
+        n => n.parse().unwrap_or(1),
+    };
+    let top = f[2] == "top";
+    let panes: Vec<PressPane> = panes
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() != 4 || !f[0].starts_with('%') {
+                return None;
+            }
+            Some(PressPane {
+                id: f[0].to_string(),
+                active: f[1] != "0",
+                in_mode: f[2] != "0",
+                mouse_any: f[3] != "0",
+            })
+        })
+        .collect();
+    Some(PressWindow {
+        zoomed,
+        status_top: if top { lines } else { 0 },
+        status_bottom: if top { 0 } else { lines },
+        panes,
+    })
+}
+
 /// Force a large fixed "capture resolution" on a window so a full-screen tool
 /// (e.g. htop) renders all its columns and rows regardless of a small phone
 /// client. Used only while a dashboard view is on screen — the terminal itself
@@ -670,6 +770,37 @@ pub fn demote_client(client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn press_window_parsing() {
+        // Unzoomed window, default single bottom status, two panes (one in
+        // copy-mode without mouse), plus malformed lines that must be skipped.
+        let win = parse_press_window("0 on bottom", "%1 1 0 1\n%2 0 1 0\ngarbage\n%3 1\n").unwrap();
+        assert!(!win.zoomed);
+        assert_eq!((win.status_top, win.status_bottom), (0, 1));
+        assert_eq!(win.panes.len(), 2);
+        assert_eq!(
+            win.panes[0],
+            PressPane {
+                id: "%1".into(),
+                active: true,
+                in_mode: false,
+                mouse_any: true,
+            }
+        );
+        assert!(win.panes[1].in_mode);
+        assert!(!win.panes[1].mouse_any);
+
+        // Zoomed, two status lines on top; "off" means no status rows at all.
+        let win = parse_press_window("1 2 top", "%1 1 0 1\n").unwrap();
+        assert!(win.zoomed);
+        assert_eq!((win.status_top, win.status_bottom), (2, 0));
+        let win = parse_press_window("0 off bottom", "%1 1 0 1\n").unwrap();
+        assert_eq!((win.status_top, win.status_bottom), (0, 0));
+
+        // A malformed header is a poll failure, not a permissive default.
+        assert!(parse_press_window("0 on", "%1 1 0 1\n").is_none());
+    }
 
     #[test]
     fn benign_absence_classification() {

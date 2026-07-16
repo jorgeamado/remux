@@ -369,6 +369,22 @@ ingest-socket + `$TMUX_PANE`↔topology mapping.
 
 ## Parked (see PLAN.md "Parked")
 
+- **Claude chat: session-switch doesn't refresh the dashboard** (bug, found on
+  device 2026-07-16, after slice-2 merge). Two symptoms:
+  1. In the chat dashboard, ← opens the sessions picker, pick another session,
+     come back → the chat log still shows the **previous** session's dialogue
+     (stale). The switch isn't re-subscribing / re-snapshotting the chat for the
+     newly-selected pane, or the dashboard isn't re-rendered on the pane change.
+     Suspect: `navigateToPane` from the picker changes the active pane but the
+     open Claude view keeps `chatPane`/`chatMessages` from before — needs the
+     same `refreshClaudeDashboard()` + `subscribeChat(newPane)` path the other
+     lifecycle transitions use. The dashboard "doesn't change in the terminal"
+     either — the whole view is holding stale pane state across the switch.
+  2. The **Claude sessions picker looks nothing like the terminal's** session
+     view — it's the generic rx-popup list of `claude.v1` paneViews, not a
+     representation matching what tmux/Claude shows. Decide the intended design
+     (mirror the native session list vs. a purpose-built picker) before
+     polishing. Repro: PWA → Claude window → Dashboard → ← → pick session → back.
 - **Multi-machine client** (new idea, 2026-07-13): one app talks to several
   remux daemons (laptop / home server / cloud VM) — machine picker, per-host
   device tokens. Blocker to design around: cross-origin (a PWA from host A

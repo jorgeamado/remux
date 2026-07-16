@@ -115,21 +115,26 @@
              keyboard is down (auto deck) — that's when you're steering, not
              typing. Word caps teach the chords. -->
         <div id="keyrow-agent" hidden>
-          <button class="key capkey" data-key="shift-tab" aria-label="cycle agent mode (shift+tab)">
-            <span class="cap">mode</span>&#x21E7;tab</button>
-          <button class="key capkey" data-key="esc-esc" aria-label="rewind (esc esc)">
-            <span class="cap">rewind</span>esc&#x2009;esc</button>
-          <button class="key capkey" data-key="ctrl-r" aria-label="transcript (ctrl+r)">
-            <span class="cap">transcript</span>^r</button>
-          <button class="key capkey" data-key="ctrl-l" aria-label="clear screen (ctrl+l)">
+          <button class="key capkey" data-key="shift-tab" title="cycle agent mode (shift+tab)"
+                  aria-label="cycle agent mode (shift+tab)">
+            <span class="cap">mode</span>&#x21E7;&#x21E5;</button>
+          <button class="key capkey" data-key="esc-esc" title="rewind (esc esc)"
+                  aria-label="rewind (esc esc)">
+            <span class="cap">esc&#x2009;esc</span>&#x21BA;</button>
+          <button class="key capkey" data-key="ctrl-r" title="transcript (ctrl+r)"
+                  aria-label="transcript (ctrl+r)">
+            <span class="cap">log</span>^r</button>
+          <button class="key capkey" data-key="ctrl-l" title="clear screen (ctrl+l)"
+                  aria-label="clear screen (ctrl+l)">
             <span class="cap">clear</span>^l</button>
         </div>
         <div id="keyrow-more" hidden>
-          <button class="key" data-key="home">home</button>
-          <button class="key" data-key="end">end</button>
-          <button class="key" data-key="pgup">pgup</button>
-          <button class="key" data-key="pgdn">pgdn</button>
-          <button class="key" id="copy-key" title="copy screen + scrollback">&#x29C9; copy</button>
+          <button class="key" data-key="home" title="home" aria-label="home">&#x21F1;</button>
+          <button class="key" data-key="end" title="end" aria-label="end">&#x21F2;</button>
+          <button class="key" data-key="pgup" title="page up" aria-label="page up">&#x21DE;</button>
+          <button class="key" data-key="pgdn" title="page down" aria-label="page down">&#x21DF;</button>
+          <button class="key" id="copy-key" title="copy screen + scrollback"
+                  aria-label="copy screen and scrollback">&#x29C9;</button>
           <button class="key" data-key="dash">-</button>
           <button class="key" data-key="underscore">_</button>
           <button class="key" data-key="pipe">|</button>

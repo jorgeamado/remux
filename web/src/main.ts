@@ -1088,6 +1088,10 @@ interface ChatMsg {
 let chatPane: string | null = null; // the pane we're subscribed to
 let chatMessages: ChatMsg[] = [];
 let chatLogEl: HTMLElement | null = null; // the open log element, repainted in place
+// Mode-switch reconciliation: after tapping the mode chip we show "switching…"
+// until the observed mode actually changes (or a timeout).
+let chatModeSwitching = false;
+let chatModeBefore = "";
 
 /** Subscribe to a pane's chat (idempotent); resets the local model so the fresh
  * snapshot replaces cleanly. */
@@ -1615,7 +1619,10 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
     | null
     | undefined;
 
-  // Sticky header: status pill + observed mode.
+  // The observed mode changed → our pending switch is reconciled.
+  if (chatModeSwitching && mode && mode !== chatModeBefore) chatModeSwitching = false;
+
+  // Sticky header: status pill + observed/switch-able mode.
   const head = document.createElement("div");
   head.className = "cc-head";
   const pill = document.createElement("span");
@@ -1623,13 +1630,39 @@ function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement
   pill.textContent =
     status === "awaiting-approval" ? "Awaiting approval" : status === "working" ? "Working…" : "Idle";
   head.appendChild(pill);
-  if (mode) {
-    const modeEl = document.createElement("span");
+  if (mode || chatModeSwitching) {
+    const modeEl = document.createElement("button");
     modeEl.className = "cc-mode";
-    modeEl.textContent = mode;
+    modeEl.textContent = chatModeSwitching ? "switching…" : mode;
+    modeEl.title = "cycle Claude's permission mode (Shift+Tab)";
+    if (isController) {
+      modeEl.addEventListener("click", () => {
+        chatModeBefore = mode;
+        chatModeSwitching = true;
+        sendJson({ type: "chat_mode", pane });
+        modeEl.textContent = "switching…";
+        // Give up the "switching…" label if no mode change is observed.
+        window.setTimeout(() => {
+          if (chatModeSwitching) {
+            chatModeSwitching = false;
+            if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+          }
+        }, 8000);
+      });
+    } else {
+      modeEl.disabled = true;
+    }
     head.appendChild(modeEl);
   }
   root.appendChild(head);
+
+  // Waiting-for-reply nudge: Claude went idle after a needs-input event.
+  if (status === "idle" && paneClaudeStatus(pane) === "waiting") {
+    const wait = document.createElement("div");
+    wait.className = "cc-note cc-waiting";
+    wait.textContent = "Claude is waiting for your reply — type below.";
+    root.appendChild(wait);
+  }
 
   // Pending approval, joined to its (approve-only) card if we have it.
   if (ask && ask.tool_name) {

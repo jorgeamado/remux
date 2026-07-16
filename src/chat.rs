@@ -37,8 +37,9 @@ const READ_CHUNK: u64 = 1024 * 1024;
 
 /// A rendered message before it enters the ring: (role, kind, text).
 pub type Rendered = (&'static str, &'static str, String);
-/// read_new output: (rendered messages, new tail state, reset?).
-type ReadOutput = (Vec<Rendered>, Tailer, bool);
+/// read_new output: (rendered messages, new tail state, reset?, latest observed
+/// permission mode this read, if any).
+type ReadOutput = (Vec<Rendered>, Tailer, bool, Option<String>);
 
 /// One rendered chat message. `seq` is monotonic *within a generation*.
 #[derive(Clone, Serialize, Debug, PartialEq)]
@@ -196,6 +197,19 @@ impl ChatStore {
 // Transcript parsing (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// Extract the permission mode from a transcript `permission-mode` record (Claude
+/// writes one when the mode changes), for honest mode reconciliation after a
+/// Shift+Tab. `None` for any other record.
+pub fn parse_mode_record(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(line).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("permission-mode") {
+        return None;
+    }
+    v.get("permissionMode")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Render one transcript JSONL record into 0+ chat messages. Only user/assistant
 /// text and tool NAMES survive; thinking, tool_result, and other record types
 /// (permission-mode, mode, summary, …) render to nothing.
@@ -301,7 +315,7 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
         let p2 = pane.clone();
         let prev = state.take();
         let read = tokio::task::spawn_blocking(move || read_new(&path, prev)).await;
-        let (msgs, new_state, reset) = match read {
+        let (msgs, new_state, reset, mode) = match read {
             Ok(Some(r)) => r,
             _ => {
                 state = None;
@@ -314,6 +328,11 @@ async fn tail_pane(app: Arc<App>, pane: String, session_id: String) {
         }
         if !msgs.is_empty() {
             app.chat.append(&p2, gen_counter.max(1), msgs);
+        }
+        // Reconcile the observed permission mode from the transcript (Shift+Tab
+        // writes a permission-mode record but fires no agent_session hook).
+        if let Some(m) = mode {
+            app.agents.set_session(&p2, &session_id, None, Some(m));
         }
         state = Some(new_state);
     }
@@ -336,6 +355,7 @@ fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
     };
 
     let mut out = Vec::new();
+    let mut latest_mode: Option<String> = None;
     if len > offset {
         let to_read = (len - offset).min(READ_CHUNK);
         file.seek(SeekFrom::Start(offset)).ok()?;
@@ -353,7 +373,11 @@ fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
                 let mut full = std::mem::take(&mut partial);
                 full.extend_from_slice(&line);
                 if let Ok(s) = std::str::from_utf8(&full) {
-                    out.extend(render_record(s.trim_end()));
+                    let s = s.trim_end();
+                    out.extend(render_record(s));
+                    if let Some(m) = parse_mode_record(s) {
+                        latest_mode = Some(m); // keep the last mode seen this read
+                    }
                 }
             } else {
                 // Trailing partial line — buffer for next poll.
@@ -369,6 +393,7 @@ fn read_new(path: &str, prev: Option<Tailer>) -> Option<ReadOutput> {
             partial,
         },
         reset,
+        latest_mode,
     ))
 }
 
@@ -462,6 +487,23 @@ mod tests {
             render_record(r#"{"type":"permission-mode","permissionMode":"default"}"#).is_empty()
         );
         assert!(render_record("not json").is_empty());
+    }
+
+    #[test]
+    fn parses_permission_mode_records() {
+        assert_eq!(
+            parse_mode_record(r#"{"type":"permission-mode","permissionMode":"acceptEdits"}"#),
+            Some("acceptEdits".into())
+        );
+        assert_eq!(
+            parse_mode_record(r#"{"type":"mode","mode":"normal"}"#),
+            None
+        );
+        assert_eq!(
+            parse_mode_record(r#"{"type":"user","message":{"content":"hi"}}"#),
+            None
+        );
+        assert_eq!(parse_mode_record("not json"), None);
     }
 
     #[test]

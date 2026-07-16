@@ -104,6 +104,10 @@ enum ClientMsg {
         pane: String,
         text: String,
     },
+    /// Cycle Claude's permission mode in `pane` (Shift+Tab). Controller-only.
+    ChatMode {
+        pane: String,
+    },
     Ping,
 }
 
@@ -1025,6 +1029,28 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             let _ = tokio::task::spawn_blocking(move || {
                                 tmux::send_keys(&p, &text)
                                     .and_then(|_| tmux::send_named(&p, &["Enter"]))
+                            })
+                            .await;
+                        }
+                    }
+                    Ok(ClientMsg::ChatMode { pane }) => {
+                        // Cycle Claude's permission mode: Shift+Tab (tmux `BTab`).
+                        // Controller-only, this session's pane, rate-limited. The
+                        // displayed mode reconciles from the next hook/transcript.
+                        let now = std::time::Instant::now();
+                        let spaced = last_pane_action
+                            .is_none_or(|t| now.duration_since(t) >= PANE_ACTION_MIN_INTERVAL);
+                        let in_session = app.topology.borrow().iter().any(|s| {
+                            s.name == session
+                                && s.windows
+                                    .iter()
+                                    .any(|w| w.panes.iter().any(|p| p.id == pane))
+                        });
+                        if controller && in_session && spaced {
+                            last_pane_action = Some(now);
+                            let p = pane.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                tmux::send_named(&p, &["BTab"])
                             })
                             .await;
                         }

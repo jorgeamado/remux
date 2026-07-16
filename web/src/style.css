@@ -1053,10 +1053,23 @@ button {
 }
 .cc-mode {
   font-size: 11px;
-  color: var(--muted);
-  border: 1px solid var(--card-border);
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
   border-radius: 6px;
-  padding: 2px 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.cc-mode:disabled {
+  color: var(--muted);
+  background: none;
+  border-color: var(--card-border);
+  cursor: default;
+}
+.cc-waiting {
+  color: #e0b357;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--card-border);
 }
 .cc-log {
   flex: 1;

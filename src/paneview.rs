@@ -1673,6 +1673,8 @@ mod tests {
                 op_id: "op-1".into(),
                 tool: "Bash".into(),
             }],
+            transcript_path: None,
+            permission_mode: None,
         };
         // A matching card → awaiting-approval, exposing only tool name + card id.
         let v = build_claude_v1(&view, std::slice::from_ref(&card));

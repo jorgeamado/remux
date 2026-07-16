@@ -111,6 +111,24 @@ struct AgentStateEvent {
     tool_name: Option<String>,
 }
 
+/// Session metadata (feeds the chat companion): the transcript file + the last
+/// observed permission mode. Separate from the coarse, hot-path `agent_state` so
+/// enriching it can't regress that event. Low-frequency (session start + mode).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionEvent {
+    #[allow(dead_code)]
+    v: u32,
+    #[allow(dead_code)]
+    kind: String,
+    pane: String,
+    session_id: String,
+    #[serde(default)]
+    transcript_path: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
 /// M4b permission event. Strict per-kind schema so the required fields can't be
 /// omitted and meaningless field combinations can't slip through a shared flat
 /// struct.
@@ -258,6 +276,13 @@ async fn handle(
             };
             write_ack(&mut write, &resp).await
         }
+        "agent_session" => {
+            let resp = match serde_json::from_str::<AgentSessionEvent>(line) {
+                Ok(ev) => process_agent_session(&app, ev),
+                Err(e) => json_err(&e.to_string()),
+            };
+            write_ack(&mut write, &resp).await
+        }
         _ => write_ack(&mut write, &json_err("unknown kind")).await,
     }
 }
@@ -347,6 +372,29 @@ fn process_agent_state(app: &App, ev: AgentStateEvent) -> serde_json::Value {
         _ => return json_err("unknown agent-state verb"),
     };
     app.agents.apply(&ev.pane, event);
+    serde_json::json!({ "ok": true })
+}
+
+fn process_agent_session(app: &App, ev: AgentSessionEvent) -> serde_json::Value {
+    if !valid_pane(&ev.pane) {
+        return json_err("bad pane id (want %N)");
+    }
+    let sid = agent_field(&ev.session_id);
+    if sid.is_empty() {
+        return json_err("missing session_id");
+    }
+    // The path is validated (canonicalized under ~/.claude/projects, fstat'd) by
+    // the chat tailer before it opens the file; here just strip control chars and
+    // bound length — transcript paths are longer than a coarse agent field.
+    let path = ev
+        .transcript_path
+        .map(|p| strip_control(&p).chars().take(512).collect::<String>())
+        .filter(|p| !p.is_empty());
+    let mode = ev
+        .permission_mode
+        .map(|m| agent_field(&m))
+        .filter(|m| !m.is_empty());
+    app.agents.set_session(&ev.pane, &sid, path, mode);
     serde_json::json!({ "ok": true })
 }
 

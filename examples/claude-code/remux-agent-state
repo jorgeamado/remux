@@ -42,11 +42,30 @@ case "$verb" in
     ;;
 esac
 
-# Bound the call: `remux emit` waits for an ingest ack (≈5s), and Claude waits
-# for its hooks — so cap the block if the daemon is wedged. Fire-and-forget.
-if command -v timeout >/dev/null 2>&1; then
-  timeout 3 "$bin" emit agent-state "${args[@]}" >/dev/null 2>&1 || true
-else
-  "$bin" emit agent-state "${args[@]}" >/dev/null 2>&1 || true
-fi
+emit() {
+  # Bound the call: `remux emit` waits for an ingest ack (≈5s) and Claude waits
+  # for its hooks — cap the block if the daemon is wedged. Fire-and-forget.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 "$bin" emit "$@" >/dev/null 2>&1 || true
+  else
+    "$bin" emit "$@" >/dev/null 2>&1 || true
+  fi
+}
+
+emit agent-state "${args[@]}"
+
+# On low-frequency verbs only (never per-tool), also send session metadata for
+# the chat companion: the transcript file + the current permission mode.
+case "$verb" in
+  session-start|prompt-submitted)
+    tpath="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)"
+    pmode="$(printf '%s' "$payload" | jq -r '.permission_mode // empty' 2>/dev/null)"
+    if [ -n "$tpath" ] || [ -n "$pmode" ]; then
+      sargs=(--session-id "$sid")
+      [ -n "$tpath" ] && sargs+=(--transcript-path "$tpath")
+      [ -n "$pmode" ] && sargs+=(--permission-mode "$pmode")
+      emit agent-session "${sargs[@]}"
+    fi
+    ;;
+esac
 exit 0

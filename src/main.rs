@@ -206,6 +206,27 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+            EmitCmd::AgentSession {
+                pane,
+                session_id,
+                transcript_path,
+                permission_mode,
+            } => {
+                if let Some(pane) = pane.or_else(|| std::env::var("TMUX_PANE").ok()) {
+                    let mut body = serde_json::json!({
+                        "v": 1, "kind": "agent_session", "pane": pane,
+                        "session_id": session_id,
+                    });
+                    if let Some(p) = transcript_path {
+                        body["transcript_path"] = p.into();
+                    }
+                    if let Some(m) = permission_mode {
+                        body["permission_mode"] = m.into();
+                    }
+                    let _ = ingest::request(&state_dir, body);
+                }
+                return Ok(());
+            }
             EmitCmd::CommandStart {
                 pane,
                 shell_id,

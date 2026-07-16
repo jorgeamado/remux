@@ -180,6 +180,23 @@ pub enum EmitCmd {
         #[arg(long)]
         tool_name: Option<String>,
     },
+    /// Session metadata for the chat companion: the transcript file + the
+    /// current permission mode. Low-frequency (session start + mode change),
+    /// separate from the hot `agent-state` path. Fire-and-forget.
+    AgentSession {
+        /// tmux pane id (%N). Defaults to $TMUX_PANE.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Agent session id.
+        #[arg(long)]
+        session_id: String,
+        /// Path to the session's transcript JSONL (validated by the daemon).
+        #[arg(long)]
+        transcript_path: Option<String>,
+        /// Current permission mode (default / acceptEdits / auto …).
+        #[arg(long)]
+        permission_mode: Option<String>,
+    },
 }
 
 /// The lifecycle transitions an `agent-state` event can carry.

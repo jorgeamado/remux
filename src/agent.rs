@@ -91,10 +91,16 @@ struct State {
     base: BaseStatus,
     /// Active ops in start order; the last is the "current" one.
     ops: Vec<Op>,
+    /// The session's transcript file (JSONL), learned from an `agent_session`
+    /// event — the source the chat tailer reads. `None` until known.
+    transcript_path: Option<String>,
+    /// Last observed Claude permission mode (default / acceptEdits / auto …).
+    /// Observational only; `None` until known.
+    permission_mode: Option<String>,
     updated: Instant,
 }
 
-/// A pane's agent state, as the projector reads it.
+/// A pane's agent state, as the projector / chat tailer reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentView {
     pub pane: String,
@@ -102,6 +108,8 @@ pub struct AgentView {
     pub base: BaseStatus,
     /// Active operations (op id + tool name), oldest first.
     pub ops: Vec<Op>,
+    pub transcript_path: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 /// Per-pane agent-state registry. Like the other registries, a payload-less
@@ -175,8 +183,42 @@ impl Registry {
                 session_id: s.session_id.clone(),
                 base: s.base,
                 ops: s.ops.clone(),
+                transcript_path: s.transcript_path.clone(),
+                permission_mode: s.permission_mode.clone(),
             })
             .collect()
+    }
+
+    /// Record session metadata (transcript path + permission mode) for `pane`,
+    /// from an `agent_session` event. Session-guarded like `apply`: a new session
+    /// takes over (fresh state), a matching one updates in place, a stale one is
+    /// ignored. Values are only overwritten when present (a mode-only update
+    /// keeps the known transcript path).
+    pub fn set_session(
+        &self,
+        pane: &str,
+        session_id: &str,
+        transcript_path: Option<String>,
+        permission_mode: Option<String>,
+    ) {
+        {
+            let mut map = self.inner.lock().unwrap();
+            // Reuse a matching-session entry; otherwise (absent or a different,
+            // superseded session) start fresh for this session.
+            let matches = map.get(pane).is_some_and(|s| s.session_id == session_id);
+            if !matches {
+                map.insert(pane.to_string(), State::fresh(session_id.to_string()));
+            }
+            let s = map.get_mut(pane).unwrap();
+            s.updated = Instant::now();
+            if transcript_path.is_some() {
+                s.transcript_path = transcript_path;
+            }
+            if permission_mode.is_some() {
+                s.permission_mode = permission_mode;
+            }
+        }
+        let _ = self.events.send(());
     }
 
     /// Drop entries whose pane is no longer live, or that have gone stale (TTL).
@@ -199,6 +241,8 @@ impl State {
             session_id,
             base: BaseStatus::Idle,
             ops: Vec::new(),
+            transcript_path: None,
+            permission_mode: None,
             updated: Instant::now(),
         }
     }
@@ -329,6 +373,30 @@ mod tests {
             },
         );
         assert_eq!(reg.views().len(), 1);
+    }
+
+    #[test]
+    fn set_session_stores_metadata_and_is_session_guarded() {
+        let reg = Registry::default();
+        started(&reg, "%1", "s1");
+        reg.apply("%1", Event::PromptSubmitted { session_id: "s1".into() });
+        // Session metadata for the current session updates in place.
+        reg.set_session("%1", "s1", Some("/t/s1.jsonl".into()), Some("default".into()));
+        let v = &reg.views()[0];
+        assert_eq!(v.transcript_path.as_deref(), Some("/t/s1.jsonl"));
+        assert_eq!(v.permission_mode.as_deref(), Some("default"));
+        assert_eq!(v.base, BaseStatus::Working); // didn't clobber status
+        // A mode-only update keeps the known path.
+        reg.set_session("%1", "s1", None, Some("acceptEdits".into()));
+        let v = &reg.views()[0];
+        assert_eq!(v.transcript_path.as_deref(), Some("/t/s1.jsonl"));
+        assert_eq!(v.permission_mode.as_deref(), Some("acceptEdits"));
+        // A different session replaces (fresh) — old path is gone.
+        reg.set_session("%1", "s2", Some("/t/s2.jsonl".into()), None);
+        let v = &reg.views()[0];
+        assert_eq!(v.session_id, "s2");
+        assert_eq!(v.transcript_path.as_deref(), Some("/t/s2.jsonl"));
+        assert_eq!(v.permission_mode, None);
     }
 
     #[test]

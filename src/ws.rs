@@ -1034,10 +1034,14 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                         press_seen.push_back(request_id.clone());
                         // Rate cap BEFORE any tmux work (same rationale as pane
                         // actions: no CPU-flooding the daemon with tiny frames).
+                        // Capped attempts don't re-arm the interval — a sliding
+                        // cap would let sustained spam starve legitimate retries.
                         let now = std::time::Instant::now();
                         let capped =
                             last_press.is_some_and(|t| now.duration_since(t) < PRESS_MIN_INTERVAL);
-                        last_press = Some(now);
+                        if !capped {
+                            last_press = Some(now);
+                        }
                         let status = if capped {
                             "rate_limited"
                         } else if (echo_cols, echo_rows) != (cols, rows) {

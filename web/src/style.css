@@ -445,14 +445,49 @@ button {
 /* ---------- key panel ---------- */
 
 #keyrow,
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   display: flex;
   gap: 5px;
   overflow-x: auto;
 }
 
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   margin-bottom: 6px;
+}
+
+/* Agent-row keys teach their chord: a small word cap over the key label. */
+.key.capkey {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-height: 46px;
+  padding: 5px 4px;
+  white-space: nowrap;
+}
+
+.key .cap {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.key.capkey:active .cap {
+  color: inherit;
+}
+
+.key.danger {
+  color: var(--danger);
+}
+
+.key.danger:active {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
 }
 
 .key {

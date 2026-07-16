@@ -180,6 +180,37 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
     .poll(async () => terminalText(page), { timeout: 10_000 })
     .toContain("direct4typing");
 
+  // --- Key deck: touch env with no on-screen keyboard → auto-expanded:
+  // agent row and nav/symbols row are up, ^C sits in the primary row. ---
+  await expect(page.locator("#keyrow-agent")).toBeVisible();
+  await expect(page.locator("#keyrow-more")).toBeVisible();
+  await page.locator('.key[data-key="ctrl-c"]').click();
+  await expect
+    .poll(async () => terminalText(page), { timeout: 5_000 })
+    .toContain("$");
+
+  // "Extra keys: off" pins the deck compact — only the primary row stays.
+  await page.locator("#menu-btn").click();
+  await expect(page.locator("#keydeck-btn")).toHaveText("Extra keys: auto");
+  await page.locator("#keydeck-btn").click(); // auto → always
+  await page.locator("#keydeck-btn").click(); // always → off
+  await page.locator("#menu-btn").click(); // close menu
+  await expect(page.locator("#keyrow-agent")).toBeHidden();
+  await expect(page.locator("#keyrow-more")).toBeHidden();
+
+  // While compact, "…" still toggles the nav/symbols row.
+  await page.locator("#more-key").click();
+  await expect(page.locator("#keyrow-more")).toBeVisible();
+  await page.locator("#more-key").click();
+  await expect(page.locator("#keyrow-more")).toBeHidden();
+
+  // Back to auto: the deck expands again (still no keyboard).
+  await page.locator("#menu-btn").click();
+  await page.locator("#keydeck-btn").click(); // off → auto
+  await expect(page.locator("#keydeck-btn")).toHaveText("Extra keys: auto");
+  await page.locator("#menu-btn").click(); // close menu
+  await expect(page.locator("#keyrow-agent")).toBeVisible();
+
   // --- Windows: create a second window via the + menu; the live topology
   // (M3a) surfaces it as a tab (M3b), then switch back via the tabs. ---
   await page.locator("#tmux-btn").click();
@@ -202,16 +233,6 @@ test("pair, observe, take control, run a command, reconnect", async ({ page }) =
   await expect(
     page.locator("#window-tabs .wtab.active")
   ).toHaveText(/^0:/);
-
-  // --- Key row: ^C lives in the "…" overflow row. ---
-  await page.locator("#more-key").click();
-  await expect(page.locator("#keyrow-more")).toBeVisible();
-  await page.locator('.key[data-key="ctrl-c"]').click();
-  await page.locator("#more-key").click();
-  await expect(page.locator("#keyrow-more")).toBeHidden();
-  await expect
-    .poll(async () => terminalText(page), { timeout: 5_000 })
-    .toContain("$");
 
   // --- Command composer: sends a full line, records history. ---
   await page.locator("#composer-input").fill("echo composed$((3+3))ok");

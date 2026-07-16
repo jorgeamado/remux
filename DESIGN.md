@@ -224,6 +224,21 @@ wake lock while visible.
   (close handling is per-socket now); session-name validation relaxed to
   tmux's own rules (`:` `.` control chars) so listed sessions with spaces
   are attachable.
+- **Multi-machine (R1, slice 1 — 2026-07-16, design consult with Codex)**: one
+  installed PWA attaches to several daemons. Independent daemons + multi-host
+  client; explicitly NOT a hub (a relay hop for terminal bytes and a single
+  point of failure). Server: `/api/meta` (persistent `machine_id`, name,
+  protocol/capabilities), `--allowed-client-origin` (exact-origin grant +
+  scoped CORS on `/api/*` — distinct from the hostname-based `--allowed-host`),
+  `--machine-name`. Client: per-machine `{token, session}` records (localStorage,
+  mirrored to IndexedDB for the SW), add-machine flow, switcher with
+  **single-active-connection** (a live socket to a background machine would
+  suppress its Web Push — push delivery skips connected devices — and linger
+  as a phantom tmux client); the SW fans out attention/permission queries
+  across machines on push. Push subscription stays home-machine-only (one SW
+  subscription, bound to one VAPID key). Later slices: PTY-free dashboard
+  channel + aggregation, ssh ingest-socket forwarding, network ingest for
+  mosh (scoped producer tokens), remote permission WSS, push coordinator.
 - **V2**: control-mode metadata client (panes as cards/tabs), snapshot/delta sync +
   custom renderer, server-paged scrollback, paste confirmation UX.
 - **V3**: shell integration (OSC 133 / hooks), semantic feed ("chat mode"),

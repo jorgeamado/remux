@@ -472,3 +472,120 @@ async fn permission_decide_confirms_write() {
     // Consumed.
     assert!(app.perms.snapshot().is_empty());
 }
+
+// ---------- multi-machine: /api/meta + client-origin CORS ----------
+
+#[tokio::test]
+async fn meta_requires_auth_and_reports_identity() {
+    let (addr, app) = common::start_server_with("it-meta", &[]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/api/meta"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "t").unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/meta"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["machine_id"], app.machine_id);
+    assert_eq!(body["name"], "test-machine");
+    assert_eq!(body["protocol"]["api"], 1);
+    assert!(body["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "terminal"));
+}
+
+#[tokio::test]
+async fn allowlisted_client_origin_gets_cors_on_api() {
+    let (addr, app) =
+        common::start_server_with("it-cors", &["https://home.ts.net:7777"]).await;
+    let client = reqwest::Client::new();
+
+    // Preflight (what the browser sends before a cross-origin authed fetch).
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/api/meta"))
+        .header("Origin", "https://home.ts.net:7777")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let h = resp.headers();
+    assert_eq!(
+        h.get("access-control-allow-origin").unwrap(),
+        "https://home.ts.net:7777"
+    );
+    assert_eq!(h.get("access-control-allow-methods").unwrap(), "GET, POST");
+    assert_eq!(
+        h.get("access-control-allow-headers").unwrap(),
+        "authorization, content-type"
+    );
+
+    // Actual request: grant echoed, Vary set, and the endpoint works.
+    let pairing = app.auth.new_pairing_token();
+    let token = app.auth.pair(&pairing, "t").unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/meta"))
+        .header("Origin", "https://home.ts.net:7777")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://home.ts.net:7777"
+    );
+    assert_eq!(resp.headers().get("vary").unwrap(), "Origin");
+}
+
+#[tokio::test]
+async fn client_origin_is_exact_not_hostname() {
+    // The grant is the whole origin: same hostname on a different scheme or
+    // port must NOT pass the guard (that's what --allowed-host would do).
+    let (addr, _app) =
+        common::start_server_with("it-cors-exact", &["https://home.ts.net:7777"]).await;
+    let client = reqwest::Client::new();
+    for origin in [
+        "http://home.ts.net:7777",  // scheme downgrade
+        "https://home.ts.net",      // different (default) port
+        "https://home.ts.net:7778", // different port
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/api/health"))
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "origin: {origin}");
+    }
+}
+
+#[tokio::test]
+async fn foreign_origin_without_allowlist_gets_no_cors() {
+    // Same-origin (host-allowlisted) requests are served but never get a CORS
+    // grant — the browser doesn't need one, and echoing would be a footgun.
+    let (addr, _app) = common::start_server_with("it-cors-none", &[]).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/health"))
+        .header("Origin", format!("http://127.0.0.1:{}", addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+}

@@ -20,7 +20,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let state_dir = dirs::data_dir().context("no data dir")?.join("remux");
+    // Honor $XDG_DATA_HOME on every platform, not just Linux: the tests (and
+    // any multi-daemon setup) rely on it for state isolation, and on macOS
+    // `dirs::data_dir()` ignores it — which made an isolated test daemon trip
+    // over the real daemon's single-instance guard.
+    let state_dir = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::data_dir)
+        .context("no data dir")?
+        .join("remux");
 
     let args = match Cli::parse().cmd {
         Cmd::Serve(args) => args,
@@ -242,6 +251,24 @@ async fn main() -> Result<()> {
     allowed_hosts.sort();
     allowed_hosts.dedup();
 
+    // Fail fast on a malformed --allowed-client-origin: a typo silently
+    // ignored would read as "multi-machine is broken" much later, on the phone.
+    let mut allowed_client_origins = Vec::new();
+    for raw in &args.allowed_client_origins {
+        let origin = remux::normalize_origin(raw).with_context(|| {
+            format!("--allowed-client-origin {raw:?} is not a valid http(s) origin")
+        })?;
+        allowed_client_origins.push(origin);
+    }
+    allowed_client_origins.sort();
+    allowed_client_origins.dedup();
+
+    let machine_id = remux::machine_id(&state_dir)?;
+    let machine_name = args
+        .machine_name
+        .clone()
+        .unwrap_or_else(remux::default_machine_name);
+
     tmux::ensure_session(&args.session)?;
     tracing::info!(session = %args.session, "tmux session ready");
 
@@ -265,6 +292,9 @@ async fn main() -> Result<()> {
 
     let app = Arc::new(App {
         allowed_hosts,
+        allowed_client_origins,
+        machine_id,
+        machine_name,
         auth,
         args,
         attention: tokio::sync::broadcast::channel(16).0,

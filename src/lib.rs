@@ -199,6 +199,19 @@ pub struct Args {
     #[arg(long = "allowed-host")]
     pub allowed_hosts: Vec<String>,
 
+    /// Exact origin (scheme://host[:port]) of a remux PWA served by ANOTHER
+    /// machine that may use this daemon cross-origin (multi-machine setup:
+    /// the phone installs the PWA from one machine and adds the others).
+    /// Grants that origin CORS on /api/* and websocket access. Repeatable.
+    /// Unlike --allowed-host this matches the whole origin, not the hostname.
+    #[arg(long = "allowed-client-origin")]
+    pub allowed_client_origins: Vec<String>,
+
+    /// Human-readable name for this machine, shown by multi-machine clients.
+    /// Defaults to the OS hostname.
+    #[arg(long)]
+    pub machine_name: Option<String>,
+
     /// Do not print a pairing token at startup.
     #[arg(long)]
     pub no_pair: bool,
@@ -242,6 +255,14 @@ pub struct App {
     pub args: Args,
     pub auth: auth::Auth,
     pub allowed_hosts: Vec<String>,
+    /// Normalized exact origins of foreign remux PWAs (see
+    /// `--allowed-client-origin`); ascii-serialized for byte comparison.
+    pub allowed_client_origins: Vec<String>,
+    /// Persistent random id for this daemon's machine (state dir), so clients
+    /// can key their per-machine records on something stabler than a URL.
+    pub machine_id: String,
+    /// Display name for this machine (`--machine-name`, default: hostname).
+    pub machine_name: String,
     /// Attention events, fanned out to websockets attached to the session
     /// and to the push dispatcher.
     pub attention: tokio::sync::broadcast::Sender<Attention>,
@@ -279,6 +300,66 @@ pub fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Canonical form of a web origin for exact matching: lowercased scheme+host,
+/// default port elided, no userinfo/path/query. `None` for anything that isn't
+/// a clean http(s) origin — including opaque origins and URLs with credentials.
+pub fn normalize_origin(s: &str) -> Option<String> {
+    let u = url::Url::parse(s.trim()).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return None;
+    }
+    // An origin has no path/query/fragment. Fail rather than strip: a config
+    // value like `https://host/pwa` would otherwise silently grant the whole
+    // host, which is more than the operator wrote down.
+    if !matches!(u.path(), "" | "/") || u.query().is_some() || u.fragment().is_some() {
+        return None;
+    }
+    match u.origin() {
+        url::Origin::Tuple(..) => Some(u.origin().ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
+/// Load (or create, first run) this machine's persistent random id.
+/// A corrupt/foreign-format file is regenerated rather than trusted: the id
+/// is only a client-side correlation key, never a credential.
+pub fn machine_id(state_dir: &std::path::Path) -> anyhow::Result<String> {
+    use rand::Rng;
+    let path = state_dir.join("machine.id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let id = existing.trim();
+        if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(id.to_string());
+        }
+    }
+    let mut buf = [0u8; 16];
+    rand::rng().fill_bytes(&mut buf);
+    let id = hex::encode(buf);
+    std::fs::write(&path, &id)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(id)
+}
+
+/// Default machine display name: the OS hostname (short form), or "remux".
+pub fn default_machine_name() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "remux".into())
+}
+
 pub fn host_of_url(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let host_port = rest.split('/').next()?;
@@ -288,6 +369,47 @@ pub fn host_of_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_origin_variants() {
+        // Canonicalization: case, default ports, trailing slash.
+        assert_eq!(
+            normalize_origin("HTTPS://Mac.TS.net:7777"),
+            Some("https://mac.ts.net:7777".into())
+        );
+        assert_eq!(
+            normalize_origin("https://mac.ts.net:443/"),
+            Some("https://mac.ts.net".into())
+        );
+        assert_eq!(
+            normalize_origin("http://localhost:5173"),
+            Some("http://localhost:5173".into())
+        );
+        // Rejected: credentials, non-http schemes, garbage, and anything
+        // beyond a bare origin (fail fast instead of granting more than
+        // the operator wrote).
+        assert_eq!(normalize_origin("https://a@evil.example"), None);
+        assert_eq!(normalize_origin("file:///etc/passwd"), None);
+        assert_eq!(normalize_origin("not an origin"), None);
+        assert_eq!(normalize_origin("https://mac.ts.net:7777/pwa"), None);
+        assert_eq!(normalize_origin("https://mac.ts.net:7777/?x=1"), None);
+        assert_eq!(normalize_origin("https://mac.ts.net:7777/#f"), None);
+    }
+
+    #[test]
+    fn machine_id_persists_and_survives_corruption() {
+        let dir = std::env::temp_dir().join(format!("remux-mid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = machine_id(&dir).unwrap();
+        let b = machine_id(&dir).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        std::fs::write(dir.join("machine.id"), "not-hex!").unwrap();
+        let c = machine_id(&dir).unwrap();
+        assert_ne!(c, "not-hex!");
+        assert_eq!(c.len(), 32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn host_of_url_variants() {

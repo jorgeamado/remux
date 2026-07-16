@@ -13,6 +13,9 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", session, "--no-pair"]);
     Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,

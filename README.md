@@ -138,6 +138,8 @@ remux serve \
 | `--session` | `main` | tmux session to attach clients to (created if missing). |
 | `--tls-cert` / `--tls-key` | — | PEM cert/key (see `tailscale cert`). |
 | `--allowed-host` | — | Extra hostnames accepted by the Host/Origin guard. |
+| `--allowed-client-origin` | — | Exact origin of another machine's remux PWA allowed to use this daemon (see [Multiple machines](#multiple-machines)). |
+| `--machine-name` | hostname | Display name shown by multi-machine clients. |
 | `--url` | derived | Public URL used in the pairing QR. |
 | `--no-pair` | — | Don't print a pairing token at startup. |
 
@@ -171,6 +173,37 @@ loginctl enable-linger $USER   # keep it running while logged out
 ```
 
 Installed another way? Copy the unit to `~/.config/systemd/user/` first.
+
+### Multiple machines
+
+Run a daemon on every machine; the app installed from one of them (your
+"home" machine) can attach to all of them. Daemons stay fully independent —
+there is no hub, no relay: if a machine is up, you can reach it, regardless
+of the others.
+
+On each *other* machine, allow the home machine's PWA origin:
+
+```sh
+remux serve ... --machine-name laptop \
+  --allowed-client-origin https://home-mac.your-tailnet.ts.net:7777
+```
+
+Then in the app: session name → **Add machine…** → enter that machine's URL
+and a pairing link from `remux pair` on it. The switcher (same menu) moves
+between machines; exactly one machine is connected at a time — switching
+closes the previous connection on purpose, so backgrounded machines can
+still reach your lock screen via push and never linger as phantom tmux
+clients.
+
+Notes:
+- Machine URLs must be `https://` (localhost is exempt, for development).
+- Web Push (lock-screen delivery) comes from the home machine only for now —
+  other machines' events show in-app while you're attached, and the
+  notification tap re-checks every machine. A cross-machine push
+  coordinator is on the roadmap.
+- Simplest alternative: install each machine's own PWA and rename the icons
+  ("remux laptop", "remux server") — no flags needed, at the cost of one
+  icon per machine.
 
 ## Security model
 

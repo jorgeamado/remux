@@ -445,14 +445,63 @@ button {
 /* ---------- key panel ---------- */
 
 #keyrow,
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   display: flex;
   gap: 5px;
   overflow-x: auto;
 }
 
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   margin-bottom: 6px;
+}
+
+/* The nav/symbols row holds more keys than fit the width: size each to its
+   label and let the row scroll, instead of crushing "home" into 34px. */
+#keyrow-more .key {
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 8px 10px;
+}
+
+/* Agent-row keys teach their chord: a small word cap over the key label.
+   Same height as plain keys — mixed-height rows read as broken. */
+.key.capkey {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  min-height: 42px;
+  padding: 4px 2px 5px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.key .cap {
+  font-size: 8px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.key.capkey:active .cap {
+  color: inherit;
+}
+
+.key.danger {
+  color: var(--danger);
+}
+
+.key.danger:active {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
 }
 
 .key {

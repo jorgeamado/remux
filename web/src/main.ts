@@ -1,6 +1,7 @@
 import "./style.css";
 import { createTerminal } from "./term";
-import { setupKeyRow, applyCtrl, disarmCtrl } from "./keys";
+import { setupKeyRow, applyCtrl, disarmCtrl, keyDeckMode, setKeyDeckMode } from "./keys";
+import type { DeckMode } from "./keys";
 import { cellFromPoint, setupTouchScroll } from "./scroll";
 
 const TOKEN_KEY = "remux.device_token";
@@ -2422,6 +2423,16 @@ applyDebug();
 };
 (window as unknown as { __termCols?: () => number }).__termCols = () =>
   handle.size().cols;
+// Visible screen only (no scrollback) — lets tests assert that ^L actually
+// cleared, which __termText can't (cleared lines persist in scrollback).
+(window as unknown as { __termScreen?: () => string }).__termScreen = () => {
+  const b = handle.term.buffer.active;
+  let out = "";
+  for (let i = 0; i < handle.term.rows; i++) {
+    out += (b.getLine(b.baseY + i)?.translateToString(true) ?? "") + "\n";
+  }
+  return out;
+};
 (window as unknown as { __topology?: () => SessionTopo[] }).__topology = () =>
   topology;
 
@@ -2461,7 +2472,7 @@ function moveComposerCursor(target: "left" | "right" | "home" | "end"): void {
 /// inserts into the draft (that's why those keys exist — iOS buries them),
 /// and cursor keys edit the draft when there is one. Arrows on an empty
 /// field still reach the terminal — TUIs need them.
-const COMPOSER_INSERT = new Set(["-", "|", "/", "~"]);
+const COMPOSER_INSERT = new Set(["-", "_", "|", "/", "~", ":", "'", '"']);
 const COMPOSER_CURSOR: Record<string, "left" | "right" | "home" | "end"> = {
   "\x1b[D": "left",
   "\x1b[C": "right",
@@ -2574,6 +2585,30 @@ termkbBtn.addEventListener("click", () => {
   renderTermkbBtn();
 });
 renderTermkbBtn();
+
+// ---------- key deck mode ----------
+
+// "auto" expands the extra key rows whenever the on-screen keyboard is down;
+// "always"/"off" pin the deck open or closed regardless.
+const keydeckBtn = $<HTMLButtonElement>("keydeck-btn");
+const DECK_LABEL: Record<DeckMode, string> = {
+  auto: "auto",
+  expanded: "always",
+  compact: "off",
+};
+const DECK_NEXT: Record<DeckMode, DeckMode> = {
+  auto: "expanded",
+  expanded: "compact",
+  compact: "auto",
+};
+function renderKeydeckBtn(): void {
+  keydeckBtn.textContent = `Extra keys: ${DECK_LABEL[keyDeckMode()]}`;
+}
+keydeckBtn.addEventListener("click", () => {
+  setKeyDeckMode(DECK_NEXT[keyDeckMode()]);
+  renderKeydeckBtn();
+});
+renderKeydeckBtn();
 
 // When the on-screen keyboard opens, make sure the focused pairing field is
 // scrolled into the (now smaller) visual viewport rather than hidden behind it.

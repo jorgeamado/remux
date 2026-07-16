@@ -55,6 +55,7 @@
         <button id="paste-btn" class="btn">Paste</button>
         <button id="notify-btn" class="btn">Notifications: off</button>
         <button id="termkb-btn" class="btn">Direct typing: off</button>
+        <button id="keydeck-btn" class="btn">Extra keys: auto</button>
         <button id="feed-btn" class="btn">Command feed</button>
         <button id="devices-btn" class="btn">Devices</button>
         <button id="debug-btn" class="btn">Debug: off</button>
@@ -111,17 +112,41 @@
       </div>
 
       <footer id="keypanel">
+        <!-- Agent row: Claude Code driving keys. Shown when the on-screen
+             keyboard is down (auto deck) — that's when you're steering, not
+             typing. Word caps teach the chords. -->
+        <div id="keyrow-agent" hidden>
+          <button class="key capkey danger" data-key="ctrl-c" title="interrupt (ctrl+c)"
+                  aria-label="interrupt (ctrl+c)">
+            <span class="cap">stop</span>^c</button>
+          <button class="key capkey" data-key="shift-tab" title="cycle agent mode (shift+tab)"
+                  aria-label="cycle agent mode (shift+tab)">
+            <span class="cap">mode</span>&#x21E7;&#x21E5;</button>
+          <button class="key capkey" data-key="esc-esc" title="rewind (esc esc)"
+                  aria-label="rewind (esc esc)">
+            <span class="cap">esc&#x2009;esc</span>&#x21BA;</button>
+          <button class="key capkey" data-key="ctrl-r" title="transcript (ctrl+r)"
+                  aria-label="transcript (ctrl+r)">
+            <span class="cap">log</span>^r</button>
+          <button class="key capkey" data-key="ctrl-l" title="clear screen (ctrl+l)"
+                  aria-label="clear screen (ctrl+l)">
+            <span class="cap">clear</span>^l</button>
+        </div>
         <div id="keyrow-more" hidden>
-          <button class="key" data-key="ctrl-c">^c</button>
-          <button class="key" data-key="home">home</button>
-          <button class="key" data-key="end">end</button>
-          <button class="key" data-key="pgup">pgup</button>
-          <button class="key" data-key="pgdn">pgdn</button>
-          <button class="key" id="copy-key" title="copy screen + scrollback">&#x29C9; copy</button>
+          <button class="key" data-key="home" title="home" aria-label="home">&#x21F1;</button>
+          <button class="key" data-key="end" title="end" aria-label="end">&#x21F2;</button>
+          <button class="key" data-key="pgup" title="page up" aria-label="page up">&#x21DE;</button>
+          <button class="key" data-key="pgdn" title="page down" aria-label="page down">&#x21DF;</button>
+          <button class="key" id="copy-key" title="copy screen + scrollback"
+                  aria-label="copy screen and scrollback">&#x29C9;</button>
           <button class="key" data-key="dash">-</button>
+          <button class="key" data-key="underscore">_</button>
           <button class="key" data-key="pipe">|</button>
           <button class="key" data-key="slash">/</button>
           <button class="key" data-key="tilde">~</button>
+          <button class="key" data-key="colon">:</button>
+          <button class="key" data-key="quote">'</button>
+          <button class="key" data-key="dquote">"</button>
         </div>
         <div id="keyrow" hidden>
           <button class="key" data-key="esc">esc</button>
@@ -132,7 +157,7 @@
           <button class="key" data-key="left">&#x2190;</button>
           <button class="key" data-key="right">&#x2192;</button>
           <button class="key" data-key="enter">&#x21B5;</button>
-          <button class="key" id="more-key">&#x2026;</button>
+          <button class="key" id="more-key" aria-label="more keys">&#x2026;</button>
         </div>
       </footer>
 

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# remux-agent-state <verb> — Claude Code lifecycle hook adapter for the claude.v1
+# dashboard. Reads the hook's JSON payload on stdin, pulls session_id (+ the
+# tool_use_id/tool_name for operations), and fires `remux emit agent-state`.
+#
+# Fire-and-forget: it never blocks Claude and never fails the hook (any missing
+# field / tool / daemon just makes it a no-op). Coarse status only — it sends the
+# tool NAME, never tool input/output.
+#
+# Verb per hook:
+#   SessionStart     -> session-start
+#   UserPromptSubmit -> prompt-submitted
+#   PreToolUse       -> operation-started   (needs tool_use_id + tool_name)
+#   PostToolUse      -> operation-ended     (needs tool_use_id)
+#   Stop             -> idle
+#   SessionEnd       -> session-ended
+#   PreCompact       -> touch
+set -u
+
+verb="${1:-}"
+[ -n "$verb" ] || exit 0
+bin="${REMUX_BIN:-remux}"
+command -v "$bin" >/dev/null 2>&1 || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+payload="$(cat)"
+sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)"
+[ -n "$sid" ] || exit 0
+
+args=("$verb" --session-id "$sid")
+case "$verb" in
+  operation-started)
+    op="$(printf '%s' "$payload" | jq -r '.tool_use_id // empty' 2>/dev/null)"
+    tool="$(printf '%s' "$payload" | jq -r '.tool_name // empty' 2>/dev/null)"
+    [ -n "$op" ] && [ -n "$tool" ] || exit 0
+    args+=(--operation-id "$op" --tool-name "$tool")
+    ;;
+  operation-ended)
+    op="$(printf '%s' "$payload" | jq -r '.tool_use_id // empty' 2>/dev/null)"
+    [ -n "$op" ] || exit 0
+    args+=(--operation-id "$op")
+    ;;
+esac
+
+emit() {
+  # Bound the call: `remux emit` waits for an ingest ack (≈5s) and Claude waits
+  # for its hooks — cap the block if the daemon is wedged. Fire-and-forget.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 "$bin" emit "$@" >/dev/null 2>&1 || true
+  else
+    "$bin" emit "$@" >/dev/null 2>&1 || true
+  fi
+}
+
+emit agent-state "${args[@]}"
+
+# On low-frequency verbs only (never per-tool), also send session metadata for
+# the chat companion: the transcript file + the current permission mode.
+case "$verb" in
+  session-start|prompt-submitted)
+    tpath="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)"
+    pmode="$(printf '%s' "$payload" | jq -r '.permission_mode // empty' 2>/dev/null)"
+    if [ -n "$tpath" ] || [ -n "$pmode" ]; then
+      sargs=(--session-id "$sid")
+      [ -n "$tpath" ] && sargs+=(--transcript-path "$tpath")
+      [ -n "$pmode" ] && sargs+=(--permission-mode "$pmode")
+      emit agent-session "${sargs[@]}"
+    fi
+    ;;
+esac
+exit 0

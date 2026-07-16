@@ -193,6 +193,37 @@ body {
   font-weight: 600;
 }
 
+/* Claude pane status — tab badges + the active-pane chip. */
+.claude-dot {
+  margin-left: 5px;
+  font-size: 10px;
+  vertical-align: middle;
+}
+.claude-dot.claude-approval {
+  color: var(--accent-fg);
+}
+.claude-dot.claude-waiting {
+  color: #d9a441; /* amber — softer than approval */
+}
+#claude-chip {
+  margin: 6px 2px 0;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  width: fit-content;
+}
+#claude-chip.claude-approval {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent-fg);
+}
+#claude-chip.claude-waiting {
+  background: #2a230f;
+  border: 1px solid #6b551d;
+  color: #e0b357;
+}
+
 /* ---------- buttons ---------- */
 
 .btn {
@@ -531,6 +562,12 @@ button {
   color: var(--accent-fg);
   font-size: 13px;
   font-weight: 600;
+  /* now a button (tap → go to pane): strip default chrome. */
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
 }
 
 .perm-countdown {
@@ -672,4 +709,445 @@ button {
   color: var(--muted);
   font-size: 11px;
   margin-top: 2px;
+}
+
+/* ---------- Pane views (custom dashboards) ---------- */
+
+#dashboard-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: var(--bg);
+  padding: 12px;
+}
+
+.dash-empty {
+  color: var(--muted);
+  font-size: 14px;
+  padding: 16px 4px;
+}
+
+.ts-head {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 2px 2px 10px;
+}
+
+.ts-card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.ts-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ts-name {
+  font-weight: 600;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ts-badge {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.ts-badge.run {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.ts-badge.idle {
+  color: var(--muted);
+  border-color: var(--card-border);
+}
+.ts-badge.done {
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.ts-badge.err {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.ts-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 6px 0 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ts-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bar);
+  border: 1px solid var(--card-border);
+  overflow: hidden;
+}
+.ts-fill {
+  height: 100%;
+  background: var(--muted);
+  transition: width 0.4s ease;
+}
+.ts-fill.run {
+  background: var(--ok);
+}
+.ts-fill.done {
+  background: var(--accent);
+}
+.ts-fill.err {
+  background: var(--danger);
+}
+
+/* ---------- htop.v1 dashboard — an instrument panel over the real htop ---- */
+/* Dashboard panel has no padding for htop so the sticky toolbar spans full width. */
+#dashboard-panel:has(.ht) {
+  padding: 0;
+}
+
+.ht {
+  font-variant-numeric: tabular-nums;
+}
+
+/* System card: compact CPU + MEM bars, quiet metadata. Scrolls away. */
+.ht-sys {
+  padding: 10px 12px 8px;
+}
+.ht-sys-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+.ht-sys-l {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  width: 30px;
+}
+.ht-sys-v {
+  font-size: 13px;
+  font-weight: 600;
+  width: 108px;
+}
+.ht-sys-x {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ht-meter {
+  flex: 1;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.ht-meter-f {
+  height: 100%;
+  background: var(--ok);
+  transition: width 0.5s ease;
+}
+.ht-meter-f.warn {
+  background: var(--accent);
+}
+.ht-meter-f.crit {
+  background: var(--danger);
+}
+.ht-sys-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+/* Sticky toolbar: filter + tree, then the sort row. */
+.ht-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  padding: 6px 12px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ht-tbar-top {
+  display: flex;
+  gap: 8px;
+}
+.ht-filter {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: var(--input);
+  color: var(--fg);
+}
+.ht-filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ht-tool {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+.ht-tool.active {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent-soft);
+}
+.ht-sorts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+.ht-sorts-l {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  margin-right: 4px;
+}
+.ht-sort {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.ht-sort.active {
+  color: var(--accent-fg);
+  border-bottom-color: var(--accent);
+}
+.ht-sort.active::after {
+  content: " ↓";
+}
+
+/* Process list: continuous rows, a 3px CPU rail, no cards. */
+.ht-r {
+  position: relative;
+  padding: 6px 12px 7px 15px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  cursor: pointer;
+}
+.ht-r:active {
+  background: var(--card);
+}
+.ht-rail {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.ht-rail-f {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  background: var(--muted);
+  transition: height 0.5s ease;
+}
+.ht-rail-f.warn {
+  background: var(--accent);
+}
+.ht-rail-f.crit {
+  background: var(--danger);
+}
+.ht-r-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ht-cmd {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ht-cpu {
+  flex: none;
+  font-size: 15px;
+  font-weight: 600;
+  min-width: 3.4em;
+  text-align: right;
+}
+.ht-cpu.warn {
+  color: var(--accent-fg);
+}
+.ht-cpu.crit {
+  color: var(--danger);
+}
+.ht-r-sub {
+  margin-top: 1px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.ht-nums {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* claude.v1 dashboard. */
+.claude-dash {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.claude-status {
+  font-size: 20px;
+  font-weight: 700;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+}
+.claude-status.claude-working {
+  color: #e0b357;
+  border-color: #6b551d;
+}
+.claude-status.claude-awaiting-approval {
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.claude-status.claude-idle {
+  color: var(--muted);
+}
+.claude-ask {
+  font-size: 14px;
+  color: var(--fg);
+}
+.claude-meta,
+.claude-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Copy overlay: pane screen + scrollback as selectable text. */
+#copy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+}
+#copy-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  border-bottom: 1px solid var(--card-border);
+}
+#copy-title {
+  color: var(--muted);
+  font-size: 12px;
+}
+#copy-text {
+  flex: 1;
+  margin: 0;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* The whole point: let the phone select this text natively. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Source-declared actions: a core button above a dashboard that opens the
+   generic popup with the view's menu options. */
+.dash-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 2px 12px;
+}
+.dash-actions-btn {
+  padding: 8px 16px;
+  font-size: 13px;
+}
+
+/* Generic popup primitive — a bottom sheet any pane view can raise. Options
+   stack vertically so a menu of 2+ choices reads cleanly on a phone. */
+.rx-popup-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-end;
+}
+.rx-popup {
+  width: 100%;
+  background: var(--card);
+  border-top: 1px solid var(--card-border);
+  border-radius: 16px 16px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+}
+.rx-popup-title {
+  font-size: 14px;
+  word-break: break-all;
+}
+.rx-popup-detail {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 6px 0 16px;
+}
+.rx-popup-btns {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rx-popup-btn {
+  width: 100%;
+  padding: 12px;
+  text-align: center;
+}
+.rx-popup-btn.rx-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.rx-popup-btn.rx-cancel {
+  color: var(--muted);
 }

@@ -299,6 +299,7 @@ function connect(): void {
     paneTabs.hidden = true;
     clearPermissionCards();
     clearFeed();
+    clearPaneViews();
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -359,12 +360,27 @@ interface ControlMsg {
   sessions?: SessionTopo[];
   /** attention frames: event kind + optional hook-fed detail */
   kind?: string;
+  pane?: string;
   reason?: string;
   source?: string;
+  /** pane_capture frames (copy overlay): captured text + truncation flag */
+  text?: string;
+  truncated?: boolean;
   /** permission_cards frames (M4b) */
   cards?: PermissionCard[];
   /** command_feed frames (M4c) */
   commands?: FeedCommand[];
+  /** pane_views frames: structured per-pane state for custom renderers */
+  views?: PaneView[];
+}
+
+/** A pane's structured view state, rendered as a custom interface. */
+interface PaneView {
+  pane: string;
+  view: string;
+  rev: number;
+  // Shape depends on `view`; the renderer for that view id validates it.
+  state: Record<string, unknown>;
 }
 
 /** A shell command in the session feed (M4c). Mirrors the daemon's Cmd view. */
@@ -428,16 +444,23 @@ function handleControl(msg: ControlMsg): void {
       topology = msg.sessions ?? [];
       renderTabs();
       maybeAutoZoom();
+      refreshPaneView(); // the active pane may have changed → re-pick its view
       if (!sessionMenu.hidden) openSessionMenu(); // refresh open picker live
       break;
     case "attention":
-      onAttention();
+      onAttention(msg);
       break;
     case "permission_cards":
       renderPermissionCards(msg.cards ?? []);
       break;
     case "command_feed":
       onCommandFeed(msg.commands ?? []);
+      break;
+    case "pane_views":
+      onPaneViews(msg.views ?? []);
+      break;
+    case "pane_capture":
+      openCopyOverlay(msg.text ?? "", msg.truncated ?? false);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -462,6 +485,15 @@ function handleControl(msg: ControlMsg): void {
         // Fall back to the server default; onclose will reconnect.
         localStorage.removeItem(SESSION_KEY);
         showHint("Session unavailable — using default");
+      } else if (msg.code === "release_failed") {
+        // We tried to open the dashboard, which releases terminal control — but
+        // tmux didn't demote us, so we're still driving size. Don't leave the
+        // dashboard covering a terminal we still control (the hidden xterm would
+        // keep shrinking the desktop); revert to the terminal.
+        if (dashboardMode) setDashboard(false);
+        showHint("Couldn't switch to Dashboard — still controlling the terminal");
+      } else if (msg.code === "capture_unavailable") {
+        showHint("Couldn't capture the pane");
       }
       break;
   }
@@ -524,6 +556,7 @@ function switchSession(name: string): void {
   // (superseded), so onclose won't, and the new session may have an empty feed
   // the daemon stays silent about — leaving stale cards without this.
   clearFeed();
+  clearPaneViews(); // per-pane views belong to the old session — drop them
   handle.term.reset(); // fresh grid; the new attach repaints everything
   connect();
 }
@@ -617,6 +650,8 @@ function renderTabs(): void {
       tab.className = `wtab${w.active ? " active" : ""}`;
       const panes = w.panes.length > 1 ? ` ·${w.panes.length}` : "";
       tab.textContent = `${w.index}: ${w.name}${panes}`;
+      const badge = statusBadge(windowClaudeStatus(w));
+      if (badge) tab.appendChild(badge);
       tab.addEventListener("click", () => {
         if (!w.active) windowAction("select_window", w.index);
       });
@@ -627,6 +662,7 @@ function renderTabs(): void {
     windowTabs.hidden = true;
   }
   renderPaneTabs();
+  renderClaudeChip();
 }
 
 /// When the active window is split, its panes become tabs — so a split can be
@@ -647,6 +683,8 @@ function renderPaneTabs(): void {
     const tab = document.createElement("button");
     tab.className = `wtab${p.active ? " active" : ""}`;
     tab.textContent = `${p.index}: ${p.command || "sh"}`;
+    const badge = statusBadge(paneClaudeStatus(p.id));
+    if (badge) tab.appendChild(badge);
     tab.addEventListener("click", () => {
       if (!p.active) windowAction("select_pane", p.index);
     });
@@ -654,6 +692,96 @@ function renderPaneTabs(): void {
   }
   paneTabs.hidden = false;
 }
+
+// ---------- Claude pane status (slice 1) ----------
+// A pane-scoped "what is Claude doing" signal, derived entirely from existing
+// hook data — no new store, nothing persisted, no screen-scraping:
+//   • "approval" — a live permission card exists for the pane (approve-only data,
+//     so this badge only appears on approve-capable devices).
+//   • "waiting"  — an agent_needs_input event fired for the pane recently (TTL).
+// Never inferred "working": the daemon can't reliably know that yet.
+type ClaudeStatus = "approval" | "waiting" | null;
+const CLAUDE_WAIT_TTL_MS = 45_000;
+// pane id -> wall-clock ms until which we treat the pane as waiting for input.
+const claudeWaiting = new Map<string, number>();
+
+function paneClaudeStatus(paneId: string): ClaudeStatus {
+  if (permCards.some((c) => c.pane === paneId)) return "approval";
+  const until = claudeWaiting.get(paneId);
+  if (until !== undefined && until > Date.now()) return "waiting";
+  return null;
+}
+
+/** Highest-severity Claude status across a window's panes (approval > waiting). */
+function windowClaudeStatus(w: WindowTopo): ClaudeStatus {
+  let out: ClaudeStatus = null;
+  for (const p of w.panes) {
+    const s = paneClaudeStatus(p.id);
+    if (s === "approval") return "approval";
+    if (s === "waiting") out = "waiting";
+  }
+  return out;
+}
+
+/** A small colored dot badge for a tab, or null when the pane/window is calm. */
+function statusBadge(s: ClaudeStatus): HTMLElement | null {
+  if (!s) return null;
+  const dot = document.createElement("span");
+  dot.className = `claude-dot claude-${s}`;
+  dot.textContent = s === "approval" ? "⌘" : "⏳"; // ⌘ / ⏳
+  dot.title = s === "approval" ? "approval required" : "waiting for input";
+  return dot;
+}
+
+/** Select the window+pane a Claude event/card came from. */
+function navigateToPane(paneId: string): void {
+  const sess = topology.find((s) => s.name === sessionTitle);
+  if (!sess) return;
+  for (const w of sess.windows) {
+    const p = w.panes.find((pp) => pp.id === paneId);
+    if (!p) continue;
+    if (!w.active) windowAction("select_window", w.index);
+    if (!p.active) windowAction("select_pane", p.index);
+    return;
+  }
+}
+
+const claudeChip = $("claude-chip");
+/** The active pane's own status, shown when there's no tab to badge (or as a
+ * quick at-a-glance for the current pane). */
+function renderClaudeChip(): void {
+  const pane = activePaneId();
+  const s = pane ? paneClaudeStatus(pane) : null;
+  claudeChip.textContent = "";
+  if (!s) {
+    claudeChip.hidden = true;
+    return;
+  }
+  claudeChip.className = `claude-chip claude-${s}`;
+  claudeChip.textContent =
+    s === "approval" ? "⌘ approval required" : "⏳ Claude waiting for input";
+  claudeChip.hidden = false;
+}
+
+/** Re-render every surface that reflects Claude status (renderTabs also paints
+ * the pane tabs and the active-pane chip). */
+function refreshClaudeStatus(): void {
+  renderTabs();
+}
+
+// Expire "waiting" entries and repaint. One cheap timer for the whole app.
+window.setInterval(() => {
+  if (claudeWaiting.size === 0) return;
+  const now = Date.now();
+  let changed = false;
+  for (const [pane, until] of claudeWaiting) {
+    if (until <= now) {
+      claudeWaiting.delete(pane);
+      changed = true;
+    }
+  }
+  if (changed) refreshClaudeStatus();
+}, 5000);
 
 // ---------- M4b permission cards ----------
 
@@ -676,6 +804,10 @@ function renderPermissionCards(cards: PermissionCard[]): void {
     permTicker = window.setInterval(paintPermissionCards, 1000);
   }
   paintPermissionCards(); // may stop the ticker if nothing is live
+  refreshClaudeStatus(); // "approval" badge/chip follows the live card set
+  // The claude.v1 dashboard joins a pending card by id — if it rendered before
+  // the card frame arrived, re-render now so Approve/Deny appears inline.
+  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
 }
 
 function clearPermissionCards(): void {
@@ -707,10 +839,13 @@ function permCardEl(card: PermissionCard, left: number): HTMLElement {
 
   const head = document.createElement("div");
   head.className = "perm-head";
-  const title = document.createElement("span");
+  const title = document.createElement("button");
   title.className = "perm-title";
-  // source is the agent, tool is what it wants to run.
-  title.textContent = `${card.source} · ${card.tool}`;
+  // source is the agent, tool is what it wants to run. Tapping jumps to the
+  // originating pane (the terminal is the canonical view for the full context).
+  title.textContent = `${card.source} · ${card.tool} →`;
+  title.title = "go to this pane";
+  title.addEventListener("click", () => navigateToPane(card.pane));
   const countdown = document.createElement("span");
   countdown.className = "perm-countdown";
   countdown.textContent = `${left}s`;
@@ -837,6 +972,652 @@ function clearFeed(): void {
   feedCommands = [];
   endRecall(); // recall list is per-session; reset on switch
   if (feedOpen) paintFeed();
+}
+
+// ---------- Pane views (custom dashboards) ----------
+
+const dashboardPanel = $("dashboard-panel");
+const viewToggleBtn = $<HTMLButtonElement>("view-toggle-btn");
+let paneViews: PaneView[] = [];
+let dashboardMode = false;
+// The pane we've asked the daemon to hold at capture resolution (view_mode).
+let dashPane: string | null = null;
+
+/** The view for the pane we're actually looking at. Only falls back to the
+ *  first available while topology is still unknown — otherwise a split could
+ *  show an unrelated pane's dashboard. */
+function currentView(): PaneView | undefined {
+  if (paneViews.length === 0) return undefined;
+  const active = activePaneId();
+  if (active === undefined) return paneViews[0]; // topology not loaded yet
+  return paneViews.find((v) => v.pane === active);
+}
+
+/** Re-evaluate the toggle + dashboard against the current view. Called on a new
+ *  pane_views frame AND on topology changes (the active pane may have moved). */
+function refreshPaneView(): void {
+  const v = currentView();
+  // The toggle only exists while a source is streaming a view for THIS pane.
+  viewToggleBtn.hidden = v === undefined;
+  if (v === undefined && dashboardMode) {
+    setDashboard(false); // no view for this pane → fall back to the terminal
+  } else if (dashboardMode) {
+    if (v && v.pane !== dashPane) {
+      // The active pane changed while in the dashboard — move the capture-size
+      // hold to the new window, and drop any now-stale popup.
+      closePopup();
+      dashPane = v.pane;
+      sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
+    }
+    // If a menu popup is open and the underlying menu changed (target swap or a
+    // new source instance), drop it so the user can't act on a stale menu.
+    if (openMenuSig !== null && menuSig(v ? readMenu(v.state) : null) !== openMenuSig) {
+      closePopup();
+    }
+    renderDashboard();
+  }
+}
+
+function onPaneViews(views: PaneView[]): void {
+  paneViews = views;
+  refreshPaneView();
+}
+
+/** Drop all pane views and leave dashboard mode — on reconnect / session switch. */
+function clearPaneViews(): void {
+  paneViews = [];
+  viewToggleBtn.hidden = true;
+  closePopup();
+  closeCopyOverlay(); // a capture from another session/connection is now stale
+  if (dashboardMode) setDashboard(false);
+}
+
+function setDashboard(on: boolean): void {
+  dashboardMode = on;
+  dashboardPanel.hidden = !on;
+  viewToggleBtn.textContent = on ? "Terminal" : "Dashboard";
+  viewToggleBtn.classList.toggle("primary", on);
+  if (on) {
+    // A dashboard is not a terminal view: stop driving tmux size. If we're the
+    // controller, hand control back so the now-hidden xterm can't keep shrinking
+    // the desktop layout (window-size latest).
+    if (isController) sendJson({ type: "release_control" });
+    // Ask the daemon to render this pane at a big "capture resolution" so a
+    // full-screen tool (htop) exposes all its info to the dashboard. The
+    // terminal is hidden now, so the oversized render isn't seen.
+    dashPane = currentView()?.pane ?? "";
+    sendJson({ type: "view_mode", pane: dashPane, dashboard: true });
+    renderDashboard();
+  } else {
+    closePopup();
+    dashPane = null;
+    sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
+    handle.fit(); // terminal is visible again — remeasure the grid
+  }
+}
+
+function toggleDashboard(): void {
+  menu.hidden = true;
+  setDashboard(!dashboardMode);
+}
+
+function renderDashboard(): void {
+  const v = currentView();
+  if (!v) {
+    dashboardPanel.textContent = "";
+    htChrome = null;
+    return;
+  }
+  if (v.view === "htop.v1") {
+    // Stateful: keep the toolbar (filter input focus!) across 1.5s updates.
+    renderHtopInto(v.state, v.pane);
+    return;
+  }
+  htChrome = null;
+  dashboardPanel.textContent = "";
+  if (v.view === "claude.v1") {
+    dashboardPanel.appendChild(renderClaude(v.state));
+    return;
+  }
+  // Generic: any source view may advertise an interactive `menu`. Render a
+  // core Actions button for it, independent of the view's own renderer.
+  const bar = menuBar(v);
+  if (bar) dashboardPanel.appendChild(bar);
+  if (v.view === "taskscope.v1") {
+    dashboardPanel.appendChild(renderTaskscope(v.state));
+  } else {
+    const unknown = document.createElement("div");
+    unknown.className = "dash-empty";
+    unknown.textContent = `No renderer for “${v.view}”.`;
+    dashboardPanel.appendChild(unknown);
+  }
+}
+
+interface MenuOption {
+  label: string;
+  action: string;
+  style?: "default" | "danger" | "cancel";
+}
+
+/** Parse a view's optional generic `menu` (mirrors the daemon's validated
+ * shape). Returns null when absent/empty, so the button only shows when there
+ * are real options. */
+function readMenu(
+  state: Record<string, unknown>
+): { title: string; detail?: string; options: MenuOption[] } | null {
+  const m = state.menu as Record<string, unknown> | undefined;
+  if (!m || typeof m !== "object") return null;
+  const raw = Array.isArray(m.options) ? m.options : [];
+  const options: MenuOption[] = [];
+  for (const o of raw) {
+    if (!o || typeof o !== "object") continue;
+    const oo = o as Record<string, unknown>;
+    if (typeof oo.label !== "string" || typeof oo.action !== "string") continue;
+    const style =
+      oo.style === "danger" || oo.style === "cancel" ? oo.style : "default";
+    options.push({ label: oo.label, action: oo.action, style });
+  }
+  if (!options.length) return null;
+  return {
+    title: typeof m.title === "string" ? m.title : "Actions",
+    detail: typeof m.detail === "string" ? m.detail : undefined,
+    options,
+  };
+}
+
+/** The core "Actions" button for a source-declared menu — opens the generic
+ * popup. Selecting an option sends its action token; the daemon validates it
+ * against the currently-advertised menu and forwards it to the source. */
+function menuBar(v: PaneView): HTMLElement | null {
+  const menu = readMenu(v.state);
+  if (!menu) return null;
+  const bar = document.createElement("div");
+  bar.className = "dash-actions";
+  const btn = document.createElement("button");
+  btn.className = "btn dash-actions-btn";
+  btn.textContent = menu.title;
+  btn.addEventListener("click", () => {
+    openPopup({
+      pane: v.pane,
+      title: menu.title,
+      detail: menu.detail,
+      options: [
+        ...menu.options.map((o) => ({
+          label: o.label,
+          action: o.action,
+          style: o.style,
+        })),
+        { label: "Cancel", action: null, style: "cancel" as const },
+      ],
+    });
+    // Remember what we're showing, so a later menu change auto-dismisses it.
+    openMenuSig = menuSig(menu);
+  });
+  bar.appendChild(btn);
+  return bar;
+}
+
+// --- htop.v1 renderer: a live "instrument panel" over the real htop ---
+
+interface HtChrome {
+  pane: string;
+  root: HTMLElement;
+  sys: HTMLElement;
+  list: HTMLElement;
+  sorts: Record<string, HTMLButtonElement>;
+}
+let htChrome: HtChrome | null = null;
+let htSortKey = "cpu"; // active sort, remembered for the toolbar highlight
+
+function htAction(pane: string, action: string): void {
+  sendJson({ type: "pane_action", pane, action });
+}
+
+/** "" (calm) | "warn" (violet) | "crit" (red) by threshold — restrained color. */
+function loadClass(v: number, warn: number, crit: number): string {
+  return v >= crit ? "crit" : v >= warn ? "warn" : "";
+}
+
+function updateHtSorts(sorts: Record<string, HTMLButtonElement>): void {
+  for (const [key, b] of Object.entries(sorts)) b.classList.toggle("active", key === htSortKey);
+}
+
+function buildHtChrome(pane: string): HtChrome {
+  const root = document.createElement("div");
+  root.className = "ht";
+
+  const sys = document.createElement("div");
+  sys.className = "ht-sys";
+
+  // Sticky toolbar: filter + tree on top, sort row below.
+  const bar = document.createElement("div");
+  bar.className = "ht-toolbar";
+
+  const top = document.createElement("div");
+  top.className = "ht-tbar-top";
+  const filter = document.createElement("input");
+  filter.className = "ht-filter";
+  filter.type = "text";
+  filter.placeholder = "Filter processes…";
+  filter.autocapitalize = "off";
+  filter.autocomplete = "off";
+  filter.spellcheck = false;
+  filter.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      htAction(pane, `filter:${filter.value}`);
+      filter.blur();
+    }
+  });
+  const tree = document.createElement("button");
+  tree.className = "ht-tool";
+  tree.textContent = "Tree";
+  tree.addEventListener("click", () => {
+    tree.classList.toggle("active");
+    htAction(pane, "tree");
+  });
+  top.append(filter, tree);
+
+  const sortRow = document.createElement("div");
+  sortRow.className = "ht-sorts";
+  const sl = document.createElement("span");
+  sl.className = "ht-sorts-l";
+  sl.textContent = "sort";
+  sortRow.appendChild(sl);
+  const sorts: Record<string, HTMLButtonElement> = {};
+  for (const [key, label] of [
+    ["cpu", "CPU"],
+    ["mem", "MEM"],
+    ["time", "TIME"],
+  ] as const) {
+    const b = document.createElement("button");
+    b.className = "ht-sort";
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      if (htSortKey === key) htAction(pane, "invert"); // tap active → reverse
+      else {
+        htSortKey = key;
+        htAction(pane, `sort:${key}`);
+      }
+      updateHtSorts(sorts);
+    });
+    sorts[key] = b;
+    sortRow.appendChild(b);
+  }
+  bar.append(top, sortRow);
+
+  const list = document.createElement("div");
+  list.className = "ht-list";
+
+  root.append(sys, bar, list);
+  return { pane, root, sys, list, sorts };
+}
+
+function renderHtopInto(state: Record<string, unknown>, pane: string): void {
+  if (!htChrome || htChrome.pane !== pane) {
+    dashboardPanel.textContent = "";
+    htChrome = buildHtChrome(pane);
+    dashboardPanel.appendChild(htChrome.root);
+    updateHtSorts(htChrome.sorts);
+  }
+  const summary = (state.summary ?? {}) as Record<string, unknown>;
+  const procs = Array.isArray(state.processes) ? (state.processes as Record<string, unknown>[]) : [];
+  renderHtSys(htChrome.sys, summary, procs.length);
+  renderHtList(htChrome.list, procs, pane, state.confidence === "low");
+}
+
+function htMeter(pct: number, cls: string): HTMLElement {
+  const m = document.createElement("div");
+  m.className = "ht-meter";
+  const f = document.createElement("div");
+  f.className = "ht-meter-f " + cls;
+  f.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  m.appendChild(f);
+  return m;
+}
+
+/** "2.27G/3.83G" → percent used, for the memory bar. */
+function memPercent(mem: string): number {
+  const m = mem.match(/([\d.]+)\s*([KMGT]?)\s*\/\s*([\d.]+)\s*([KMGT]?)/);
+  if (!m) return 0;
+  const u: Record<string, number> = { K: 1, M: 1024, G: 1024 ** 2, T: 1024 ** 3, "": 1 };
+  const used = parseFloat(m[1]) * (u[m[2]] ?? 1);
+  const total = parseFloat(m[3]) * (u[m[4]] ?? 1);
+  return total > 0 ? (used / total) * 100 : 0;
+}
+
+function renderHtSys(sys: HTMLElement, s: Record<string, unknown>, tasks: number): void {
+  sys.textContent = "";
+  const cpu = Number(s.cpu_pct ?? 0);
+
+  const cpuRow = document.createElement("div");
+  cpuRow.className = "ht-sys-row";
+  cpuRow.append(htSysL("CPU"), htSysV(`${cpu.toFixed(1)}%`), htMeter(cpu, loadClass(cpu, 60, 90)));
+  const tk = document.createElement("span");
+  tk.className = "ht-sys-x";
+  tk.textContent = `${tasks} tasks`;
+  cpuRow.append(tk);
+  sys.appendChild(cpuRow);
+
+  if (s.mem) {
+    const memPct = memPercent(String(s.mem));
+    const memRow = document.createElement("div");
+    memRow.className = "ht-sys-row";
+    memRow.append(htSysL("MEM"), htSysV(String(s.mem)), htMeter(memPct, loadClass(memPct, 75, 90)));
+    sys.appendChild(memRow);
+  }
+
+  const meta: string[] = [];
+  if (s.load) meta.push(`load ${s.load}`);
+  if (s.uptime) meta.push(`up ${s.uptime}`);
+  if (meta.length) {
+    const m = document.createElement("div");
+    m.className = "ht-sys-meta";
+    m.textContent = meta.join("   ·   ");
+    sys.appendChild(m);
+  }
+}
+
+function htSysL(t: string): HTMLElement {
+  const e = document.createElement("span");
+  e.className = "ht-sys-l";
+  e.textContent = t;
+  return e;
+}
+function htSysV(t: string): HTMLElement {
+  const e = document.createElement("span");
+  e.className = "ht-sys-v";
+  e.textContent = t;
+  return e;
+}
+
+function renderHtList(
+  list: HTMLElement,
+  procs: Record<string, unknown>[],
+  pane: string,
+  low: boolean
+): void {
+  list.textContent = "";
+  if (low || procs.length === 0) {
+    const note = document.createElement("div");
+    note.className = "dash-empty";
+    note.textContent = "Couldn't read htop's screen — tap Terminal for the live view.";
+    list.appendChild(note);
+    return;
+  }
+  for (const p of procs) list.appendChild(htRow(p, pane));
+}
+
+function htRow(p: Record<string, unknown>, pane: string): HTMLElement {
+  const cpu = Number(p.cpu ?? 0);
+  const mem = Number(p.mem ?? 0);
+  const cpuCls = loadClass(cpu, 60, 90);
+
+  const row = document.createElement("div");
+  row.className = "ht-r";
+
+  const rail = document.createElement("div");
+  rail.className = "ht-rail";
+  const rf = document.createElement("div");
+  rf.className = "ht-rail-f " + cpuCls;
+  rf.style.height = `${Math.max(2, Math.min(100, cpu))}%`;
+  rail.appendChild(rf);
+
+  const body = document.createElement("div");
+  body.className = "ht-r-body";
+
+  const l1 = document.createElement("div");
+  l1.className = "ht-r-line";
+  const cmd = document.createElement("span");
+  cmd.className = "ht-cmd";
+  cmd.textContent = String(p.command || `pid ${p.pid ?? "?"}`);
+  const cpuEl = document.createElement("span");
+  cpuEl.className = "ht-cpu " + cpuCls;
+  cpuEl.textContent = cpu.toFixed(1);
+  l1.append(cmd, cpuEl);
+
+  const l2 = document.createElement("div");
+  l2.className = "ht-r-line ht-r-sub";
+  const who = document.createElement("span");
+  who.className = "ht-who";
+  who.textContent = `${p.pid ?? "?"} ${String(p.user ?? "")}`;
+  const nums = document.createElement("span");
+  nums.className = "ht-nums";
+  nums.textContent = `${String(p.res ?? "")}   M ${mem.toFixed(1)}   ${String(p.time ?? "")}`;
+  l2.append(who, nums);
+
+  body.append(l1, l2);
+  row.append(rail, body);
+  row.addEventListener("click", () => openKillSheet(p, pane));
+  return row;
+}
+
+// ── Generic popup primitive ────────────────────────────────────────────────
+// A pane-view renderer (or, later, a plugin) declares a title + options; each
+// option maps to an ALREADY-WHITELISTED pane action string. The popup is pure
+// presentation over the action whitelist: it never sends raw input, and the
+// daemon re-validates every action on receipt. One popup at a time; it is
+// dropped when the dashboard is left or the pane changes (its action/pane
+// closure would otherwise go stale).
+
+interface PopupOption {
+  label: string;
+  /** A whitelisted pane-action string, or null for a pure dismiss (Cancel). */
+  action: string | null;
+  style?: "default" | "danger" | "cancel";
+}
+interface PopupSpec {
+  /** The pane whose view the chosen action targets. */
+  pane: string;
+  title: string;
+  detail?: string;
+  options: PopupOption[];
+}
+
+let popupEl: HTMLElement | null = null;
+// Signature of the source menu the open popup was built from (null if the popup
+// isn't menu-driven, e.g. the htop kill sheet). If the pane's menu content
+// changes underneath an open menu popup — the source swapped targets, or a new
+// source instance claimed the pane — we drop the popup so a tap can't act on a
+// different menu than the one the user is looking at (Codex).
+let openMenuSig: string | null = null;
+function menuSig(menu: { options: MenuOption[] } | null): string | null {
+  return menu
+    ? JSON.stringify(menu.options.map((o) => [o.label, o.action, o.style]))
+    : null;
+}
+function closePopup(): void {
+  popupEl?.remove();
+  popupEl = null;
+  openMenuSig = null;
+}
+
+function openPopup(spec: PopupSpec): void {
+  closePopup(); // only one at a time
+  const bg = document.createElement("div");
+  bg.className = "rx-popup-bg";
+  const sheet = document.createElement("div");
+  sheet.className = "rx-popup";
+  const title = document.createElement("div");
+  title.className = "rx-popup-title";
+  title.textContent = spec.title;
+  sheet.appendChild(title);
+  if (spec.detail) {
+    const detail = document.createElement("div");
+    detail.className = "rx-popup-detail";
+    detail.textContent = spec.detail;
+    sheet.appendChild(detail);
+  }
+  const btns = document.createElement("div");
+  btns.className = "rx-popup-btns";
+  for (const opt of spec.options) {
+    const b = document.createElement("button");
+    b.className = "btn rx-popup-btn";
+    if (opt.style === "danger") b.classList.add("rx-danger");
+    else if (opt.style === "cancel") b.classList.add("rx-cancel");
+    b.textContent = opt.label;
+    b.addEventListener("click", () => {
+      if (opt.action) htAction(spec.pane, opt.action);
+      closePopup();
+    });
+    btns.appendChild(b);
+  }
+  sheet.appendChild(btns);
+  bg.addEventListener("click", (e) => {
+    if (e.target === bg) closePopup();
+  });
+  bg.appendChild(sheet);
+  popupEl = bg;
+  $("app").appendChild(bg);
+}
+
+/** Deliberate, confirmed process signal — never a one-tap action. Built on the
+ * generic popup: SIGTERM (graceful) / SIGKILL (force) / Cancel. */
+function openKillSheet(p: Record<string, unknown>, pane: string): void {
+  const pid = Number(p.pid ?? 0);
+  if (!pid) return;
+  openPopup({
+    pane,
+    title: String(p.command || `pid ${pid}`),
+    detail: `pid ${pid} · ${String(p.user ?? "")} · cpu ${Number(p.cpu ?? 0).toFixed(
+      1
+    )}% · mem ${Number(p.mem ?? 0).toFixed(1)}%`,
+    options: [
+      { label: `SIGTERM ${pid} (graceful)`, action: `kill:${pid}:TERM`, style: "default" },
+      { label: `SIGKILL ${pid} (force)`, action: `kill:${pid}:KILL`, style: "danger" },
+      { label: "Cancel", action: null, style: "cancel" },
+    ],
+  });
+}
+
+// --- taskscope.v1 renderer (hard-coded; one built-in view) ---
+
+function tsStatusClass(status: string): string {
+  switch (status) {
+    case "running":
+      return "run";
+    case "done":
+      return "done";
+    case "error":
+      return "err";
+    default:
+      return "idle";
+  }
+}
+
+/** claude.v1 dashboard: honest, broadcast-safe agent status. The pending ask
+ * carries only a tool name + a permission-card id; we JOIN that id against the
+ * (approve-only) permission_cards frame to show Approve/Deny inline — the command
+ * itself never travels in claude.v1. */
+function renderClaude(state: Record<string, unknown>): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "claude-dash";
+  const status = String(state.status ?? "idle");
+  const ask = state.current_tool_ask as
+    | { tool_name?: string; permission_card_id?: string }
+    | null
+    | undefined;
+
+  const head = document.createElement("div");
+  head.className = `claude-status claude-${status}`;
+  head.textContent =
+    status === "awaiting-approval"
+      ? "Awaiting approval"
+      : status === "working"
+        ? "Working…"
+        : "Idle";
+  root.appendChild(head);
+
+  if (ask && ask.tool_name) {
+    const askEl = document.createElement("div");
+    askEl.className = "claude-ask";
+    askEl.textContent = `Wants to run: ${ask.tool_name}`;
+    root.appendChild(askEl);
+    // Join the card by id (approve-only). If present, Approve/Deny right here.
+    const card = permCards.find((c) => c.id === ask.permission_card_id);
+    if (card) {
+      const elapsed = Math.floor((performance.now() - permReceivedAt) / 1000);
+      root.appendChild(permCardEl(card, Math.max(0, card.remaining_secs - elapsed)));
+    } else {
+      const note = document.createElement("div");
+      note.className = "claude-note";
+      note.textContent = "Approve or deny on an approve-capable device.";
+      root.appendChild(note);
+    }
+  }
+
+  const sid = String(state.session_id ?? "");
+  if (sid) {
+    const meta = document.createElement("div");
+    meta.className = "claude-meta";
+    meta.textContent = `session ${sid.slice(0, 8)}`;
+    root.appendChild(meta);
+  }
+
+  const recent = Array.isArray(state.recent_tools) ? state.recent_tools : [];
+  if (!recent.length) {
+    const empty = document.createElement("div");
+    empty.className = "claude-note";
+    empty.textContent = "No recent activity.";
+    root.appendChild(empty);
+  }
+  return root;
+}
+
+function renderTaskscope(state: Record<string, unknown>): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "ts";
+  const workers = Array.isArray(state.workers) ? (state.workers as Record<string, unknown>[]) : [];
+
+  const head = document.createElement("div");
+  head.className = "ts-head";
+  head.textContent = `taskscope · ${workers.length} worker${workers.length === 1 ? "" : "s"}`;
+  root.appendChild(head);
+
+  if (workers.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "dash-empty";
+    empty.textContent = "No workers.";
+    root.appendChild(empty);
+    return root;
+  }
+  for (const w of workers) root.appendChild(taskscopeCard(w));
+  return root;
+}
+
+function taskscopeCard(w: Record<string, unknown>): HTMLElement {
+  const status = String(w.status ?? "");
+  const cls = tsStatusClass(status);
+  const cpu = Number(w.cpu ?? 0);
+  const mem = Number(w.mem ?? 0);
+  const progress = Math.max(0, Math.min(100, Number(w.progress ?? 0)));
+
+  const card = document.createElement("div");
+  card.className = "ts-card";
+
+  const row = document.createElement("div");
+  row.className = "ts-row";
+  const name = document.createElement("span");
+  name.className = "ts-name";
+  name.textContent = String(w.name ?? "?");
+  const badge = document.createElement("span");
+  badge.className = `ts-badge ${cls}`;
+  badge.textContent = status;
+  row.append(name, badge);
+
+  const meta = document.createElement("div");
+  meta.className = "ts-meta";
+  meta.textContent = `${cpu}% CPU · ${mem} MB`;
+
+  const bar = document.createElement("div");
+  bar.className = "ts-bar";
+  const fill = document.createElement("div");
+  fill.className = `ts-fill ${cls}`;
+  fill.style.width = `${progress}%`;
+  bar.appendChild(fill);
+
+  card.append(row, meta, bar);
+  return card;
 }
 
 function paintFeed(): void {
@@ -1043,7 +1824,13 @@ async function checkPendingAttention(): Promise<void> {
   }
 }
 
-function onAttention(): void {
+function onAttention(msg: ControlMsg): void {
+  // Record pane-scoped "waiting for input" status (hook-fed events carry a pane).
+  // This runs regardless of visibility so the chip/badges stay current in-app.
+  if (msg.kind === "agent_needs_input" && msg.pane) {
+    claudeWaiting.set(msg.pane, Date.now() + CLAUDE_WAIT_TTL_MS);
+    refreshClaudeStatus();
+  }
   if (document.visibilityState === "visible") {
     return;
   }
@@ -1134,9 +1921,59 @@ document.addEventListener("click", (ev) => {
 $("font-dec").addEventListener("click", () => applyFont(fontSize - 1));
 $("font-inc").addEventListener("click", () => applyFont(fontSize + 1));
 $("paste-btn").addEventListener("click", () => void pasteFromClipboard());
+setupCopyMode();
 notifyBtn.addEventListener("click", () => void toggleNotify());
 feedBtn.addEventListener("click", toggleFeed);
+viewToggleBtn.addEventListener("click", toggleDashboard);
 renderNotifyBtn();
+
+// ---------- copy overlay (selectable pane text) ----------
+// The terminal is a WebGL canvas with tmux `mouse on`, so touch = scroll and
+// native selection never triggers. This captures the pane's screen + scrollback
+// as plain text into a selectable <pre> so the phone's own long-press select +
+// Copy works. A read-only snapshot (labelled as such), not live copy-mode.
+const copyOverlay = $("copy-overlay");
+const copyTextEl = $("copy-text");
+let capturedText = "";
+
+function openCopyOverlay(text: string, truncated: boolean): void {
+  capturedText = text;
+  copyTextEl.textContent = text;
+  $("copy-title").textContent = truncated
+    ? "Copy — most recent (truncated). Long-press to select, or"
+    : "Copy — long-press to select, or";
+  copyOverlay.hidden = false;
+  copyTextEl.scrollTop = copyTextEl.scrollHeight; // open at the newest output
+}
+
+function closeCopyOverlay(): void {
+  if (copyOverlay.hidden) return;
+  copyOverlay.hidden = true;
+  copyTextEl.textContent = ""; // don't retain captured (possibly secret) content
+  capturedText = "";
+}
+
+function setupCopyMode(): void {
+  $("copy-key").addEventListener("click", () => {
+    const pane = activePaneId();
+    if (!pane) {
+      showHint("No active pane to copy");
+      return;
+    }
+    sendJson({ type: "capture", pane });
+  });
+  $("copy-all").addEventListener("click", () => {
+    // Use the ALREADY-captured text synchronously in the click handler — WebKit
+    // requires clipboard writes during the user gesture (a fresh async capture
+    // would lose the activation).
+    if (!capturedText) return;
+    void navigator.clipboard.writeText(capturedText).then(
+      () => showHint("Copied"),
+      () => showHint("Long-press to select and copy instead")
+    );
+  });
+  $("copy-close").addEventListener("click", closeCopyOverlay);
+}
 
 // ---------- command composer ----------
 

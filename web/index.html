@@ -33,11 +33,16 @@
         <span class="flex-spacer"></span>
         <button id="tmux-btn" class="btn">+</button>
         <button id="control-btn" class="btn primary">Take control</button>
+        <button id="view-toggle-btn" class="btn" hidden>Dashboard</button>
         <button id="menu-btn" class="btn" hidden>aA</button>
       </div>
 
       <nav id="window-tabs" hidden></nav>
       <nav id="pane-tabs" hidden></nav>
+
+      <!-- Pane-scoped Claude status for the active pane (waiting / approval).
+           Cross-pane status shows as badges on the tabs above. -->
+      <div id="claude-chip" hidden></div>
 
       <!-- M4b: agent permission cards (Approve/Deny). Populated from the WS
            permission_cards frame; approve-capable devices only. -->
@@ -72,7 +77,25 @@
         <button id="tip-close" class="btn">&#x2715;</button>
       </div>
 
-      <main id="terminal"></main>
+      <main id="terminal">
+        <!-- Pane views: a source (e.g. taskscope) streams structured state for
+             a pane; the PWA renders it as a custom interface over the terminal.
+             Nested so it overlays the terminal box exactly (inset:0). -->
+        <div id="dashboard-panel" data-native-scroll hidden></div>
+      </main>
+
+      <!-- Copy overlay: pane screen + scrollback as selectable text. Top-level
+           (position:fixed) so it covers the viewport; controls sit OUTSIDE the
+           selectable <pre> so their labels can't enter a selection. -->
+      <div id="copy-overlay" hidden>
+        <div id="copy-bar">
+          <span id="copy-title">Copy — long-press to select, or</span>
+          <span class="flex-spacer"></span>
+          <button id="copy-all" class="btn primary">Copy all</button>
+          <button id="copy-close" class="btn">Close</button>
+        </div>
+        <pre id="copy-text" data-native-scroll></pre>
+      </div>
 
       <button id="hint" hidden></button>
 
@@ -93,6 +116,7 @@
           <button class="key" data-key="end">end</button>
           <button class="key" data-key="pgup">pgup</button>
           <button class="key" data-key="pgdn">pgdn</button>
+          <button class="key" id="copy-key" title="copy screen + scrollback">&#x29C9; copy</button>
           <button class="key" data-key="dash">-</button>
           <button class="key" data-key="pipe">|</button>
           <button class="key" data-key="slash">/</button>

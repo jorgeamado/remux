@@ -39,6 +39,13 @@ export function setupTouchScroll(
     "touchstart",
     (ev) => {
       if (ev.touches.length === 1) {
+        // Overlays that scroll themselves (e.g. the pane-view dashboard) opt out
+        // of terminal scrollback so a swipe scrolls the overlay natively.
+        const t = ev.target as Element | null;
+        if (t?.closest("[data-native-scroll]")) {
+          lastY = null; // touchmove bails on null → no preventDefault → native scroll
+          return;
+        }
         lastY = ev.touches[0].clientY;
       }
     },

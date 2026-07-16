@@ -42,8 +42,10 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 
 - Claude Code's `Notification` hook fires when it shows a permission
   prompt or goes idle waiting for you. It is display-only — it cannot
-  affect what Claude does (approvals from the phone are M4b, via the
-  `PermissionRequest` hook).
+  affect what Claude does. To actually **approve/deny tool use from the
+  phone** (M4b), add the `PreToolUse` adapter in
+  [`examples/claude-code`](../examples/claude-code/README.md), which routes
+  the decision through `remux emit permission`.
 - The hook command inherits `$TMUX_PANE` from the pane's environment;
   `remux emit` sends one JSON line to the daemon's local ingest socket
   (filesystem-authenticated, data-only — an event can raise a

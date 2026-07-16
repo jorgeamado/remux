@@ -96,6 +96,31 @@ async fn terminal_press_flow_over_tmux() {
     assert_eq!(r["status"], "mouse_off");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Wheel into copy-mode (whitelisted for observers) — a press must be
+    // refused while the pane is in a tmux mode, wherever it would land.
+    ws.send(WsMsg::binary(b"\x1b[<64;10;10M".repeat(5)))
+        .await
+        .unwrap();
+    let mut in_mode = false;
+    for _ in 0..50 {
+        if tmux_sock(
+            &sock,
+            &["display-message", "-t", session, "-p", "#{pane_in_mode}"],
+        ) == "1"
+        {
+            in_mode = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(in_mode, "wheel reports never entered copy-mode");
+    press(&mut ws, "p3b", 100, 30, 1, 1).await;
+    let r = next_json(&mut ws).await;
+    assert_eq!(r["request_id"], "p3b");
+    assert_eq!(r["status"], "copy_mode");
+    tmux_sock(&sock, &["send-keys", "-t", session, "-X", "cancel"]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     // Start a mouse-reporting app: printf enables SGR mouse mode (1000h sets
     // #{mouse_any_flag}, 1006h selects the SGR encoding), cat -v echoes stdin
     // with control chars made printable so the capture can prove delivery.

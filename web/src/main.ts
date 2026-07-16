@@ -207,8 +207,9 @@ function renderBanner(): void {
     controlBtn.textContent = "Take control";
     controlBtn.classList.add("primary");
   }
-  // Pressing is an observer affordance; a controller's taps are real input.
-  pressBtn.hidden = isController;
+  // Pressing is an observer affordance for the raw terminal; a controller's
+  // taps are real input, and a dashboard has its own semantic actions.
+  pressBtn.hidden = isController || dashboardMode;
 }
 
 // ---------- connection ----------
@@ -299,6 +300,10 @@ function connect(): void {
 
   sock.onclose = () => {
     if (ws !== sock) return;
+    // Disarm first: it re-renders the banner, and the lines below re-hide it.
+    // An offline tap must not flash cells or queue a phantom press.
+    setPressArmed(false);
+    pressPendingIds.clear();
     controlRequested = false;
     pendingInput = "";
     isController = false;
@@ -1052,6 +1057,9 @@ function setDashboard(on: boolean): void {
   viewToggleBtn.textContent = on ? "Terminal" : "Dashboard";
   viewToggleBtn.classList.toggle("primary", on);
   if (on) {
+    // The terminal is about to be covered — an armed press would intercept
+    // taps meant for dashboard buttons and click the hidden xterm instead.
+    setPressArmed(false);
     // A dashboard is not a terminal view: stop driving tmux size. If we're the
     // controller, hand control back so the now-hidden xterm can't keep shrinking
     // the desktop layout (window-size latest).
@@ -1067,6 +1075,7 @@ function setDashboard(on: boolean): void {
     dashPane = null;
     sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
     handle.fit(); // terminal is visible again — remeasure the grid
+    renderBanner(); // the Press button applies to the terminal view again
   }
 }
 
@@ -2234,7 +2243,10 @@ terminalEl.appendChild(pressOverlay);
 
 let pressTimer: number | undefined;
 let pressSeq = 0;
-let pressPending: string | null = null; // request_id awaiting its result
+// Request ids awaiting a result. A set, not a single slot: a second gesture
+// must not orphan the first result (its "Tap sent" would be silently lost
+// while the click still landed). Cleared on disconnect.
+const pressPendingIds = new Set<string>();
 let pressStart: { x: number; y: number } | null = null;
 
 function setPressArmed(on: boolean): void {
@@ -2268,14 +2280,29 @@ pressOverlay.addEventListener("pointermove", (ev) => {
 pressOverlay.addEventListener("pointerup", (ev) => {
   if (!pressArmed || !pressStart) return;
   ev.preventDefault();
-  const cell = cellFromPoint(terminalEl, handle.term, pressStart.x, pressStart.y);
+  const start = pressStart;
   setPressArmed(false);
+  // cellFromPoint clamps into the grid; a tap on the card padding outside
+  // the rendered .xterm-screen is a chrome tap, not an edge-cell press.
+  const screen = terminalEl.querySelector(".xterm-screen")?.getBoundingClientRect();
+  if (
+    !screen ||
+    start.x < screen.left ||
+    start.x >= screen.right ||
+    start.y < screen.top ||
+    start.y >= screen.bottom
+  ) {
+    return;
+  }
+  const cell = cellFromPoint(terminalEl, handle.term, start.x, start.y);
   if (!cell) return;
   const { cols, rows } = handle.size();
-  pressPending = `p${++pressSeq}-${Date.now().toString(36)}`;
+  const id = `p${++pressSeq}-${Date.now().toString(36)}`;
+  if (pressPendingIds.size > 8) pressPendingIds.clear(); // lost results
+  pressPendingIds.add(id);
   sendJson({
     type: "terminal_press",
-    request_id: pressPending,
+    request_id: id,
     cols,
     rows,
     col: cell.col,
@@ -2308,8 +2335,8 @@ function flashPressCell(col: number, row: number): void {
 }
 
 function onPressResult(msg: ControlMsg): void {
-  if (!msg.request_id || msg.request_id !== pressPending) return;
-  pressPending = null;
+  if (!msg.request_id || !pressPendingIds.has(msg.request_id)) return;
+  pressPendingIds.delete(msg.request_id);
   const text: Record<string, string> = {
     delivered: "Tap sent",
     stale: "Screen changed — arm Press and tap again",

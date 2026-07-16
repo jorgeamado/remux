@@ -19,7 +19,7 @@ async fn https_listener_serves_health() {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Grab a free port (small race window; fine for a test).
     let port = {

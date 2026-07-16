@@ -45,6 +45,14 @@ const CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const CAPTURE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Max bytes of a single chat message typed to Claude.
 const CHAT_SEND_MAX: usize = 8 * 1024;
+/// One-shot press (`terminal_press`): min spacing between attempts on one
+/// connection (applied before any tmux work, like pane actions — the armed
+/// one-tap UX sends at human cadence, this bounds a scripted client), how
+/// many recent request ids are remembered for duplicate suppression, and a
+/// cap on the client-chosen request id length.
+const PRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const PRESS_REPLAY_IDS: usize = 32;
+const PRESS_MAX_REQUEST_ID: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -91,6 +99,21 @@ enum ClientMsg {
     /// The client sends the pane id it was viewing at tap time (snapshot).
     Capture {
         pane: String,
+    },
+    /// One-shot press: a single unmodified left click at 1-based client-grid
+    /// coordinates. The daemon validates it (grid echo; status rows rejected;
+    /// every pane the click could land in must be a live mouse-reporting app
+    /// outside any tmux mode — see press_check) and SYNTHESIZES the SGR bytes
+    /// into this connection's own PTY — it never promotes the client to
+    /// controller and never resizes anything (docs/design-tap.md).
+    /// `cols`/`rows` echo the grid the client saw at tap time — the
+    /// stale-layout guard.
+    TerminalPress {
+        request_id: String,
+        cols: u16,
+        rows: u16,
+        col: u16,
+        row: u16,
     },
     /// Subscribe this connection to a pane's rendered Claude chat (opt-in;
     /// transcript content is never broadcast). Replaces any prior subscription.
@@ -143,6 +166,14 @@ enum ServerMsg<'a> {
         reason: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<&'a str>,
+    },
+    /// Outcome of a `terminal_press`. `delivered` means the click was written
+    /// to the tmux client — NOT that the TUI acted on it (the daemon cannot
+    /// know). Other statuses: `stale`, `outside_pane`, `copy_mode`,
+    /// `mouse_off`, `rate_limited`, `failed`.
+    TerminalPressResult {
+        request_id: &'a str,
+        status: &'a str,
     },
     Pong,
 }
@@ -666,6 +697,11 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // Last copy-overlay capture on this connection (separate rate cap — a capture
     // response is large and OUT_QUEUE counts messages, not bytes).
     let mut last_capture: Option<std::time::Instant> = None;
+    // One-shot press: rate cap + recently seen request ids. A duplicate id is
+    // dropped silently — the first attempt already produced a result (guards
+    // against client-side double-fire, e.g. iOS pointer duplication).
+    let mut last_press: Option<std::time::Instant> = None;
+    let mut press_seen: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
@@ -989,6 +1025,81 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Ok(ClientMsg::TerminalPress {
+                        request_id,
+                        cols: echo_cols,
+                        rows: echo_rows,
+                        col,
+                        row,
+                    }) => {
+                        // Bound the client-chosen id; drop malformed ids and
+                        // duplicates silently (the first attempt already got its
+                        // result — a resend must not deliver a second click).
+                        if request_id.is_empty() || request_id.len() > PRESS_MAX_REQUEST_ID {
+                            continue;
+                        }
+                        if press_seen.contains(&request_id) {
+                            continue;
+                        }
+                        // Rate cap BEFORE any tmux work (same rationale as pane
+                        // actions: no CPU-flooding the daemon with tiny frames).
+                        // Capped attempts neither re-arm the interval (a sliding
+                        // cap would let sustained spam starve legitimate retries)
+                        // nor consume replay memory (a retry of the same id after
+                        // rate_limited must not be silently swallowed).
+                        let now = std::time::Instant::now();
+                        let capped =
+                            last_press.is_some_and(|t| now.duration_since(t) < PRESS_MIN_INTERVAL);
+                        if !capped {
+                            last_press = Some(now);
+                            if press_seen.len() >= PRESS_REPLAY_IDS {
+                                press_seen.pop_front();
+                            }
+                            press_seen.push_back(request_id.clone());
+                        }
+                        let status = if capped {
+                            "rate_limited"
+                        } else if (echo_cols, echo_rows) != (cols, rows) {
+                            // The grid the client aimed at is not the grid this
+                            // connection renders any more (rotation, font change,
+                            // reconnect) — the tap coordinates mean nothing now.
+                            "stale"
+                        } else if col == 0 || row == 0 || col > cols || row > rows {
+                            "outside_pane"
+                        } else {
+                            // Fresh poll as close to delivery as possible — layout,
+                            // zoom, and foreground mouse mode change at any time.
+                            // (Residual race: the bytes are queued behind any
+                            // in-flight input for the PTY write, so "delivered"
+                            // means queued to the tmux client, not acted upon.)
+                            let sess = session.clone();
+                            let win =
+                                tokio::task::spawn_blocking(move || tmux::press_window(&sess))
+                                    .await?;
+                            match win {
+                                Err(e) => {
+                                    tracing::warn!("press window poll failed: {e:#}");
+                                    "failed"
+                                }
+                                Ok(None) => "failed",
+                                Ok(Some(win)) => match press_check(&win, rows, row) {
+                                    Err(status) => status,
+                                    Ok(()) => {
+                                        if in_tx.send(sgr_click(col, row)).await.is_err() {
+                                            break;
+                                        }
+                                        "delivered"
+                                    }
+                                },
+                            }
+                        };
+                        let _ = out_tx
+                            .send(json(&ServerMsg::TerminalPressResult {
+                                request_id: &request_id,
+                                status,
+                            }))
+                            .await;
+                    }
                     Ok(ClientMsg::ChatSubscribe { pane }) => {
                         // Gate on SESSION MEMBERSHIP (not approve) — the terminal
                         // already shows this pane's text to any in-session device.
@@ -1205,6 +1316,57 @@ fn wheel_reports_only(bytes: &[u8]) -> bool {
     true
 }
 
+/// One-shot press bytes: a single unmodified left-button press+release at
+/// the same cell. The daemon FORMATS this — it never parses click-shaped
+/// client bytes — so no motion, drag, modifier, or other button can exist
+/// on this path by construction.
+fn sgr_click(col: u16, row: u16) -> Vec<u8> {
+    format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes()
+}
+
+/// Validate a 1-based client-grid press against the freshly polled state of
+/// the window this client displays.
+///
+/// The daemon deliberately does NOT map the click to a pane rectangle: tmux
+/// routes a client's click itself — with a cursor-following pan offset when
+/// the client is smaller than the window, zoom layouts, and status rows —
+/// and validation that guesses that per-client mapping can approve a
+/// different pane than the one tmux hits (Codex review). Two guards that
+/// hold regardless of the mapping:
+///
+/// - Status rows are drawn on the CLIENT grid (top or bottom), so rejecting
+///   them in client coordinates is exact. Status clicks are tmux chrome
+///   (window switching for everyone, programmable bindings) — controller
+///   territory, never pressable.
+/// - Every pane the click could land in — only the active one while zoomed,
+///   any pane otherwise — must be pressable (live app with mouse reporting,
+///   not a tmux mode). Wherever tmux routes it, the gates hold.
+///
+/// Residual: a click on a pane border keeps its default binding (a bare
+/// left press+release grabs and immediately drops a resize — a no-op);
+/// host-configured custom bindings remain the host's own choice.
+fn press_check(win: &tmux::PressWindow, client_rows: u16, row: u16) -> Result<(), &'static str> {
+    if row <= win.status_top || row > client_rows.saturating_sub(win.status_bottom) {
+        return Err("outside_pane");
+    }
+    let mut candidates = win.panes.iter().filter(|p| !win.zoomed || p.active);
+    let mut any = false;
+    for pane in &mut candidates {
+        any = true;
+        if pane.in_mode {
+            return Err("copy_mode");
+        }
+        if !pane.mouse_any {
+            return Err("mouse_off");
+        }
+    }
+    // No panes (window vanished mid-poll) → refuse rather than default open.
+    if !any {
+        return Err("failed");
+    }
+    Ok(())
+}
+
 async fn resolve_client_name(pid: Option<u32>) -> Option<String> {
     let pid = pid?;
     for _ in 0..20 {
@@ -1257,5 +1419,95 @@ mod tests {
         assert!(!wheel_reports_only(b"\x1b[<64;12;5Mq")); // trailing key
         assert!(!wheel_reports_only(b"\x1b[<64;12345;5M")); // oversized field
         assert!(!wheel_reports_only(b"\x1b[<64;;5M")); // empty field
+    }
+
+    #[test]
+    fn sgr_click_shape() {
+        assert_eq!(sgr_click(12, 5), b"\x1b[<0;12;5M\x1b[<0;12;5m");
+        // The formatted pair is NOT observer-forwardable as raw bytes — the
+        // structured path is the only way a click reaches the PTY.
+        assert!(!wheel_reports_only(&sgr_click(12, 5)));
+    }
+
+    #[test]
+    fn press_check_status_rows_and_pane_gates() {
+        fn pane(id: &str, active: bool, in_mode: bool, mouse_any: bool) -> crate::tmux::PressPane {
+            crate::tmux::PressPane {
+                id: id.into(),
+                active,
+                in_mode,
+                mouse_any,
+            }
+        }
+        // Single mouse-on pane, one bottom status row, 24 client rows.
+        let win = crate::tmux::PressWindow {
+            zoomed: false,
+            status_top: 0,
+            status_bottom: 1,
+            panes: vec![pane("%1", true, false, true)],
+        };
+        assert_eq!(press_check(&win, 24, 1), Ok(()));
+        assert_eq!(press_check(&win, 24, 23), Ok(()));
+        assert_eq!(press_check(&win, 24, 24), Err("outside_pane")); // status row
+
+        // Two top status rows: rows 1-2 are chrome, content starts at 3.
+        let win = crate::tmux::PressWindow {
+            zoomed: false,
+            status_top: 2,
+            status_bottom: 0,
+            panes: vec![pane("%1", true, false, true)],
+        };
+        assert_eq!(press_check(&win, 24, 2), Err("outside_pane"));
+        assert_eq!(press_check(&win, 24, 3), Ok(()));
+        assert_eq!(press_check(&win, 24, 24), Ok(()));
+
+        // Splits: the daemon can't reproduce tmux's per-client routing (pan
+        // offsets, zoom), so EVERY pane the click could hit must be pressable.
+        let win = crate::tmux::PressWindow {
+            zoomed: false,
+            status_top: 0,
+            status_bottom: 1,
+            panes: vec![
+                pane("%1", true, false, true),
+                pane("%2", false, false, false),
+            ],
+        };
+        assert_eq!(press_check(&win, 24, 5), Err("mouse_off"));
+        let win = crate::tmux::PressWindow {
+            zoomed: false,
+            status_top: 0,
+            status_bottom: 1,
+            panes: vec![pane("%1", true, false, true), pane("%2", false, true, true)],
+        };
+        assert_eq!(press_check(&win, 24, 5), Err("copy_mode"));
+
+        // Zoomed: hidden panes can't be hit — only the active pane gates.
+        let win = crate::tmux::PressWindow {
+            zoomed: true,
+            status_top: 0,
+            status_bottom: 1,
+            panes: vec![
+                pane("%1", true, false, true),
+                pane("%2", false, true, false),
+            ],
+        };
+        assert_eq!(press_check(&win, 24, 5), Ok(()));
+        // ...and a zoomed unpressable active pane still refuses.
+        let win = crate::tmux::PressWindow {
+            zoomed: true,
+            status_top: 0,
+            status_bottom: 1,
+            panes: vec![pane("%1", true, true, true), pane("%2", false, false, true)],
+        };
+        assert_eq!(press_check(&win, 24, 5), Err("copy_mode"));
+
+        // A window with no panes (vanished mid-poll) refuses, not defaults open.
+        let win = crate::tmux::PressWindow {
+            zoomed: false,
+            status_top: 0,
+            status_bottom: 0,
+            panes: vec![],
+        };
+        assert_eq!(press_check(&win, 24, 5), Err("failed"));
     }
 }

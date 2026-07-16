@@ -445,14 +445,63 @@ button {
 /* ---------- key panel ---------- */
 
 #keyrow,
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   display: flex;
   gap: 5px;
   overflow-x: auto;
 }
 
-#keyrow-more {
+#keyrow-more,
+#keyrow-agent {
   margin-bottom: 6px;
+}
+
+/* The nav/symbols row holds more keys than fit the width: size each to its
+   label and let the row scroll, instead of crushing "home" into 34px. */
+#keyrow-more .key {
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 8px 10px;
+}
+
+/* Agent-row keys teach their chord: a small word cap over the key label.
+   Same height as plain keys — mixed-height rows read as broken. */
+.key.capkey {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  min-height: 42px;
+  padding: 4px 2px 5px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.key .cap {
+  font-size: 8px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.key.capkey:active .cap {
+  color: inherit;
+}
+
+.key.danger {
+  color: var(--danger);
+}
+
+.key.danger:active {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
 }
 
 .key {
@@ -1264,4 +1313,53 @@ button {
 }
 .rx-popup-btn.rx-cancel {
   color: var(--muted);
+}
+
+/* ---------- Press mode (one-shot tap without taking control) ---------- */
+
+/* Armed: the overlay owns the next gesture; a violet inset ring says the
+   terminal is waiting for exactly one tap. */
+#press-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: none;
+  cursor: crosshair;
+  touch-action: none; /* no scroll/double-tap-zoom while armed */
+}
+#terminal.press-armed #press-overlay {
+  display: block;
+}
+#terminal.press-armed::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 29;
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  border-radius: 12px;
+}
+#press-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+/* The tapped cell flashes so a press is never silent. */
+.press-flash {
+  position: absolute;
+  z-index: 31;
+  pointer-events: none;
+  border-radius: 3px;
+  background: var(--accent);
+  animation: press-flash 0.4s ease-out forwards;
+}
+@keyframes press-flash {
+  from {
+    opacity: 0.9;
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.6);
+  }
 }

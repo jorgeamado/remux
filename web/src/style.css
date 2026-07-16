@@ -1021,7 +1021,89 @@ button {
   white-space: nowrap;
 }
 
-/* claude.v1 dashboard. */
+/* Claude chat companion. */
+.claude-chat {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--card-border);
+  flex: none;
+}
+.cc-status {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.cc-status.claude-working {
+  color: #e0b357;
+}
+.cc-status.claude-awaiting-approval {
+  color: var(--accent-fg);
+}
+.cc-status.claude-idle {
+  color: var(--muted);
+}
+.cc-mode {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+.cc-log {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cc-msg {
+  max-width: 90%;
+  padding: 8px 12px;
+  border-radius: 14px;
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.cc-user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+  border-bottom-right-radius: 4px;
+}
+.cc-assistant {
+  align-self: flex-start;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-bottom-left-radius: 4px;
+}
+.cc-tool {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
+  padding: 0 4px;
+}
+.cc-note {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px;
+}
+
+/* (legacy status dashboard styles kept for the chip) */
 .claude-dash {
   padding: 16px;
   display: flex;

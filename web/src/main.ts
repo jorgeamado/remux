@@ -366,6 +366,10 @@ interface ControlMsg {
   /** pane_capture frames (copy overlay): captured text + truncation flag */
   text?: string;
   truncated?: boolean;
+  /** chat_update frames: rendered Claude transcript (per-connection). */
+  generation?: number;
+  full?: boolean;
+  messages?: ChatMsg[];
   /** permission_cards frames (M4b) */
   cards?: PermissionCard[];
   /** command_feed frames (M4c) */
@@ -461,6 +465,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "pane_capture":
       openCopyOverlay(msg.text ?? "", msg.truncated ?? false);
+      break;
+    case "chat_update":
+      onChatUpdate(msg);
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -1023,12 +1030,47 @@ function onPaneViews(views: PaneView[]): void {
   refreshPaneView();
 }
 
+// ---------- Claude chat (per-connection, opt-in, never broadcast) ----------
+interface ChatMsg {
+  seq: number;
+  role: string; // "user" | "assistant"
+  kind: string; // "text" | "tool"
+  text: string;
+}
+let chatPane: string | null = null; // the pane we're subscribed to
+let chatMessages: ChatMsg[] = [];
+
+/** Subscribe to a pane's chat (idempotent); resets the local model so the fresh
+ * snapshot replaces cleanly. */
+function subscribeChat(pane: string): void {
+  if (chatPane === pane) return;
+  if (chatPane) sendJson({ type: "chat_unsubscribe" });
+  chatPane = pane;
+  chatMessages = [];
+  sendJson({ type: "chat_subscribe", pane });
+}
+function unsubscribeChat(): void {
+  if (!chatPane) return;
+  sendJson({ type: "chat_unsubscribe" });
+  chatPane = null;
+  chatMessages = [];
+}
+
+function onChatUpdate(msg: ControlMsg): void {
+  if (msg.pane !== chatPane) return; // a stale frame for a pane we've left
+  const incoming = msg.messages ?? [];
+  chatMessages = msg.full ? incoming.slice() : chatMessages.concat(incoming);
+  if (chatMessages.length > 300) chatMessages = chatMessages.slice(-300);
+  if (dashboardMode && currentView()?.view === "claude.v1") renderDashboard();
+}
+
 /** Drop all pane views and leave dashboard mode — on reconnect / session switch. */
 function clearPaneViews(): void {
   paneViews = [];
   viewToggleBtn.hidden = true;
   closePopup();
   closeCopyOverlay(); // a capture from another session/connection is now stale
+  unsubscribeChat();
   if (dashboardMode) setDashboard(false);
 }
 
@@ -1050,6 +1092,7 @@ function setDashboard(on: boolean): void {
     renderDashboard();
   } else {
     closePopup();
+    unsubscribeChat();
     dashPane = null;
     sendJson({ type: "view_mode", pane: "", dashboard: false }); // restore size
     handle.fit(); // terminal is visible again — remeasure the grid
@@ -1076,7 +1119,7 @@ function renderDashboard(): void {
   htChrome = null;
   dashboardPanel.textContent = "";
   if (v.view === "claude.v1") {
-    dashboardPanel.appendChild(renderClaude(v.state));
+    dashboardPanel.appendChild(renderClaude(v.state, v.pane));
     return;
   }
   // Generic: any source view may advertise an interactive `menu`. Render a
@@ -1505,62 +1548,73 @@ function tsStatusClass(status: string): string {
   }
 }
 
-/** claude.v1 dashboard: honest, broadcast-safe agent status. The pending ask
- * carries only a tool name + a permission-card id; we JOIN that id against the
- * (approve-only) permission_cards frame to show Approve/Deny inline — the command
- * itself never travels in claude.v1. */
-function renderClaude(state: Record<string, unknown>): HTMLElement {
+/** Claude chat companion: a readable conversation for a Claude pane. Status +
+ * mode come from the broadcast-safe claude.v1 state; the messages come from the
+ * per-connection chat channel (transcript text, never broadcast). The pending
+ * approval joins its card by id (approve-only). */
+function renderClaude(state: Record<string, unknown>, pane: string): HTMLElement {
+  subscribeChat(pane); // opt in to this pane's transcript on open
+
   const root = document.createElement("div");
-  root.className = "claude-dash";
+  root.className = "claude-chat";
   const status = String(state.status ?? "idle");
+  const mode = typeof state.permission_mode === "string" ? state.permission_mode : "";
   const ask = state.current_tool_ask as
     | { tool_name?: string; permission_card_id?: string }
     | null
     | undefined;
 
+  // Sticky header: status pill + observed mode.
   const head = document.createElement("div");
-  head.className = `claude-status claude-${status}`;
-  head.textContent =
-    status === "awaiting-approval"
-      ? "Awaiting approval"
-      : status === "working"
-        ? "Working…"
-        : "Idle";
+  head.className = "cc-head";
+  const pill = document.createElement("span");
+  pill.className = `cc-status claude-${status}`;
+  pill.textContent =
+    status === "awaiting-approval" ? "Awaiting approval" : status === "working" ? "Working…" : "Idle";
+  head.appendChild(pill);
+  if (mode) {
+    const modeEl = document.createElement("span");
+    modeEl.className = "cc-mode";
+    modeEl.textContent = mode;
+    head.appendChild(modeEl);
+  }
   root.appendChild(head);
 
+  // Pending approval, joined to its (approve-only) card if we have it.
   if (ask && ask.tool_name) {
-    const askEl = document.createElement("div");
-    askEl.className = "claude-ask";
-    askEl.textContent = `Wants to run: ${ask.tool_name}`;
-    root.appendChild(askEl);
-    // Join the card by id (approve-only). If present, Approve/Deny right here.
     const card = permCards.find((c) => c.id === ask.permission_card_id);
     if (card) {
       const elapsed = Math.floor((performance.now() - permReceivedAt) / 1000);
       root.appendChild(permCardEl(card, Math.max(0, card.remaining_secs - elapsed)));
     } else {
-      const note = document.createElement("div");
-      note.className = "claude-note";
-      note.textContent = "Approve or deny on an approve-capable device.";
-      root.appendChild(note);
+      const askEl = document.createElement("div");
+      askEl.className = "cc-note";
+      askEl.textContent = `Wants to run: ${ask.tool_name} — approve on an approve-capable device.`;
+      root.appendChild(askEl);
     }
   }
 
-  const sid = String(state.session_id ?? "");
-  if (sid) {
-    const meta = document.createElement("div");
-    meta.className = "claude-meta";
-    meta.textContent = `session ${sid.slice(0, 8)}`;
-    root.appendChild(meta);
-  }
-
-  const recent = Array.isArray(state.recent_tools) ? state.recent_tools : [];
-  if (!recent.length) {
+  // The conversation.
+  const log = document.createElement("div");
+  log.className = "cc-log";
+  log.setAttribute("data-native-scroll", "");
+  if (!chatMessages.length) {
     const empty = document.createElement("div");
-    empty.className = "claude-note";
-    empty.textContent = "No recent activity.";
-    root.appendChild(empty);
+    empty.className = "cc-note";
+    empty.textContent = "No conversation yet.";
+    log.appendChild(empty);
   }
+  for (const m of chatMessages) {
+    const el = document.createElement("div");
+    el.className = `cc-msg cc-${m.role}${m.kind === "tool" ? " cc-tool" : ""}`;
+    el.textContent = m.kind === "tool" ? m.text : m.text;
+    log.appendChild(el);
+  }
+  root.appendChild(log);
+  // Open scrolled to the newest message.
+  requestAnimationFrame(() => {
+    log.scrollTop = log.scrollHeight;
+  });
   return root;
 }
 

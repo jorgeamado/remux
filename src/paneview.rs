@@ -814,6 +814,9 @@ fn build_claude_v1(v: &crate::agent::AgentView, cards: &[crate::permit::Card]) -
         "status": status,
         "current_tool_ask": ask,   // null when not awaiting approval
         "recent_tools": [],        // deferred: no honest ok/fail signal yet
+        // The permission mode name is non-sensitive (default / acceptEdits / …),
+        // so it's fine on the broadcast claude.v1 for the chat view to display.
+        "permission_mode": v.permission_mode,
     })
 }
 

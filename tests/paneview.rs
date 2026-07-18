@@ -15,6 +15,9 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
     let args = Args::parse_from(["remux", "--session", session, "--no-pair"]);
     Arc::new(App {
         allowed_hosts: vec![],
+        allowed_client_origins: vec![],
+        machine_id: remux::machine_id(dir).unwrap(),
+        machine_name: "test-machine".into(),
         auth,
         args,
         attention: tokio::sync::broadcast::channel(4).0,

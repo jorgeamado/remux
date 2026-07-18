@@ -558,6 +558,9 @@ function openSessionMenu(): void {
     }
   }
   sessionMenu.appendChild(menuItem("Add machine…", () => void addMachineFlow()));
+  if (typeof navigator.mediaDevices?.getUserMedia === "function") {
+    sessionMenu.appendChild(menuItem("Scan QR to add…", () => void scanMachineFlow()));
+  }
   sessionMenu.hidden = false;
 }
 
@@ -610,32 +613,25 @@ function resetMachineScopedState(): void {
   handle.term.reset();
 }
 
-/// In-app "Add machine": URL + pairing link/token. Deliberately NOT the
-/// scan-the-QR path — scanning another machine's pairing QR opens that
-/// machine's own PWA in the browser, outside this installed app.
-async function addMachineFlow(): Promise<void> {
-  sessionMenu.hidden = true;
-  const rawUrl = window.prompt(
-    "Machine URL (from that machine's `remux serve`):",
-    "https://"
-  );
-  if (rawUrl === null) return;
-  const baseUrl = normalizeMachineUrl(rawUrl);
-  if (!baseUrl) {
-    showHint("Machine URLs must be https://host[:port]");
-    return;
+/// Split pairing input into address + optional token. A full pairing link
+/// ("https://host:port/#pair=<64hex>") answers both at once; a bare URL
+/// leaves the token null; a bare token with no address is not enough.
+/// Returns an error hint string when the input can't name a machine.
+function parsePairingInput(
+  raw: string
+): { baseUrl: string; token: string | null } | string {
+  const token = extractPairToken(raw);
+  const withoutToken = raw.replace(/(?:#pair=)?[0-9a-f]{64}\s*$/i, "").trim();
+  if (token && !withoutToken) {
+    return "Paste the full pairing link — it includes the machine's address";
   }
-  if (baseUrl === location.origin) {
-    showHint("That's this machine");
-    return;
-  }
-  const link = window.prompt("Pairing link or token (run `remux pair` there):");
-  if (link === null) return;
-  const token = extractPairToken(link);
-  if (!token) {
-    showHint("That doesn't look like a pairing link or token");
-    return;
-  }
+  const baseUrl = normalizeMachineUrl(withoutToken.replace(/#$/, ""));
+  if (!baseUrl) return "Machine URLs must be https://host[:port]";
+  if (baseUrl === location.origin) return "That's this machine";
+  return { baseUrl, token };
+}
+
+async function completePairing(baseUrl: string, token: string): Promise<void> {
   try {
     const machine = await pairMachine(baseUrl, token);
     showHint(`Paired with ${machine.name}`);
@@ -651,6 +647,144 @@ async function addMachineFlow(): Promise<void> {
       showHint(`Pairing failed: ${e instanceof Error ? e.message : e}`);
     }
   }
+}
+
+/// In-app "Add machine": paste the other machine's pairing link and it pairs
+/// in one step (the link carries both the URL and the token). A bare URL
+/// still works — the token is asked for separately.
+async function addMachineFlow(): Promise<void> {
+  sessionMenu.hidden = true;
+  const rawUrl = window.prompt(
+    "Pairing link from that machine (or just its URL):",
+    "https://"
+  );
+  if (rawUrl === null) return;
+  const parsed = parsePairingInput(rawUrl);
+  if (typeof parsed === "string") {
+    showHint(parsed);
+    return;
+  }
+  let token = parsed.token;
+  if (!token) {
+    const link = window.prompt("Pairing link or token (run `remux pair` there):");
+    if (link === null) return;
+    token = extractPairToken(link);
+  }
+  if (!token) {
+    showHint("That doesn't look like a pairing link or token");
+    return;
+  }
+  await completePairing(parsed.baseUrl, token);
+}
+
+/// In-app QR scan for "Add machine". The daemon's pairing QR encodes the full
+/// pairing link; scanning it with the OS camera would open that machine's own
+/// PWA in the browser, outside this installed app — so we scan it HERE, with
+/// our own camera view, and feed the decoded link into the same pairing path
+/// as paste.
+async function scanMachineFlow(): Promise<void> {
+  sessionMenu.hidden = true;
+  const text = await scanQrCode();
+  if (text === null) return; // cancelled or camera unavailable (already hinted)
+  const parsed = parsePairingInput(text);
+  if (typeof parsed === "string") {
+    showHint(parsed);
+    return;
+  }
+  if (!parsed.token) {
+    showHint("That QR has no pairing token — run `remux pair` on that machine");
+    return;
+  }
+  await completePairing(parsed.baseUrl, parsed.token);
+}
+
+/// Minimal surface of the Shape Detection API (Chrome/Android). iOS Safari
+/// doesn't have it — there we lazy-load the pure-JS jsQR decoder instead.
+interface QrDetector {
+  detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
+}
+
+/// Full-screen camera view; resolves with the first decoded QR payload, or
+/// null on cancel / no camera. Frames are sampled a few times a second — a
+/// tight loop would peg the phone's CPU for no faster lock-on.
+async function scanQrCode(): Promise<string | null> {
+  if (typeof navigator.mediaDevices?.getUserMedia !== "function") {
+    showHint("No camera here — paste the pairing link instead");
+    return null;
+  }
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+    });
+  } catch {
+    showHint("Camera unavailable — paste the pairing link instead");
+    return null;
+  }
+  const detectorCtor = (
+    window as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => QrDetector }
+  ).BarcodeDetector;
+  const detector = detectorCtor ? new detectorCtor({ formats: ["qr_code"] }) : null;
+  return await new Promise<string | null>((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.id = "qr-scan";
+    const video = document.createElement("video");
+    video.playsInline = true; // iOS: without this, playback goes fullscreen
+    video.muted = true;
+    video.srcObject = stream;
+    const label = document.createElement("p");
+    label.textContent = "Point at the pairing QR";
+    const cancel = document.createElement("button");
+    cancel.className = "btn";
+    cancel.textContent = "Cancel";
+    overlay.append(video, label, cancel);
+    document.body.append(overlay);
+    let done = false;
+    const finish = (text: string | null): void => {
+      if (done) return;
+      done = true;
+      stream.getTracks().forEach((t) => t.stop());
+      overlay.remove();
+      resolve(text);
+    };
+    cancel.addEventListener("click", () => finish(null));
+    void video.play();
+    let jsQr: typeof import("jsqr").default | null = null;
+    if (!detector) {
+      import("jsqr").then(
+        (m) => (jsQr = m.default),
+        () => {
+          showHint("QR decoder failed to load — paste the link instead");
+          finish(null);
+        }
+      );
+    }
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const tick = async (): Promise<void> => {
+      if (done) return;
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        try {
+          if (detector) {
+            const codes = await detector.detect(video);
+            const hit = codes.find((c) => c.rawValue);
+            if (hit) return finish(hit.rawValue);
+          } else if (jsQr && ctx) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0);
+            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQr(img.data, img.width, img.height);
+            if (code?.data) return finish(code.data);
+          }
+        } catch {
+          /* transient decode error — keep scanning */
+        }
+      }
+      window.setTimeout(() => void tick(), 200);
+    };
+    void tick();
+  });
 }
 
 sessionName.addEventListener("click", (ev) => {

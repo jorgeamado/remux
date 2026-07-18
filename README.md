@@ -188,8 +188,12 @@ remux serve ... --machine-name laptop \
   --allowed-client-origin https://home-mac.your-tailnet.ts.net:7777
 ```
 
-Then in the app: session name → **Add machine…** → enter that machine's URL
-and a pairing link from `remux pair` on it. The switcher (same menu) moves
+Then in the app: session name → **Add machine…** → paste the pairing link
+printed by `remux pair` on that machine (one paste pairs — the link carries
+both the address and the token; a bare URL works too, the token is asked for
+next). Or **Scan QR to add…** to point the camera at the pairing QR from
+inside the app — scanning it with the OS camera would instead open that
+machine's own PWA in the browser. The switcher (same menu) moves
 between machines; exactly one machine is connected at a time — switching
 closes the previous connection on purpose, so backgrounded machines can
 still reach your lock screen via push and never linger as phantom tmux

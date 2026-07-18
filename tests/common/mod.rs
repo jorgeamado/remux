@@ -12,10 +12,7 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
 
 /// `start_server` plus allowlisted foreign client origins
 /// (`--allowed-client-origin`), for the multi-machine CORS tests.
-pub async fn start_server_with(
-    session: &str,
-    client_origins: &[&str],
-) -> (SocketAddr, Arc<App>) {
+pub async fn start_server_with(session: &str, client_origins: &[&str]) -> (SocketAddr, Arc<App>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("remux=trace")
         .try_init();

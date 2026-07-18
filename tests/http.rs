@@ -551,8 +551,7 @@ async fn meta_requires_auth_and_reports_identity() {
 
 #[tokio::test]
 async fn allowlisted_client_origin_gets_cors_on_api() {
-    let (addr, app) =
-        common::start_server_with("it-cors", &["https://home.ts.net:7777"]).await;
+    let (addr, app) = common::start_server_with("it-cors", &["https://home.ts.net:7777"]).await;
     let client = reqwest::Client::new();
 
     // Preflight (what the browser sends before a cross-origin authed fetch).

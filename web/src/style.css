@@ -526,6 +526,41 @@ button {
   color: #fff;
 }
 
+/* ---------- QR scan (Add machine) ---------- */
+
+#qr-scan {
+  position: fixed;
+  inset: 0;
+  z-index: 40; /* above setup and menus — it's a modal capture surface */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 28px;
+  padding-bottom: calc(28px + env(safe-area-inset-bottom));
+  background: #000;
+}
+
+#qr-scan video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#qr-scan p,
+#qr-scan .btn {
+  z-index: 1;
+}
+
+#qr-scan p {
+  color: #fff;
+  font-size: 14px;
+  text-shadow: 0 1px 4px rgb(0 0 0 / 80%);
+}
+
 /* ---------- setup ---------- */
 
 #setup {

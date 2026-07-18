@@ -50,6 +50,9 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "pd", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,

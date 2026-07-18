@@ -3,45 +3,28 @@ import { createTerminal } from "./term";
 import { setupKeyRow, applyCtrl, disarmCtrl, keyDeckMode, setKeyDeckMode } from "./keys";
 import type { DeckMode } from "./keys";
 import { cellFromPoint, setupTouchScroll } from "./scroll";
+import {
+  Machine,
+  activeMachine,
+  allMachines,
+  apiUrl,
+  homeMachine,
+  loadMachines,
+  normalizeMachineUrl,
+  setActiveMachine,
+  setMachineIdentity,
+  setMachineSession,
+  setMachineToken,
+  upsertMachine,
+  wsUrl,
+} from "./machines";
 
-const TOKEN_KEY = "remux.device_token";
-
-// ---------- token mirror for the service worker ----------
-// The SW cannot read localStorage; it needs the device token to ask
-// /api/attention for notification detail after a (payload-less) push.
-// IndexedDB is the only storage both contexts share.
-function idbTokenWrite(token: string | null): void {
-  try {
-    const open = indexedDB.open("remux", 1);
-    open.onupgradeneeded = () => open.result.createObjectStore("kv");
-    open.onsuccess = () => {
-      const tx = open.result.transaction("kv", "readwrite");
-      if (token === null) {
-        tx.objectStore("kv").delete("device_token");
-      } else {
-        tx.objectStore("kv").put(token, "device_token");
-      }
-      tx.oncomplete = () => open.result.close();
-    };
-  } catch {
-    /* private mode etc. — SW falls back to the generic notification */
-  }
-}
-
-function setDeviceToken(token: string | null): void {
-  if (token === null) {
-    localStorage.removeItem(TOKEN_KEY);
-  } else {
-    localStorage.setItem(TOKEN_KEY, token);
-  }
-  idbTokenWrite(token);
-}
-
-// Devices paired before the mirror existed: sync on every startup.
-idbTokenWrite(localStorage.getItem(TOKEN_KEY));
+// Machine records (per-machine device token + last session), migrated from
+// the pre-multi-machine single-token keys and mirrored to IndexedDB for the
+// service worker. Must run before anything touches tokens.
+loadMachines();
 const FONT_KEY = "remux.font";
 const NOTIFY_KEY = "remux.notify";
-const SESSION_KEY = "remux.session";
 const TERMKB_KEY = "remux.termkb";
 // Purge any typed-command history persisted by older builds — command lines can
 // contain secrets and must never live on disk. History is memory-only now.
@@ -129,24 +112,56 @@ function extractPairToken(text: string): string | null {
   return m ? m[1] : null;
 }
 
-async function pairWith(token: string): Promise<void> {
-  const resp = await fetch("/api/pair", {
+function deviceName(): string {
+  return navigator.userAgent.includes("iPhone")
+    ? "iPhone"
+    : navigator.userAgent.includes("Android")
+      ? "Android"
+      : "browser";
+}
+
+/// Pair with a daemon. `baseUrl` "" = the machine that served this PWA
+/// (the "home" machine); anything else is a foreign machine being added.
+async function pairMachine(baseUrl: string, token: string): Promise<Machine> {
+  const resp = await fetch(`${baseUrl}/api/pair`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      token,
-      device_name: navigator.userAgent.includes("iPhone")
-        ? "iPhone"
-        : navigator.userAgent.includes("Android")
-          ? "Android"
-          : "browser",
-    }),
+    body: JSON.stringify({ token, device_name: deviceName() }),
   });
   if (!resp.ok) {
     throw new Error(await resp.text());
   }
   const body = (await resp.json()) as { device_token: string };
-  setDeviceToken(body.device_token);
+  const fallbackName = baseUrl ? new URL(baseUrl).host : location.host;
+  const machine = upsertMachine({
+    id: baseUrl || "home",
+    name: fallbackName,
+    url: baseUrl,
+    token: body.device_token,
+  });
+  // May merge into an existing record for the same daemon — hand the caller
+  // the survivor, not a record that no longer exists.
+  return refreshMachineMeta(machine);
+}
+
+/// Upgrade a record's placeholder identity to the daemon's persistent
+/// machine_id + display name; may merge with an existing record for the same
+/// daemon (returns the survivor). Best effort: a pre-/api/meta daemon keeps
+/// the placeholder (URL-keyed) identity and everything still works.
+async function refreshMachineMeta(m: Machine): Promise<Machine> {
+  try {
+    const resp = await fetch(apiUrl(m, "/api/meta"), {
+      headers: { authorization: `Bearer ${m.token}` },
+    });
+    if (!resp.ok) return m;
+    const meta = (await resp.json()) as { machine_id?: string; name?: string };
+    if (meta.machine_id) {
+      return setMachineIdentity(m, meta.machine_id, meta.name || m.name);
+    }
+  } catch {
+    /* offline / older daemon */
+  }
+  return m;
 }
 
 function showSetup(message?: string): void {
@@ -262,8 +277,8 @@ const RESPONSE_RE =
   /^(?:\x1b\[\?[\d;]*c|\x1b\[>[\d;]*c|\x1b\[\d+;\d+R|\x1b\[\??\d+n|\x1b\[\?[\d;]*\$y|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\)+$/;
 
 function connect(): void {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) {
+  const machine = activeMachine();
+  if (!machine?.token) {
     showSetup();
     return;
   }
@@ -271,8 +286,7 @@ function connect(): void {
   setup.hidden = true;
   setStatus("connecting…", "connecting");
 
-  const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const sock = new WebSocket(`${scheme}://${location.host}/ws`);
+  const sock = new WebSocket(wsUrl(machine));
   sock.binaryType = "arraybuffer";
   ws = sock;
 
@@ -280,10 +294,10 @@ function connect(): void {
     const { cols, rows } = handle.size();
     sendJson({
       type: "auth",
-      token,
+      token: machine.token,
       cols,
       rows,
-      session: localStorage.getItem(SESSION_KEY) || undefined,
+      session: machine.session || undefined,
     });
   };
 
@@ -492,18 +506,15 @@ function handleControl(msg: ControlMsg): void {
     }
     case "error":
       if (msg.code === "auth_failed") {
-        setDeviceToken(null);
-        intentionalClose = true;
-        ws?.close();
-        showSetup("This device is no longer paired. Pair it again.");
+        onMachineAuthLost("This device is no longer paired. Pair it again.");
       } else if (msg.code === "revoked") {
-        setDeviceToken(null);
-        intentionalClose = true;
-        ws?.close();
-        showSetup("This device was revoked. Pair it again if that was a mistake.");
+        onMachineAuthLost(
+          "This device was revoked. Pair it again if that was a mistake."
+        );
       } else if (msg.code === "invalid_session") {
         // Fall back to the server default; onclose will reconnect.
-        localStorage.removeItem(SESSION_KEY);
+        const m = activeMachine();
+        if (m) setMachineSession(m, undefined);
         showHint("Session unavailable — using default");
       } else if (msg.code === "release_failed") {
         // We tried to open the dashboard, which releases terminal control — but
@@ -517,6 +528,29 @@ function handleControl(msg: ControlMsg): void {
       }
       break;
   }
+}
+
+/// The active machine rejected our token (unpaired/revoked). Home machine:
+/// clear the token and return to the pairing screen. Foreign machine: forget
+/// it and land back on home — its PWA can only re-add it by pairing anyway.
+function onMachineAuthLost(message: string): void {
+  const m = activeMachine();
+  if (!m || m.url === "") {
+    intentionalClose = true;
+    ws?.close();
+    if (m) setMachineToken(m, null);
+    showSetup(message);
+    return;
+  }
+  const name = m.name;
+  setMachineToken(m, null); // removes the foreign machine, active falls home
+  // No intentionalClose here: connect() supersedes this socket, so its close
+  // event is ignored — a set flag would leak onto the NEW socket and swallow
+  // its first real disconnect (the bug the 2026-07-12 review found).
+  ws?.close();
+  resetMachineScopedState();
+  connect();
+  showHint(`${name}: ${message}`);
 }
 
 function scheduleReconnect(): void {
@@ -561,13 +595,32 @@ function openSessionMenu(): void {
       switchSession(name);
     })
   );
+  // Machines: sessions above are the ACTIVE machine's; other paired daemons
+  // are one tap away. Single live connection by design — switching machines
+  // closes this socket (a lingering one would suppress that machine's push
+  // and linger as a phantom tmux client).
+  if (allMachines().length > 1 || activeMachine()?.url !== "") {
+    const label = document.createElement("div");
+    label.className = "menu-label";
+    label.textContent = "Machines";
+    sessionMenu.appendChild(label);
+    for (const m of allMachines()) {
+      const marker = m.id === activeMachine()?.id ? "● " : "";
+      sessionMenu.appendChild(menuItem(`${marker}${m.name}`, () => switchMachine(m)));
+    }
+  }
+  sessionMenu.appendChild(menuItem("Add machine…", () => void addMachineFlow()));
+  if (typeof navigator.mediaDevices?.getUserMedia === "function") {
+    sessionMenu.appendChild(menuItem("Scan QR to add…", () => void scanMachineFlow()));
+  }
   sessionMenu.hidden = false;
 }
 
 function switchSession(name: string): void {
   sessionMenu.hidden = true;
   if (name === sessionTitle) return;
-  localStorage.setItem(SESSION_KEY, name);
+  const m = activeMachine();
+  if (m) setMachineSession(m, name);
   // connect() supersedes the old socket; its close event is then ignored,
   // so no intentionalClose flag is needed (which could leak and suppress
   // the reconnect after an invalid_session rejection).
@@ -579,6 +632,275 @@ function switchSession(name: string): void {
   clearPaneViews(); // per-pane views belong to the old session — drop them
   handle.term.reset(); // fresh grid; the new attach repaints everything
   connect();
+}
+
+// ---------- machines (multi-host) ----------
+
+/// Close the connection to the current machine and attach to another. The old
+/// socket MUST die (not idle in the background): a live socket registers this
+/// device as "watching" on that daemon, which suppresses its Web Push — and
+/// its PTY is a real tmux client on that machine.
+function switchMachine(m: Machine): void {
+  sessionMenu.hidden = true;
+  if (m.id === activeMachine()?.id) return;
+  setActiveMachine(m.id);
+  ws?.close(); // superseded by the connect() below; close event ignored
+  resetMachineScopedState();
+  setStatus(`connecting to ${m.name}…`, "connecting");
+  connect();
+}
+
+/// Everything that belongs to the machine we are leaving. A composer draft or
+/// buffered keystrokes typed for machine A must never be sendable to machine
+/// B — a half-typed command can carry secrets and is wrong on B anyway.
+function resetMachineScopedState(): void {
+  clearFeed();
+  clearPermissionCards();
+  topology = []; // the new machine streams its own
+  sessionTitle = "";
+  composerInput.value = "";
+  shellLinePending = false;
+  endRecall(); // an in-progress recall indexes the OLD machine's snapshot
+  pendingInput = "";
+  controlRequested = false;
+  handle.term.reset();
+}
+
+/// Split pairing input into address + optional token. A full pairing link
+/// ("https://host:port/#pair=<64hex>") answers both at once; a bare URL
+/// leaves the token null; a bare token with no address is not enough.
+/// The token is ONLY taken from an explicit `#pair=` fragment — 64 hex
+/// characters anywhere else (say, a URL path) must not be promoted to a
+/// credential and sent to whatever address remains.
+/// Returns an error hint string when the input can't name a machine.
+function parsePairingInput(
+  raw: string
+): { baseUrl: string; token: string | null } | string {
+  const s = raw.trim();
+  if (/^[0-9a-f]{64}$/i.test(s)) {
+    return "Paste the full pairing link — it includes the machine's address";
+  }
+  const m = s.match(/^(.*?)#pair=([0-9a-f]{64})$/i);
+  const token = m ? m[2] : null;
+  const baseUrl = normalizeMachineUrl(m ? m[1].replace(/#$/, "") : s);
+  if (!baseUrl) return "Machine URLs must be https://host[:port]";
+  if (baseUrl === location.origin) return "That's this machine";
+  return { baseUrl, token };
+}
+
+async function completePairing(baseUrl: string, token: string): Promise<void> {
+  try {
+    const machine = await pairMachine(baseUrl, token);
+    showHint(`Paired with ${machine.name}`);
+    switchMachine(machine);
+  } catch (e) {
+    // A CORS/network failure surfaces as a bare TypeError — the usual cause
+    // is the foreign daemon not allowlisting this PWA's origin.
+    if (e instanceof TypeError) {
+      showHint(
+        `Can't reach it — run its daemon with --allowed-client-origin ${location.origin}`
+      );
+    } else {
+      showHint(`Pairing failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+}
+
+/// In-app "Add machine": paste the other machine's pairing link and it pairs
+/// in one step (the link carries both the URL and the token). A bare URL
+/// still works — the token is asked for separately.
+async function addMachineFlow(): Promise<void> {
+  sessionMenu.hidden = true;
+  const rawUrl = window.prompt(
+    "Pairing link from that machine (or just its URL):",
+    "https://"
+  );
+  if (rawUrl === null) return;
+  const parsed = parsePairingInput(rawUrl);
+  if (typeof parsed === "string") {
+    showHint(parsed);
+    return;
+  }
+  let token = parsed.token;
+  if (!token) {
+    const link = window.prompt("Pairing link or token (run `remux pair` there):");
+    if (link === null) return;
+    const t = link.trim();
+    if (/^[0-9a-f]{64}$/i.test(t)) {
+      token = t;
+    } else {
+      // A full link pasted here must name the SAME machine — silently sending
+      // machine B's token to the machine A address from the first prompt
+      // would hand A a reusable credential for B.
+      const second = parsePairingInput(t);
+      if (typeof second === "string") {
+        showHint(second);
+        return;
+      }
+      if (second.baseUrl !== parsed.baseUrl) {
+        showHint(`That link is for ${second.baseUrl}, not ${parsed.baseUrl}`);
+        return;
+      }
+      token = second.token;
+    }
+  }
+  if (!token) {
+    showHint("That doesn't look like a pairing link or token");
+    return;
+  }
+  await completePairing(parsed.baseUrl, token);
+}
+
+/// In-app QR scan for "Add machine". The daemon's pairing QR encodes the full
+/// pairing link; scanning it with the OS camera would open that machine's own
+/// PWA in the browser, outside this installed app — so we scan it HERE, with
+/// our own camera view, and feed the decoded link into the same pairing path
+/// as paste.
+async function scanMachineFlow(): Promise<void> {
+  sessionMenu.hidden = true;
+  const text = await scanQrCode();
+  if (text === null) return; // cancelled or camera unavailable (already hinted)
+  const parsed = parsePairingInput(text);
+  if (typeof parsed === "string") {
+    showHint(parsed);
+    return;
+  }
+  if (!parsed.token) {
+    showHint("That QR has no pairing token — run `remux pair` on that machine");
+    return;
+  }
+  // A QR is untrusted input that would otherwise enroll a machine with zero
+  // further interaction — show where it points before pairing.
+  if (!window.confirm(`Pair with ${parsed.baseUrl}?`)) return;
+  await completePairing(parsed.baseUrl, parsed.token);
+}
+
+/// Minimal surface of the Shape Detection API (Chrome/Android). iOS Safari
+/// doesn't have it — there we lazy-load the pure-JS jsQR decoder instead.
+interface QrDetector {
+  detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
+}
+interface QrDetectorCtor {
+  new (opts: { formats: string[] }): QrDetector;
+  getSupportedFormats?(): Promise<string[]>;
+}
+
+/// Native QR detector, or null when the platform can't do it. Existence of
+/// BarcodeDetector is not enough — supported formats vary by platform, which
+/// is exactly what getSupportedFormats() is for; a detector that can never
+/// see a QR would silently suppress the jsQR fallback forever.
+async function nativeQrDetector(): Promise<QrDetector | null> {
+  const ctor = (window as unknown as { BarcodeDetector?: QrDetectorCtor }).BarcodeDetector;
+  if (!ctor) return null;
+  try {
+    const formats = (await ctor.getSupportedFormats?.()) ?? [];
+    if (!formats.includes("qr_code")) return null;
+    return new ctor({ formats: ["qr_code"] });
+  } catch {
+    return null;
+  }
+}
+
+/// Full-screen camera view; resolves with the first decoded QR payload, or
+/// null on cancel / no camera. Frames are sampled a few times a second — a
+/// tight loop would peg the phone's CPU for no faster lock-on.
+async function scanQrCode(): Promise<string | null> {
+  if (typeof navigator.mediaDevices?.getUserMedia !== "function") {
+    showHint("No camera here — paste the pairing link instead");
+    return null;
+  }
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+    });
+  } catch {
+    showHint("Camera unavailable — paste the pairing link instead");
+    return null;
+  }
+  let detector = await nativeQrDetector();
+  return await new Promise<string | null>((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.id = "qr-scan";
+    const video = document.createElement("video");
+    video.playsInline = true; // iOS: without this, playback goes fullscreen
+    video.muted = true;
+    video.srcObject = stream;
+    const label = document.createElement("p");
+    label.textContent = "Point at the pairing QR";
+    const cancel = document.createElement("button");
+    cancel.className = "btn";
+    cancel.textContent = "Cancel";
+    overlay.append(video, label, cancel);
+    document.body.append(overlay);
+    let done = false;
+    // The camera must not outlive the scanner: backgrounding the PWA, page
+    // teardown, or the OS revoking the track all end the scan — a live
+    // stream with nobody watching is a lit camera indicator and a promise
+    // that never settles.
+    const onHidden = (): void => {
+      if (document.visibilityState === "hidden") finish(null);
+    };
+    const onPageHide = (): void => finish(null);
+    const finish = (text: string | null): void => {
+      if (done) return;
+      done = true;
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", onPageHide);
+      stream.getTracks().forEach((t) => t.stop());
+      overlay.remove();
+      resolve(text);
+    };
+    document.addEventListener("visibilitychange", onHidden);
+    window.addEventListener("pagehide", onPageHide);
+    stream.getTracks().forEach((t) => t.addEventListener("ended", () => finish(null)));
+    cancel.addEventListener("click", () => finish(null));
+    void video.play();
+    let jsQr: typeof import("jsqr").default | null = null;
+    const loadJsQr = (): void => {
+      import("jsqr").then(
+        (m) => (jsQr = m.default),
+        () => {
+          if (done) return; // cancelled while loading — nothing to report
+          showHint("QR decoder failed to load — paste the link instead");
+          finish(null);
+        }
+      );
+    };
+    if (!detector) loadJsQr();
+    let nativeErrors = 0;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const tick = async (): Promise<void> => {
+      if (done) return;
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        try {
+          if (detector) {
+            const codes = await detector.detect(video);
+            const hit = codes.find((c) => c.rawValue);
+            if (hit) return finish(hit.rawValue);
+            nativeErrors = 0;
+          } else if (jsQr && ctx) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0);
+            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQr(img.data, img.width, img.height);
+            if (code?.data) return finish(code.data);
+          }
+        } catch {
+          // A detector that keeps rejecting is broken, not busy — drop to
+          // the JS decoder instead of scanning forever with a dead engine.
+          if (detector && ++nativeErrors >= 5) {
+            detector = null;
+            loadJsQr();
+          }
+        }
+      }
+      window.setTimeout(() => void tick(), 200);
+    };
+    void tick();
+  });
 }
 
 sessionName.addEventListener("click", (ev) => {
@@ -918,7 +1240,7 @@ async function decidePermission(card: PermissionCard, decision: "allow" | "deny"
   permDeciding.add(card.id);
   paintPermissionCards();
   try {
-    const resp = await fetch(`/api/permissions/${encodeURIComponent(card.id)}/decide`, {
+    const resp = await fetch(activeApi(`/api/permissions/${encodeURIComponent(card.id)}/decide`), {
       method: "POST",
       headers: { ...authHeader(), "content-type": "application/json" },
       body: JSON.stringify({ decision }),
@@ -1770,19 +2092,41 @@ function b64urlToBytes(value: string): Uint8Array {
   return Uint8Array.from(raw, (c) => c.charCodeAt(0));
 }
 
+/// Auth for the ACTIVE machine's API.
 function authHeader(): Record<string, string> {
-  return { authorization: `Bearer ${localStorage.getItem(TOKEN_KEY) ?? ""}` };
+  return { authorization: `Bearer ${activeMachine()?.token ?? ""}` };
+}
+
+/// API path on the active machine (absolute for a foreign machine).
+function activeApi(path: string): string {
+  const m = activeMachine();
+  return m ? apiUrl(m, path) : path;
+}
+
+/// Web Push is HOME-machine only: the service worker's single push
+/// subscription is bound to the home daemon's VAPID key, so other daemons
+/// can't use it. Their notifications arrive in-band while active; true push
+/// from every machine is the roadmap's push-coordinator step.
+function homeAuthHeader(): Record<string, string> | null {
+  const home = homeMachine();
+  return home?.token ? { authorization: `Bearer ${home.token}` } : null;
 }
 
 async function subscribePush(): Promise<void> {
   if (!("serviceWorker" in navigator)) return;
+  const auth = homeAuthHeader();
+  if (!auth) {
+    // Never fail silently here — the user just toggled notifications on.
+    showHint("Push setup failed — pair this app's own machine first");
+    return;
+  }
   const reg = await navigator.serviceWorker.getRegistration();
   if (!reg?.pushManager) {
     showHint("Lock-screen alerts need the installed app; in-app alerts active");
     return;
   }
   try {
-    const resp = await fetch("/api/push/key", { headers: authHeader() });
+    const resp = await fetch("/api/push/key", { headers: auth });
     if (!resp.ok) throw new Error(String(resp.status));
     const { key } = (await resp.json()) as { key: string };
     let sub: PushSubscription;
@@ -1802,7 +2146,7 @@ async function subscribePush(): Promise<void> {
     const json = sub.toJSON();
     const resp2 = await fetch("/api/push/subscribe", {
       method: "POST",
-      headers: { ...authHeader(), "content-type": "application/json" },
+      headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify({ endpoint: sub.endpoint, keys: json.keys ?? {} }),
     });
     if (!resp2.ok) throw new Error(await resp2.text());
@@ -1818,11 +2162,14 @@ async function unsubscribePush(): Promise<void> {
     const reg = await navigator.serviceWorker?.getRegistration();
     const sub = await reg?.pushManager?.getSubscription();
     if (!sub) return;
-    await fetch("/api/push/unsubscribe", {
-      method: "POST",
-      headers: { ...authHeader(), "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: sub.endpoint }),
-    });
+    const auth = homeAuthHeader();
+    if (auth) {
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      });
+    }
     await sub.unsubscribe();
   } catch {
     /* best effort */
@@ -1831,20 +2178,47 @@ async function unsubscribePush(): Promise<void> {
 
 /// After a notification tap (or any return to the app), land on the session
 /// that actually wants attention — the push payload deliberately can't say.
+/// Fans out across every paired machine (there is no live socket to the
+/// inactive ones — this poll is their only in-app signal).
 async function checkPendingAttention(): Promise<void> {
-  if (!localStorage.getItem(TOKEN_KEY)) return;
-  try {
-    const resp = await fetch("/api/attention", { headers: authHeader() });
-    if (!resp.ok) return;
-    const { sessions } = (await resp.json()) as { sessions: string[] };
-    const others = sessions.filter((s) => s !== sessionTitle);
-    if (others.length > 0 && !sessions.includes(sessionTitle)) {
-      showHint(`Attention in ${others[0]} — tap to open`, () =>
-        switchSession(others[0])
-      );
-    }
-  } catch {
-    /* offline */
+  const active = activeMachine();
+  if (!active?.token) return;
+  const results = await Promise.all(
+    allMachines().map(async (m) => {
+      try {
+        // Bounded: an unreachable machine must not stall the deep-link past
+        // the moment the user is still looking at the hint.
+        const resp = await fetch(apiUrl(m, "/api/attention"), {
+          headers: { authorization: `Bearer ${m.token}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return null;
+        const { sessions } = (await resp.json()) as { sessions: string[] };
+        return { m, sessions };
+      } catch {
+        return null; // that machine is offline — not this one's problem
+      }
+    })
+  );
+  // The active machine's current session already shows its own state; prefer
+  // its other sessions, then other machines.
+  const here = results.find((r) => r?.m.id === active.id);
+  if (here && here.sessions.includes(sessionTitle)) return;
+  const localOther = here?.sessions.find((s) => s !== sessionTitle);
+  if (localOther) {
+    showHint(`Attention in ${localOther} — tap to open`, () =>
+      switchSession(localOther)
+    );
+    return;
+  }
+  for (const r of results) {
+    if (!r || r.m.id === active.id || r.sessions.length === 0) continue;
+    const { m, sessions } = r;
+    showHint(`Attention on ${m.name}: ${sessions[0]} — tap to open`, () => {
+      setMachineSession(m, sessions[0]);
+      switchMachine(m);
+    });
+    return;
   }
 }
 
@@ -2019,12 +2393,19 @@ let recallSnapshot: string[] = [];
 // that nothing is persisted.
 let composerFromFeed = false;
 
-// Per-session typed-command history, MEMORY ONLY (see above). session -> lines.
+// Per-machine, per-session typed-command history, MEMORY ONLY (see above).
+// Keyed by machine id + session name: "main" on machine A and "main" on
+// machine B are different shells — recall must never offer A's commands
+// (possibly secrets) for sending to B.
 const typedHistoryMem = new Map<string, string[]>();
+
+function typedHistoryKey(): string {
+  return `${activeMachine()?.id ?? ""}:${sessionTitle}`;
+}
 
 function typedHistory(): string[] {
   if (!sessionTitle) return [];
-  return typedHistoryMem.get(sessionTitle) ?? [];
+  return typedHistoryMem.get(typedHistoryKey()) ?? [];
 }
 
 /// Record a *typed* command for this session, in memory only. Skips
@@ -2033,7 +2414,7 @@ function recordTyped(cmd: string): void {
   if (!sessionTitle || composerFromFeed) return;
   const h = typedHistory();
   if (h[h.length - 1] === cmd) return;
-  typedHistoryMem.set(sessionTitle, [...h, cmd].slice(-HISTORY_MAX));
+  typedHistoryMem.set(typedHistoryKey(), [...h, cmd].slice(-HISTORY_MAX));
 }
 
 function feedCommandSet(): Set<string> {
@@ -2381,8 +2762,10 @@ function standaloneMode(): string {
 function updateDebug(): void {
   if (!debugOn) return;
   const role = isController ? "controller" : "observer";
+  const m = activeMachine();
   debugOverlay.textContent = [
     `remux debug · ${standaloneMode()} · ${role}`,
+    `machine ${m?.name ?? "?"} ${m?.url || "(home)"}`,
     `session ${sessionTitle || "?"}`,
     handle.debug(),
     `ua ${navigator.userAgent.slice(0, 60)}`,
@@ -2547,7 +2930,7 @@ $("devices-btn").addEventListener("click", async (ev) => {
   menu.hidden = true;
   let list: { name: string; last_seen_unix: number; this_device: boolean }[];
   try {
-    const resp = await fetch("/api/devices", { headers: authHeader() });
+    const resp = await fetch(activeApi("/api/devices"), { headers: authHeader() });
     if (!resp.ok) throw new Error(String(resp.status));
     list = await resp.json();
   } catch {
@@ -2626,7 +3009,7 @@ $("pair-btn").addEventListener("click", async () => {
     return;
   }
   try {
-    await pairWith(token);
+    await pairMachine("", token);
     setup.hidden = true;
     connect();
   } catch (e) {
@@ -2691,7 +3074,7 @@ function offerInstallTip(pairUrl: string): void {
     const pairUrl = `${location.origin}/#pair=${hashToken}`;
     history.replaceState(null, "", location.pathname);
     try {
-      await pairWith(hashToken);
+      await pairMachine("", hashToken);
       offerInstallTip(pairUrl);
     } catch (e) {
       showSetup(`Pairing failed: ${e instanceof Error ? e.message : e}`);
@@ -2700,6 +3083,10 @@ function offerInstallTip(pairUrl: string): void {
   }
   requestWakeLock();
   connect();
+  // Devices paired before /api/meta existed carry the placeholder identity;
+  // upgrade to the daemon's persistent machine_id + name when reachable.
+  const home = homeMachine();
+  if (home?.token && home.id === "home") void refreshMachineMeta(home);
   // A notification tap may cold-start the app (no visibilitychange fires):
   // land on the session that wants attention.
   void checkPendingAttention();

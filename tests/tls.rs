@@ -42,6 +42,9 @@ async fn https_listener_serves_health() {
         key_path.to_str().unwrap(),
     ]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
         auth,
         args,

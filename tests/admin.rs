@@ -14,6 +14,9 @@ async fn admin_socket_mints_usable_pairing_tokens() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "adm", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,
@@ -67,6 +70,9 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "adm3", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,
@@ -106,6 +112,9 @@ async fn stale_socket_file_is_replaced() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "adm4", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,
@@ -134,6 +143,9 @@ async fn admin_socket_rejects_garbage() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "adm2", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,
@@ -176,6 +188,9 @@ async fn revoke_cascades_and_cancels_pairing() {
     let auth = Auth::load(dir.join("devices.json")).unwrap();
     let args = Args::parse_from(["remux", "--session", "adm5", "--no-pair"]);
     let app = Arc::new(App {
+        allowed_client_origins: Vec::new(),
+        machine_id: "test-machine-id".into(),
+        machine_name: "test-machine".into(),
         allowed_hosts: vec![],
         auth,
         args,

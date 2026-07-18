@@ -7,6 +7,12 @@ use std::sync::Arc;
 /// Start the real router on an ephemeral port with a fresh state dir.
 /// Returns the bound address and the app (for minting pairing tokens).
 pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
+    start_server_with(session, &[]).await
+}
+
+/// `start_server` plus allowlisted foreign client origins
+/// (`--allowed-client-origin`), for the multi-machine CORS tests.
+pub async fn start_server_with(session: &str, client_origins: &[&str]) -> (SocketAddr, Arc<App>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("remux=trace")
         .try_init();
@@ -18,6 +24,12 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
     let args = Args::parse_from(["remux", "--session", session, "--no-pair"]);
     let app = Arc::new(App {
         allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+        allowed_client_origins: client_origins
+            .iter()
+            .map(|o| remux::normalize_origin(o).unwrap())
+            .collect(),
+        machine_id: remux::machine_id(&dir).unwrap(),
+        machine_name: "test-machine".into(),
         auth,
         args,
         attention: tokio::sync::broadcast::channel(16).0,

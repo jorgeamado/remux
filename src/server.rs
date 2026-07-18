@@ -19,6 +19,7 @@ struct Assets;
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
+        .route("/api/meta", get(meta))
         .route("/api/pair", post(pair))
         .route("/api/sessions", get(sessions))
         .route("/api/windows", get(windows))
@@ -39,6 +40,26 @@ pub fn router(app: Arc<App>) -> Router {
 fn bearer_device(app: &App, headers: &HeaderMap) -> Option<crate::auth::Device> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     app.auth.authenticate(value.strip_prefix("Bearer ")?)
+}
+
+/// Identity + capability card for multi-machine clients: a PWA served by one
+/// machine keys its per-machine records on `machine_id` and gates features on
+/// `capabilities`/`protocol` instead of assuming every daemon matches the one
+/// that served it. Device-token gated: the name and feature set of a machine
+/// are not for unauthenticated tailnet peers.
+async fn meta(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if bearer_device(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "device token required").into_response();
+    }
+    Json(serde_json::json!({
+        "machine_id": app.machine_id,
+        "name": app.machine_name,
+        "protocol": { "api": 1, "ws": 1 },
+        "capabilities": [
+            "terminal", "topology", "attention", "permissions", "feed", "push", "devices",
+        ],
+    }))
+    .into_response()
 }
 
 async fn sessions(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -329,29 +350,80 @@ async fn guard(
 
     // Branch on *presence* first: an Origin that exists but isn't valid text
     // must be rejected, not skipped as if absent (Codex).
+    // A foreign-but-allowlisted client origin (multi-machine PWA) is tracked
+    // so the response can carry the CORS grant for exactly that origin.
+    let mut cors_origin: Option<String> = None;
     if let Some(origin_val) = headers.get(header::ORIGIN) {
         // Parse strictly with `url` rather than string-splitting: reject an
         // Origin carrying credentials (`https://allowed@evil` — the old splitter
         // read the host as `allowed`) and compare the REAL host. A non-text or
         // malformed Origin is rejected outright.
-        let origin_ok = origin_val
+        let parsed = origin_val
             .to_str()
             .ok()
             .and_then(|origin| url::Url::parse(origin).ok())
-            .filter(|u| u.username().is_empty() && u.password().is_none())
+            .filter(|u| u.username().is_empty() && u.password().is_none());
+        let host_ok = parsed
+            .as_ref()
             .and_then(|u| u.host_str().map(|h| allowed(&app, strip_brackets(h))))
             .unwrap_or(false);
-        if !origin_ok {
+        // Exact-origin match for foreign PWAs (--allowed-client-origin):
+        // whole scheme://host:port, not the hostname — a hostname grant
+        // would also bless http:// on an https deployment.
+        let client_origin = parsed
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .map(|u| u.origin().ascii_serialization())
+            .filter(|o| app.allowed_client_origins.iter().any(|a| a == o));
+        if !host_ok && client_origin.is_none() {
             tracing::warn!("rejected request: bad or non-text Origin header");
             return Err(StatusCode::FORBIDDEN);
         }
+        cors_origin = client_origin;
     }
 
     // Authenticated API responses can carry command summaries / attention detail;
     // keep them out of the browser's HTTP cache. Static assets may still cache.
     let is_api = request.uri().path().starts_with("/api");
+
+    // CORS applies only to allowlisted foreign client origins and only on
+    // /api/*. Same-origin requests need no grant, /ws does not use CORS, and
+    // static assets stay same-origin (each machine serves its own PWA).
+    let cors_header = match (&cors_origin, is_api) {
+        (Some(origin), true) => {
+            Some(header::HeaderValue::from_str(origin).map_err(|_| StatusCode::FORBIDDEN)?)
+        }
+        _ => None,
+    };
+
+    // Preflight: answer here — the router has no OPTIONS routes and would 405.
+    if let Some(origin_header) = &cors_header {
+        if request.method() == axum::http::Method::OPTIONS {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            let h = response.headers_mut();
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header.clone());
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                header::HeaderValue::from_static("GET, POST"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                header::HeaderValue::from_static("authorization, content-type"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                header::HeaderValue::from_static("600"),
+            );
+            h.insert(header::VARY, header::HeaderValue::from_static("Origin"));
+            return Ok(response);
+        }
+    }
+
     let mut response = next.run(request).await;
     let h = response.headers_mut();
+    if let Some(origin_header) = cors_header {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header);
+        h.insert(header::VARY, header::HeaderValue::from_static("Origin"));
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -453,8 +525,15 @@ async fn static_handler(uri: Uri) -> Response {
             if path == "index.html" {
                 resp.headers_mut().insert(
                     header::CONTENT_SECURITY_POLICY,
+                    // connect-src https:: the multi-machine PWA fetches other
+                    // daemons' /api/* cross-origin — TLS-only on purpose, so a
+                    // foreign machine can never be added over plaintext. The
+                    // localhost http entries exist for multi-daemon development
+                    // only (mirrors normalizeMachineUrl in the client).
                     header::HeaderValue::from_static(
-                        "default-src 'self'; connect-src 'self' ws: wss:; \
+                        "default-src 'self'; \
+                         connect-src 'self' https: ws: wss: \
+                           http://localhost:* http://127.0.0.1:*; \
                          img-src 'self' data:; style-src 'self'; \
                          base-uri 'none'; frame-ancestors 'none'",
                     ),

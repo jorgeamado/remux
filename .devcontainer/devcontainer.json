@@ -14,6 +14,17 @@
       "label": "remux daemon"
     }
   },
+  // Persist Claude Code state (config + login credentials) on the bind-mounted
+  // repo so a container rebuild doesn't require re-login. Contents are gitignored
+  // (.devcontainer/data/). Applies to every process, incl. the daemon's tmux
+  // panes, so `claude` in a pane picks it up automatically.
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "${containerWorkspaceFolder}/.devcontainer/data/claude"
+  },
+  // Claude Code lives on the ephemeral fs (npm -g), so reinstall it when the
+  // container is (re)created via devcontainer up. A custom `docker run` launch
+  // does not run this — reinstall manually there (see docs/STATUS.md).
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code",
   "customizations": {
     "vscode": {
       "extensions": [

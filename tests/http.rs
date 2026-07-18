@@ -333,6 +333,48 @@ async fn serves_embedded_index() {
     assert!(csp.to_str().unwrap().contains("default-src 'self'"));
 }
 
+#[tokio::test]
+async fn shell_revalidates_but_hashed_assets_are_immutable() {
+    // A new deploy must be picked up: the HTML shell and the service worker must
+    // not be cached (or the old index.html keeps pointing at the old, hashed-away
+    // JS bundle). The content-hashed build assets, in contrast, are immutable.
+    let (addr, _app) = start_server("it-cache").await;
+    let cc = |body: reqwest::Response| {
+        body.headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+
+    let index = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    assert_eq!(
+        cc(index).as_deref(),
+        Some("no-cache"),
+        "index.html must revalidate"
+    );
+
+    let sw = reqwest::get(format!("http://{addr}/sw.js")).await.unwrap();
+    assert_eq!(cc(sw).as_deref(), Some("no-cache"), "sw.js must revalidate");
+
+    // Discover a hashed asset from the served index and check it's immutable.
+    let html = reqwest::get(format!("http://{addr}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let asset = html
+        .split('"')
+        .find(|s| s.starts_with("/assets/") && (s.ends_with(".js") || s.ends_with(".css")))
+        .expect("index references a hashed asset");
+    let a = reqwest::get(format!("http://{addr}{asset}")).await.unwrap();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(
+        cc(a).as_deref(),
+        Some("public, max-age=31536000, immutable"),
+        "hashed assets are immutable"
+    );
+}
+
 /// Build an open card and keep its waiter receiver alive so the registry holds
 /// it (dropping the receiver would still leave it listed, but this mirrors a
 /// live hook). `_rx` must be held by the caller.

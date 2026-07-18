@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# taskscope — a tiny demo monitor ("our own htop") for remux.
+#
+# Just run `taskscope`: it shows a live fleet dashboard in the terminal, and —
+# when it's inside a remux-served tmux pane — ALSO streams its state to remux in
+# the background, so a "Dashboard" toggle appears on your phone (no `remux
+# stream` to type). The terminal stays canonical; the phone dashboard is extra.
+#
+# --json:      emit the state as newline-delimited JSON (one object per tick) and
+#              nothing else — for manual piping to `remux stream`.
+# --once:      render/emit a single frame and exit (handy for testing).
+# --no-stream: don't auto-stream to remux even inside a pane.
+#
+# No dependencies — pure bash. In the remux container it's on PATH as
+# `taskscope` (or /workspaces/remux/examples/taskscope/taskscope).
+set -u
+
+INTERVAL="${TASKSCOPE_INTERVAL:-1}"
+JSON=0; ONCE=0; STREAM=1
+PAUSED=0        # toggled from the phone via the remux action back-channel
+AFIFO=""        # action FIFO (daemon -> this source), set when interactive
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --once) ONCE=1 ;;
+    --no-stream) STREAM=0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "taskscope: unknown option $a" >&2; exit 2 ;;
+  esac
+done
+
+WORKERS=(api-gateway indexer web-1 web-2 scheduler backup)
+STATUS=(running running idle running idle done)
+CPU=(12 44 8 30 3 0)
+MEM=(120 512 90 140 40 20)
+PROG=(0 62 0 41 0 100)
+
+tick=0
+esc=$'\033'
+hide="${esc}[?25l"; show="${esc}[?25h"; home="${esc}[H"; clr="${esc}[2J"
+bold="${esc}[1m"; dim="${esc}[2m"; reset="${esc}[0m"
+green="${esc}[32m"; red="${esc}[31m"; cyan="${esc}[36m"; grey="${esc}[90m"
+
+STREAMING=0
+cleanup() {
+  # Closing fd 3 signals `remux stream` (EOF) to drop the pane view.
+  [ "$STREAMING" = 1 ] && exec 3>&- 2>/dev/null
+  # Close and remove the action FIFO.
+  [ -n "$AFIFO" ] && { exec 4<&- 2>/dev/null; rm -f "$AFIFO"; }
+  printf '%s%s' "$show" "$reset"
+  exit 0
+}
+trap cleanup INT TERM
+rnd() { echo $(( RANDOM % $1 )); }
+
+# Auto-stream to remux when running inside a remux-served pane, so the phone gets
+# a Dashboard with no piping. Best-effort: if the daemon isn't there `remux
+# stream` just exits and writes to fd 3 fail (ignored) — the TUI is unaffected.
+#
+# Also set up the ACTION back-channel: a FIFO the daemon writes chosen menu
+# actions to. We open it read-write on fd 4 FIRST (so it always has a reader and
+# `remux stream`'s write-open never blocks), then read it non-blockingly.
+maybe_start_stream() {
+  [ "$STREAM" = 1 ] || return 0
+  [ -n "${TMUX_PANE:-}" ] || return 0
+  local bin="${REMUX_BIN:-remux}"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  local fifo
+  fifo="$(mktemp -u "${TMPDIR:-/tmp}/taskscope.act.XXXXXX")"
+  if mkfifo "$fifo" 2>/dev/null && exec 4<>"$fifo" 2>/dev/null; then
+    AFIFO="$fifo"
+    exec 3> >("$bin" stream --view taskscope.v1 --actions "$fifo" 2>/dev/null) && STREAMING=1
+    [ "$STREAMING" = 1 ] || { exec 4<&- 2>/dev/null; rm -f "$fifo"; AFIFO=""; }
+  else
+    rm -f "$fifo" 2>/dev/null
+    exec 3> >("$bin" stream --view taskscope.v1 2>/dev/null) && STREAMING=1
+  fi
+}
+
+# Drain any actions the daemon has delivered (non-blocking). fd 4 is opened
+# read-write so a read never hits EOF; the short -t timeout bounds the wait.
+drain_actions() {
+  [ -n "$AFIFO" ] || return 0
+  local line
+  while IFS= read -r -t 0.01 -u 4 line 2>/dev/null; do
+    case "$line" in
+      *'"action":"pause"'*)  PAUSED=1 ;;
+      *'"action":"resume"'*) PAUSED=0 ;;
+    esac
+  done
+}
+
+step() {
+  [ "$PAUSED" = 1 ] && return 0   # frozen from the phone
+  local i
+  for i in "${!WORKERS[@]}"; do
+    case "${STATUS[$i]}" in
+      running)
+        CPU[$i]=$(( (CPU[i]*3 + $(rnd 90) + 5) / 4 ))
+        MEM[$i]=$(( MEM[i] + $(rnd 7) - 3 )); (( MEM[i] < 10 )) && MEM[$i]=10
+        PROG[$i]=$(( PROG[i] + $(rnd 6) ))
+        if (( PROG[i] >= 100 )); then PROG[$i]=100; STATUS[$i]=done; CPU[$i]=0; fi
+        (( $(rnd 45) == 0 )) && STATUS[$i]=error
+        ;;
+      idle)
+        CPU[$i]=$(( CPU[i] > 2 ? CPU[i]-2 : $(rnd 3) ))
+        (( $(rnd 6) == 0 )) && STATUS[$i]=running
+        ;;
+      done)
+        (( $(rnd 12) == 0 )) && { STATUS[$i]=running; PROG[$i]=0; }
+        ;;
+      error)
+        CPU[$i]=0
+        (( $(rnd 5) == 0 )) && STATUS[$i]=running
+        ;;
+    esac
+    (( CPU[i] > 100 )) && CPU[$i]=100
+  done
+}
+
+bar() { # value width
+  local v=$1 w=$2 fill i out=""
+  fill=$(( v * w / 100 ))
+  for ((i=0;i<w;i++)); do (( i < fill )) && out+="#" || out+="."; done
+  printf '%s' "$out"
+}
+
+color_for() {
+  case "$1" in
+    running) printf '%s' "$green" ;; idle) printf '%s' "$grey" ;;
+    done) printf '%s' "$cyan" ;; error) printf '%s' "$red" ;;
+  esac
+}
+
+render_tui() {
+  local i c
+  printf '%s' "$home"
+  local pausetag=""; [ "$PAUSED" = 1 ] && pausetag="${red} ▮▮ paused${reset}"
+  printf '%s%s taskscope%s  %sdemo monitor%s%s            uptime %ds  \n' \
+    "$bold" "$cyan" "$reset" "$dim" "$reset" "$pausetag" "$tick"
+  printf '%s\n' "──────────────────────────────────────────────────────────"
+  printf '%s%-13s %-8s %5s %7s  %-16s %s%s\n' \
+    "$dim" "WORKER" "STATUS" "CPU%" "MEM" "PROGRESS" "" "$reset"
+  for i in "${!WORKERS[@]}"; do
+    c=$(color_for "${STATUS[$i]}")
+    printf '%-13s %s%-8s%s %4d%% %6dM  %s%s%s %3d%%  \n' \
+      "${WORKERS[$i]}" "$c" "${STATUS[$i]}" "$reset" \
+      "${CPU[$i]}" "${MEM[$i]}" "$c" "$(bar "${PROG[$i]}" 16)" "$reset" "${PROG[$i]}"
+  done
+  printf '%s\n' "──────────────────────────────────────────────────────────"
+  printf '%sCtrl-C to quit · remux demo tool · try --json for structured state%s  \n' \
+    "$dim" "$reset"
+}
+
+emit_json() {
+  local i first=1
+  printf '{"t":%d,"workers":[' "$tick"
+  for i in "${!WORKERS[@]}"; do
+    (( first )) || printf ','; first=0
+    printf '{"name":"%s","status":"%s","cpu":%d,"mem":%d,"progress":%d}' \
+      "${WORKERS[$i]}" "${STATUS[$i]}" "${CPU[$i]}" "${MEM[$i]}" "${PROG[$i]}"
+  done
+  printf ']'
+  # Advertise an interactive menu only when the action back-channel exists, so a
+  # display-only source (plain --json piping) doesn't offer actions that can't
+  # be delivered. Options are low-risk → requires:"session".
+  if [ -n "$AFIFO" ]; then
+    if [ "$PAUSED" = 1 ]; then
+      printf ',"menu":{"title":"taskscope","options":[{"label":"Resume all","action":"resume","requires":"session"}]}'
+    else
+      printf ',"menu":{"title":"taskscope","options":[{"label":"Pause all","action":"pause","requires":"session"}]}'
+    fi
+  fi
+  printf '}\n'
+}
+
+if (( JSON )); then
+  while :; do emit_json; (( ONCE )) && break; tick=$((tick+1)); step; sleep "$INTERVAL"; done
+else
+  # Only in TUI mode: a dead background stream (fd 3) must not kill the TUI. In
+  # --json mode we keep the default so a closed pipe exits cleanly.
+  trap '' PIPE
+  maybe_start_stream
+  printf '%s%s' "$hide" "$clr"
+  while :; do
+    drain_actions   # apply any pause/resume the phone sent
+    render_tui
+    # Same tick's state to the phone, so terminal and dashboard never disagree.
+    [ "$STREAMING" = 1 ] && { emit_json >&3 2>/dev/null || STREAMING=0; }
+    (( ONCE )) && cleanup
+    tick=$((tick+1)); step; sleep "$INTERVAL"
+  done
+fi

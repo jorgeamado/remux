@@ -669,16 +669,20 @@ function resetMachineScopedState(): void {
 /// Split pairing input into address + optional token. A full pairing link
 /// ("https://host:port/#pair=<64hex>") answers both at once; a bare URL
 /// leaves the token null; a bare token with no address is not enough.
+/// The token is ONLY taken from an explicit `#pair=` fragment — 64 hex
+/// characters anywhere else (say, a URL path) must not be promoted to a
+/// credential and sent to whatever address remains.
 /// Returns an error hint string when the input can't name a machine.
 function parsePairingInput(
   raw: string
 ): { baseUrl: string; token: string | null } | string {
-  const token = extractPairToken(raw);
-  const withoutToken = raw.replace(/(?:#pair=)?[0-9a-f]{64}\s*$/i, "").trim();
-  if (token && !withoutToken) {
+  const s = raw.trim();
+  if (/^[0-9a-f]{64}$/i.test(s)) {
     return "Paste the full pairing link — it includes the machine's address";
   }
-  const baseUrl = normalizeMachineUrl(withoutToken.replace(/#$/, ""));
+  const m = s.match(/^(.*?)#pair=([0-9a-f]{64})$/i);
+  const token = m ? m[2] : null;
+  const baseUrl = normalizeMachineUrl(m ? m[1].replace(/#$/, "") : s);
   if (!baseUrl) return "Machine URLs must be https://host[:port]";
   if (baseUrl === location.origin) return "That's this machine";
   return { baseUrl, token };
@@ -721,7 +725,24 @@ async function addMachineFlow(): Promise<void> {
   if (!token) {
     const link = window.prompt("Pairing link or token (run `remux pair` there):");
     if (link === null) return;
-    token = extractPairToken(link);
+    const t = link.trim();
+    if (/^[0-9a-f]{64}$/i.test(t)) {
+      token = t;
+    } else {
+      // A full link pasted here must name the SAME machine — silently sending
+      // machine B's token to the machine A address from the first prompt
+      // would hand A a reusable credential for B.
+      const second = parsePairingInput(t);
+      if (typeof second === "string") {
+        showHint(second);
+        return;
+      }
+      if (second.baseUrl !== parsed.baseUrl) {
+        showHint(`That link is for ${second.baseUrl}, not ${parsed.baseUrl}`);
+        return;
+      }
+      token = second.token;
+    }
   }
   if (!token) {
     showHint("That doesn't look like a pairing link or token");
@@ -748,6 +769,9 @@ async function scanMachineFlow(): Promise<void> {
     showHint("That QR has no pairing token — run `remux pair` on that machine");
     return;
   }
+  // A QR is untrusted input that would otherwise enroll a machine with zero
+  // further interaction — show where it points before pairing.
+  if (!window.confirm(`Pair with ${parsed.baseUrl}?`)) return;
   await completePairing(parsed.baseUrl, parsed.token);
 }
 
@@ -755,6 +779,26 @@ async function scanMachineFlow(): Promise<void> {
 /// doesn't have it — there we lazy-load the pure-JS jsQR decoder instead.
 interface QrDetector {
   detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
+}
+interface QrDetectorCtor {
+  new (opts: { formats: string[] }): QrDetector;
+  getSupportedFormats?(): Promise<string[]>;
+}
+
+/// Native QR detector, or null when the platform can't do it. Existence of
+/// BarcodeDetector is not enough — supported formats vary by platform, which
+/// is exactly what getSupportedFormats() is for; a detector that can never
+/// see a QR would silently suppress the jsQR fallback forever.
+async function nativeQrDetector(): Promise<QrDetector | null> {
+  const ctor = (window as unknown as { BarcodeDetector?: QrDetectorCtor }).BarcodeDetector;
+  if (!ctor) return null;
+  try {
+    const formats = (await ctor.getSupportedFormats?.()) ?? [];
+    if (!formats.includes("qr_code")) return null;
+    return new ctor({ formats: ["qr_code"] });
+  } catch {
+    return null;
+  }
 }
 
 /// Full-screen camera view; resolves with the first decoded QR payload, or
@@ -774,10 +818,7 @@ async function scanQrCode(): Promise<string | null> {
     showHint("Camera unavailable — paste the pairing link instead");
     return null;
   }
-  const detectorCtor = (
-    window as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => QrDetector }
-  ).BarcodeDetector;
-  const detector = detectorCtor ? new detectorCtor({ formats: ["qr_code"] }) : null;
+  let detector = await nativeQrDetector();
   return await new Promise<string | null>((resolve) => {
     const overlay = document.createElement("div");
     overlay.id = "qr-scan";
@@ -793,25 +834,41 @@ async function scanQrCode(): Promise<string | null> {
     overlay.append(video, label, cancel);
     document.body.append(overlay);
     let done = false;
+    // The camera must not outlive the scanner: backgrounding the PWA, page
+    // teardown, or the OS revoking the track all end the scan — a live
+    // stream with nobody watching is a lit camera indicator and a promise
+    // that never settles.
+    const onHidden = (): void => {
+      if (document.visibilityState === "hidden") finish(null);
+    };
+    const onPageHide = (): void => finish(null);
     const finish = (text: string | null): void => {
       if (done) return;
       done = true;
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", onPageHide);
       stream.getTracks().forEach((t) => t.stop());
       overlay.remove();
       resolve(text);
     };
+    document.addEventListener("visibilitychange", onHidden);
+    window.addEventListener("pagehide", onPageHide);
+    stream.getTracks().forEach((t) => t.addEventListener("ended", () => finish(null)));
     cancel.addEventListener("click", () => finish(null));
     void video.play();
     let jsQr: typeof import("jsqr").default | null = null;
-    if (!detector) {
+    const loadJsQr = (): void => {
       import("jsqr").then(
         (m) => (jsQr = m.default),
         () => {
+          if (done) return; // cancelled while loading — nothing to report
           showHint("QR decoder failed to load — paste the link instead");
           finish(null);
         }
       );
-    }
+    };
+    if (!detector) loadJsQr();
+    let nativeErrors = 0;
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     const tick = async (): Promise<void> => {
@@ -822,6 +879,7 @@ async function scanQrCode(): Promise<string | null> {
             const codes = await detector.detect(video);
             const hit = codes.find((c) => c.rawValue);
             if (hit) return finish(hit.rawValue);
+            nativeErrors = 0;
           } else if (jsQr && ctx) {
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
@@ -831,7 +889,12 @@ async function scanQrCode(): Promise<string | null> {
             if (code?.data) return finish(code.data);
           }
         } catch {
-          /* transient decode error — keep scanning */
+          // A detector that keeps rejecting is broken, not busy — drop to
+          // the JS decoder instead of scanning forever with a dead engine.
+          if (detector && ++nativeErrors >= 5) {
+            detector = null;
+            loadJsQr();
+          }
         }
       }
       window.setTimeout(() => void tick(), 200);

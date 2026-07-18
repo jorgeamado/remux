@@ -115,6 +115,8 @@ any time with:
 remux pair
 ```
 
+Once you're in, [Using the app](#using-the-app) walks through the UI.
+
 ### TLS (recommended, required for PWA install on iOS)
 
 Self-signed certificates do not work with iOS PWAs. Use Tailscale's built-in
@@ -208,6 +210,58 @@ Notes:
 - Simplest alternative: install each machine's own PWA and rename the icons
   ("remux laptop", "remux server") — no flags needed, at the cost of one
   icon per machine.
+
+## Using the app
+
+A quick tour of the phone UI, top to bottom.
+
+**The screen.** The top bar shows the session name on the left (tap it — that's
+the main menu) and the connection state on the right. Below it: the control row
+(your role and the **Take control** button), the window/pane tabs, the terminal,
+and the composer with its key rows.
+
+**Observer vs. controller.** Every open connection is a real tmux client, but
+only one drives the terminal size. You connect as an *observer*: you see
+everything live but the grid stays sized for whoever is typing. **Take
+control** resizes the session to your phone; **Release** (or simply typing on
+your desktop) hands it back. Locking the phone or losing signal releases
+automatically — your desktop gets its dimensions back immediately.
+
+**Press — tap without taking over.** As an observer, the **Press** button arms
+tap-to-press: tap a text-UI element on screen (a Claude Code *Allow* button, a
+menu entry, a fuzzy-finder row) and remux presses it on the host — no take-over,
+no resize, nobody's layout disturbed.
+
+**Typing.** On touch devices the composer is the input line: type a command,
+**➤** sends it (with Enter). **▴** recalls previously typed commands — history
+lives in memory only, per machine and session, and never touches disk. **⌄**
+toggles the key row: `esc` `ctrl` (arms the next key) `tab` arrows `enter`, and
+**…** for more. When an agent is running you also get dedicated keys: interrupt
+(`ctrl+c`), cycle agent mode (`shift+tab`), and rewind (`esc esc`). *Extra
+keys* in the aA menu picks the deck style (auto / expanded / compact); *Direct
+typing* makes taps on the terminal type straight into it — the default on
+desktop, off on phones so tapping the screen doesn't summon the keyboard.
+
+**Sessions and machines.** Tap the session name to switch between tmux
+sessions, create one (**New session…**), jump between paired machines, or add a
+machine (**Add machine…** / **Scan QR to add…** — see
+[Multiple machines](#multiple-machines)).
+
+**Windows and panes.** The tabs under the control row are the session's tmux
+windows — tap to switch (controller only). A split window shows a pane row
+beneath. **+** creates: new window, side-by-side or stacked split, next pane.
+Tabs carry agent status badges: purple = an approval is waiting, amber = the
+agent is waiting for your reply.
+
+**Dashboard.** The **Dashboard** button swaps the terminal for an at-a-glance
+view — session/window tree, agent workers, a system snapshot. Tap **Terminal**
+to go back.
+
+**The aA menu.** Font size (**A−/A+** — effectively the terminal resolution:
+smaller font, more columns), **Paste**, **Notifications**
+(see [Notifications](#notifications)), *Direct typing*, *Extra keys*,
+**Command feed** (see [Agent approvals & the command feed](#agent-approvals--the-command-feed)),
+**Devices** (your paired devices), and a **Debug** overlay.
 
 ## Security model
 

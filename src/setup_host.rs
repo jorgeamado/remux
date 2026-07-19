@@ -59,9 +59,16 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
     for (i, c) in candidates.iter().enumerate() {
         println!("  {}) {}", i + 1, c.label);
     }
+    // Default to the best candidate that is USABLE unattended — WireGuard
+    // has no probeable address, so a --yes/non-TTY run must not land on it.
+    let default_pick = candidates
+        .iter()
+        .position(|c| !c.ip.is_empty())
+        .unwrap_or(0)
+        + 1;
     let pick = ask_line(
         &format!("Use which? [1-{}]", candidates.len()),
-        "1",
+        &default_pick.to_string(),
         opts.yes,
     );
     let mut chosen = pick
@@ -117,15 +124,7 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
             p = cfg_path.display()
         );
     }
-    if tls.is_none() {
-        println!(
-            "  WARNING: without TLS the iOS home-screen app can't be installed; \
-             the browser still works (see README → TLS)."
-        );
-    }
-
     // ---- 3. config ----
-    let scheme = if tls.is_some() { "https" } else { "http" };
     let url_host = chosen.dns.clone().unwrap_or_else(|| chosen.ip.clone());
     let service = ask_yn("Start remux at login?", true, opts.yes);
     // Setup owns the NETWORK story only: start from the existing file so a
@@ -133,7 +132,6 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
     // settings the user configured themselves.
     let mut cfg = crate::config::load(&cfg_path)?;
     cfg.listen = Some(format!("{}:{port}", chosen.ip).parse()?);
-    cfg.url = Some(format!("{scheme}://{url_host}:{port}"));
     if let Some(dns) = &chosen.dns {
         let hosts = cfg.allowed_hosts.get_or_insert_with(Vec::new);
         if !hosts.contains(dns) {
@@ -144,6 +142,26 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
         cfg.tls_cert = Some(cert.clone());
         cfg.tls_key = Some(key.clone());
     }
+    // The URL scheme must match the FINAL TLS state — a re-run that keeps an
+    // existing cert must not write an http:// QR for a TLS listener.
+    let scheme = if cfg.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    if cfg.tls_cert.is_none() {
+        println!(
+            "  WARNING: without TLS the iOS home-screen app can't be installed; \
+             the browser still works (see README → TLS)."
+        );
+    }
+    if tls.is_none() && cfg.tls_cert.is_some() && chosen.dns.is_none() {
+        println!(
+            "  NOTE: keeping the existing TLS certificate — make sure it covers \
+             {url_host}, or re-run setup on a network with a certificate path"
+        );
+    }
+    cfg.url = Some(format!("{scheme}://{url_host}:{port}"));
     if service {
         // A service's pairing QR would rot unread in a log file — pair via
         // `remux pair` (we mint one right below). Foreground runs keep it.
@@ -152,6 +170,13 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
     crate::config::save(&cfg_path, &cfg)?;
     println!("  wrote {}", cfg_path.display());
     warn_if_remux_args_overrides();
+    if service && !crate::service::propagates_xdg() {
+        println!(
+            "  WARNING: XDG_CONFIG_HOME/XDG_DATA_HOME are set, but the service \
+             manager here (brew services / a packaged unit) won't pass them to \
+             the daemon — it will use the DEFAULT config and state paths"
+        );
+    }
 
     // ---- 4. app entry, service, pairing ----
     #[cfg(target_os = "macos")]
@@ -228,18 +253,24 @@ pub fn uninstall() -> Result<Outcome> {
 /// migrating to the config file needs to know their old env file still wins.
 fn warn_if_remux_args_overrides() {
     let Some(home) = dirs::home_dir() else { return };
-    let env_file = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("remux/env");
-    if let Ok(body) = std::fs::read_to_string(&env_file) {
-        if body.contains("REMUX_ARGS") {
-            println!(
-                "  NOTE: {} sets REMUX_ARGS, which OVERRIDES the config file — \
-                 empty it out to let the config take effect",
-                env_file.display()
-            );
+    // The packaged unit hardcodes %h/.config/remux/env, so check that path
+    // regardless of any XDG_CONFIG_HOME override (and the override too).
+    let mut env_files = vec![home.join(".config/remux/env")];
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(xdg).join("remux/env");
+        if !env_files.contains(&p) {
+            env_files.push(p);
+        }
+    }
+    for env_file in env_files {
+        if let Ok(body) = std::fs::read_to_string(&env_file) {
+            if body.contains("REMUX_ARGS") {
+                println!(
+                    "  NOTE: {} sets REMUX_ARGS, which OVERRIDES the config file — \
+                     empty it out to let the config take effect",
+                    env_file.display()
+                );
+            }
         }
     }
 }
@@ -395,8 +426,15 @@ const APP_BUNDLE_ID: &str = "io.github.jorgeamado.remux.launcher";
 /// bundle that happens to be called remux.app.
 #[cfg(target_os = "macos")]
 fn owns_app_bundle(app: &Path) -> bool {
+    // Match the exact key/value pair, not a substring anywhere in the file:
+    // only a bundle whose CFBundleIdentifier IS ours counts as ours.
+    let needle = format!("<key>CFBundleIdentifier</key><string>{APP_BUNDLE_ID}</string>");
     std::fs::read_to_string(app.join("Contents/Info.plist"))
-        .map(|p| p.contains(APP_BUNDLE_ID))
+        .map(|p| {
+            p.split_whitespace()
+                .collect::<String>()
+                .contains(&needle.split_whitespace().collect::<String>())
+        })
         .unwrap_or(false)
 }
 

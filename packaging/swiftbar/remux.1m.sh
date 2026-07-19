@@ -55,7 +55,7 @@ echo "Pair a device… | bash=\"$BIN\" param1=pair terminal=true sfimage=qrcode"
 # so only accept a strictly-shaped https?://host[:port] value — anything
 # else could smuggle extra parameters (e.g. a bash=) into the line.
 URL=$(sed -n 's/^url = "\(.*\)"/\1/p' "${XDG_CONFIG_HOME:-$HOME/.config}/remux/config.toml" 2>/dev/null | head -1)
-if printf '%s' "$URL" | grep -Eq '^https?://[][A-Za-z0-9.:-]+/?$'; then
+if printf '%s' "$URL" | grep -Eq '^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?/?$'; then
   echo "Open in browser | href=$URL sfimage=safari"
 fi
 echo "---"

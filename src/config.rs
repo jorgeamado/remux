@@ -156,20 +156,39 @@ pub fn validate_public_url(url: &str) -> anyhow::Result<()> {
         .or_else(|| url.strip_prefix("http://"))
         .with_context(|| format!("url {url:?} must start with http:// or https://"))?;
     let host_port = rest.split('/').next().unwrap_or("");
-    if host_port.is_empty() {
-        anyhow::bail!("url {url:?} has no host");
-    }
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         anyhow::bail!("url {url:?} contains whitespace or control characters");
     }
     if host_port.contains('@') {
         anyhow::bail!("url {url:?} must not contain credentials");
     }
-    let ok = host_port
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
-    if !ok {
+    // Split host from port ([v6]:port / host:port / bare), then check each
+    // part properly — "roughly host-shaped" let `http://:7777` through.
+    let (host, port) = if let Some(rest6) = host_port.strip_prefix('[') {
+        let (h, after) = rest6
+            .split_once(']')
+            .with_context(|| format!("url {url:?} has an unterminated [ipv6] host"))?;
+        (h, after.strip_prefix(':'))
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    // ':' is legal only inside a bracketed IPv6 host, which was split off
+    // above — a leftover colon here means "http://:7777"-style junk.
+    let v6 = host_port.starts_with('[');
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || (v6 && c == ':'))
+    {
         anyhow::bail!("url {url:?} has an invalid host");
+    }
+    if let Some(p) = port {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("url {url:?} has an invalid port");
+        }
     }
     Ok(())
 }
@@ -224,7 +243,17 @@ pub fn save(path: &Path, cfg: &ServeConfig) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .context("config path has no parent directory")?;
-    create_private_dir(dir)?;
+    // Only OUR default directory gets its permissions forced: --config may
+    // point anywhere, and chmod'ing an arbitrary shared parent dir to 0700
+    // is not ours to do.
+    let owned_dir = default_path()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    if owned_dir.as_deref() == Some(dir) {
+        create_private_dir(dir)?;
+    } else {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     let body = toml::to_string_pretty(cfg).context("serializing config")?;
     let tmp = dir.join(format!(
         ".config.toml.tmp.{}.{:x}",
@@ -376,6 +405,31 @@ mod tests {
         };
         apply(&mut a, cfg, &explicit(&[]));
         assert!(validate(&a).unwrap_err().to_string().contains("tls-key"));
+    }
+
+    #[test]
+    fn public_url_validation_rejects_junk_and_accepts_real_shapes() {
+        for good in [
+            "https://host.ts.net:7777",
+            "http://127.0.0.1:7801",
+            "https://[fd7a::1]:7777",
+            "http://localhost",
+            "https://host.ts.net:7777/",
+        ] {
+            assert!(validate_public_url(good).is_ok(), "{good} should pass");
+        }
+        for bad in [
+            "ftp://host:7777",
+            "http://:7777",
+            "http://[]",
+            "http://host:abc",
+            "http://user@host:7777",
+            "http://host :7777",
+            "http://[fd7a::1:7777",
+            "host.ts.net:7777",
+        ] {
+            assert!(validate_public_url(bad).is_err(), "{bad} should fail");
+        }
     }
 
     #[test]

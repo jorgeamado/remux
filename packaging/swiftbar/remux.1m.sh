@@ -27,11 +27,15 @@ STATUS=$("$BIN" service status --short 2>/dev/null || echo "unknown unknown")
 RUNNING=${STATUS%% *}
 ENABLED=${STATUS##* }
 
-# Menu-bar glyph: template SF Symbol, tinted only while the daemon runs.
+# Menu-bar glyph: the remux "r" (packaging/icons/bar.svg, 44px retina PNG).
+# Idle: template image (macOS tints it for light/dark). Running: the violet
+# variant, shown as-is.
+GLYPH_IDLE="iVBORw0KGgoAAAANSUhEUgAAACwAAAAsCAYAAAAehFoBAAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAAALKADAAQAAAABAAAALAAAAADfpsWZAAAAtUlEQVRYCe3SvQnAIBQE4JefVQQ7wakcI0u5hyO4g5WN+YFUV1/AwL3umuP4dGmtnTlnc85ZjNFmv63WevTebYxhIYTZ99qeUjLvvZVSph/7DFzO+36x9B25/mnss1WDv34xCUsYBPQlAIQeJUwnhUIJAwg9SphOCoUSBhB6lDCdFAolDCD0KGE6KRRKGEDoUcJ0UiiUMIDQo4TppFAoYQChRwnTSaFQwgBCjxKmk0KhhAGEHi/0ghkE44V6aAAAAABJRU5ErkJggg=="
+GLYPH_ACTIVE="iVBORw0KGgoAAAANSUhEUgAAACwAAAAsCAYAAAAehFoBAAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAAALKADAAQAAAABAAAALAAAAADfpsWZAAAAu0lEQVRYCe3SsQ3CMBRF0R+TBUIDdNmAITJnFmGKTEABJfQoiogTIapbv8KWnrvbPH0duZk/a75P3+jOKU59itJfuo1LvB453s+19Ft/97XX4RDHS9qPruPgJu+vCtr/keV/Wmj6YIDI08JyUgxaGCDytLCcFIMWBog8LSwnxaCFASJPC8tJMWhhgMjTwnJSDFoYIPK0sJwUgxYGiDwtLCfFoIUBIk8Ly0kxaGGAyNPCclIMWhgg8qxOeAN1VxapBTbHXwAAAABJRU5ErkJggg=="
 if [ "$RUNNING" = running ]; then
-  echo "| sfimage=terminal.fill sfcolor=#8b5cf6"
+  echo "| image=$GLYPH_ACTIVE"
 else
-  echo "| sfimage=terminal"
+  echo "| templateImage=$GLYPH_IDLE"
 fi
 
 echo "---"

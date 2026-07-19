@@ -421,6 +421,11 @@ fn tailscale_cert(dns: &str, dir: &Path) -> Result<(PathBuf, PathBuf)> {
 #[cfg(target_os = "macos")]
 const APP_BUNDLE_ID: &str = "io.github.jorgeamado.remux.launcher";
 
+/// The "remux-r" app icon (see packaging/icons/app.svg for the source;
+/// regenerate the icns from it with qlmanage + iconutil).
+#[cfg(target_os = "macos")]
+const APP_ICON: &[u8] = include_bytes!("../packaging/icons/remux.icns");
+
 /// True when the bundle at `app` is one we generated (identified by our
 /// CFBundleIdentifier). Setup must neither overwrite nor delete a foreign
 /// bundle that happens to be called remux.app.
@@ -454,7 +459,12 @@ fn install_app_bundle() -> Result<PathBuf> {
         );
     }
     let macos = app.join("Contents/MacOS");
+    let resources = app.join("Contents/Resources");
     std::fs::create_dir_all(&macos)?;
+    std::fs::create_dir_all(&resources)?;
+    // The icns is baked into the binary — the bundle is generated wherever
+    // the user runs setup, so there is no install dir to copy it from.
+    std::fs::write(resources.join("AppIcon.icns"), APP_ICON)?;
     std::fs::write(
         app.join("Contents/Info.plist"),
         format!(
@@ -465,6 +475,7 @@ fn install_app_bundle() -> Result<PathBuf> {
   <key>CFBundleName</key><string>remux</string>
   <key>CFBundleIdentifier</key><string>{APP_BUNDLE_ID}</string>
   <key>CFBundleExecutable</key><string>launcher</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
 </dict>

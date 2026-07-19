@@ -1,8 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="96" fill="#0d1117"/>
-  <text x="96" y="330" font-family="ui-monospace, Menlo, monospace" font-size="220"
-        font-weight="bold" fill="#2ea043">&gt;_</text>
-  <rect x="330" y="290" width="90" height="26" fill="#2ea043">
-    <animate attributeName="opacity" values="1;0;1" dur="1.6s" repeatCount="indefinite"/>
-  </rect>
+  <rect width="512" height="512" rx="96" fill="#8b5cf6"/>
+  <path d="M152 366V184M152 268C176 220 208 196 250 196C294 196 322 220 332 260" fill="none" stroke="#0a0d13" stroke-width="60" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="282" y="326" width="86" height="32" rx="16" fill="#c4b5fd"/>
 </svg>

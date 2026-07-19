@@ -58,6 +58,11 @@ async fn main() -> Result<()> {
                     remux::config::load(&path)?
                 };
                 let merged = remux::config::merged_for_save(existing, &args, &explicit);
+                // Never persist a config that wouldn't start: run the same
+                // post-merge validation a real launch would.
+                let mut probe = args.clone();
+                remux::config::apply(&mut probe, merged.clone(), &|_| false);
+                remux::config::validate(&probe)?;
                 remux::config::save(&path, &merged)?;
                 println!("wrote {}", path.display());
                 println!("start with: remux serve");

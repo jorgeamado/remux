@@ -11,7 +11,6 @@
 //! undone by `remux setup --uninstall` — package managers must not be asked
 //! to delete files they didn't install.
 
-use crate::config::ServeConfig;
 use anyhow::{Context, Result};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +29,7 @@ pub enum Outcome {
 }
 
 /// How this machine can be reached from the phone, best first.
+#[derive(Clone)]
 struct Candidate {
     label: String,
     ip: String,
@@ -64,12 +64,25 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
         "1",
         opts.yes,
     );
-    let chosen = pick
+    let mut chosen = pick
         .trim()
         .parse::<usize>()
         .ok()
         .and_then(|n| candidates.get(n.saturating_sub(1)))
-        .context("not a listed option")?;
+        .context("not a listed option")?
+        .clone();
+    if chosen.ip.is_empty() {
+        // WireGuard: the address can't be probed, only asked for.
+        let ip = ask_line("This machine's WireGuard IP", "", opts.yes);
+        chosen.ip = ip.trim().to_string();
+        if chosen.ip.is_empty() {
+            anyhow::bail!(
+                "a WireGuard address is required — rerun setup interactively, \
+                 or configure manually with --save-config"
+            );
+        }
+    }
+    let chosen = &chosen;
 
     let port = ask_line("Port", "7777", opts.yes);
     let port: u16 = port.trim().parse().context("not a port number")?;
@@ -115,19 +128,30 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
     let scheme = if tls.is_some() { "https" } else { "http" };
     let url_host = chosen.dns.clone().unwrap_or_else(|| chosen.ip.clone());
     let service = ask_yn("Start remux at login?", true, opts.yes);
-    let cfg = ServeConfig {
-        listen: Some(format!("{}:{port}", chosen.ip).parse()?),
-        url: Some(format!("{scheme}://{url_host}:{port}")),
-        allowed_hosts: chosen.dns.clone().map(|d| vec![d]),
-        tls_cert: tls.as_ref().map(|t| t.0.clone()),
-        tls_key: tls.as_ref().map(|t| t.1.clone()),
+    // Setup owns the NETWORK story only: start from the existing file so a
+    // re-run never wipes session, machine-name, client origins, or other
+    // settings the user configured themselves.
+    let mut cfg = crate::config::load(&cfg_path)?;
+    cfg.listen = Some(format!("{}:{port}", chosen.ip).parse()?);
+    cfg.url = Some(format!("{scheme}://{url_host}:{port}"));
+    if let Some(dns) = &chosen.dns {
+        let hosts = cfg.allowed_hosts.get_or_insert_with(Vec::new);
+        if !hosts.contains(dns) {
+            hosts.push(dns.clone());
+        }
+    }
+    if let Some((cert, key)) = &tls {
+        cfg.tls_cert = Some(cert.clone());
+        cfg.tls_key = Some(key.clone());
+    }
+    if service {
         // A service's pairing QR would rot unread in a log file — pair via
         // `remux pair` (we mint one right below). Foreground runs keep it.
-        no_pair: service.then_some(true),
-        ..Default::default()
-    };
+        cfg.no_pair = Some(true);
+    }
     crate::config::save(&cfg_path, &cfg)?;
     println!("  wrote {}", cfg_path.display());
+    warn_if_remux_args_overrides();
 
     // ---- 4. app entry, service, pairing ----
     #[cfg(target_os = "macos")]
@@ -145,7 +169,9 @@ pub fn run(opts: &Options, state_dir: &Path) -> Result<Outcome> {
         println!("\nDone. Start with: remux serve");
         return Ok(Outcome::Configured { pair_url: None });
     }
-    crate::service::run(crate::service::ServiceCmd::On)?;
+    // enroll_fresh restarts a service that was already running — a plain
+    // enable would leave the OLD daemon up and pair against stale settings.
+    crate::service::enroll_fresh()?;
     println!("  service enabled (control it with `remux service on|off|status`)");
     // The daemon needs a moment before its admin socket answers.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -180,9 +206,13 @@ pub fn uninstall() -> Result<Outcome> {
             .map(|h| h.join("Applications/remux.app"))
             .filter(|p| p.exists());
         if let Some(app) = app {
-            match std::fs::remove_dir_all(&app) {
-                Ok(()) => println!("removed {}", app.display()),
-                Err(e) => println!("could not remove {}: {e}", app.display()),
+            if owns_app_bundle(&app) {
+                match std::fs::remove_dir_all(&app) {
+                    Ok(()) => println!("removed {}", app.display()),
+                    Err(e) => println!("could not remove {}: {e}", app.display()),
+                }
+            } else {
+                println!("left {} alone — not created by remux", app.display());
             }
         }
     }
@@ -191,6 +221,27 @@ pub fn uninstall() -> Result<Outcome> {
         _ => {}
     }
     Ok(Outcome::Uninstalled)
+}
+
+/// The packaged systemd unit lets `$REMUX_ARGS` (from ~/.config/remux/env)
+/// override everything — flags outrank the config file by design. A user
+/// migrating to the config file needs to know their old env file still wins.
+fn warn_if_remux_args_overrides() {
+    let Some(home) = dirs::home_dir() else { return };
+    let env_file = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("remux/env");
+    if let Ok(body) = std::fs::read_to_string(&env_file) {
+        if body.contains("REMUX_ARGS") {
+            println!(
+                "  NOTE: {} sets REMUX_ARGS, which OVERRIDES the config file — \
+                 empty it out to let the config take effect",
+                env_file.display()
+            );
+        }
+    }
 }
 
 // ---------- probes ----------
@@ -274,8 +325,10 @@ fn zerotier() -> Option<Candidate> {
     })
 }
 
-/// WireGuard has no query for "my address" that works everywhere; if an
-/// interface is up we surface it and let the user type the address.
+/// WireGuard has no query for "my address" that works everywhere; probing
+/// only detects that an interface is up. The address is asked for LATER and
+/// only if the user actually picks this candidate — probing must never
+/// prompt, and `--yes`/non-TTY runs must stay prompt-free.
 fn wireguard() -> Option<Candidate> {
     let bin = which("wg")?;
     let out = Command::new(bin)
@@ -286,18 +339,9 @@ fn wireguard() -> Option<Candidate> {
     if !out.status.success() || ifs.is_empty() {
         return None;
     }
-    let ip = ask_line(
-        &format!("WireGuard interface(s) up ({ifs}) — this machine's WireGuard IP"),
-        "",
-        false,
-    );
-    let ip = ip.trim().to_string();
-    if ip.is_empty() {
-        return None;
-    }
     Some(Candidate {
-        label: format!("WireGuard — {ip}"),
-        ip,
+        label: format!("WireGuard ({ifs}) — asks for this machine's WireGuard IP"),
+        ip: String::new(), // filled in after selection
         dns: None,
         tailscale: false,
     })
@@ -344,34 +388,55 @@ fn tailscale_cert(dns: &str, dir: &Path) -> Result<(PathBuf, PathBuf)> {
 /// binary path from generation time — re-run `remux setup` after moving the
 /// binary.
 #[cfg(target_os = "macos")]
+const APP_BUNDLE_ID: &str = "io.github.jorgeamado.remux.launcher";
+
+/// True when the bundle at `app` is one we generated (identified by our
+/// CFBundleIdentifier). Setup must neither overwrite nor delete a foreign
+/// bundle that happens to be called remux.app.
+#[cfg(target_os = "macos")]
+fn owns_app_bundle(app: &Path) -> bool {
+    std::fs::read_to_string(app.join("Contents/Info.plist"))
+        .map(|p| p.contains(APP_BUNDLE_ID))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
 fn install_app_bundle() -> Result<PathBuf> {
-    let bin = std::env::current_exe().context("locating own binary")?;
+    // Stable path (Homebrew opt symlink) so a brew upgrade doesn't strand
+    // the launcher; single-quote shell escaping handles every legal path.
+    let bin = crate::service::stable_exe()?;
+    let quoted = format!("'{}'", bin.display().to_string().replace('\'', r"'\''"));
     let apps = dirs::home_dir()
         .context("no home directory")?
         .join("Applications");
     let app = apps.join("remux.app");
+    if app.exists() && !owns_app_bundle(&app) {
+        anyhow::bail!(
+            "{} exists but wasn't created by remux — refusing to overwrite it",
+            app.display()
+        );
+    }
     let macos = app.join("Contents/MacOS");
     std::fs::create_dir_all(&macos)?;
     std::fs::write(
         app.join("Contents/Info.plist"),
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>remux</string>
-  <key>CFBundleIdentifier</key><string>io.github.jorgeamado.remux.launcher</string>
+  <key>CFBundleIdentifier</key><string>{APP_BUNDLE_ID}</string>
   <key>CFBundleExecutable</key><string>launcher</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
 </dict>
 </plist>
-"#,
+"#
+        ),
     )?;
     let launcher = macos.join("launcher");
-    std::fs::write(
-        &launcher,
-        format!("#!/bin/sh\nexec \"{}\" service on\n", bin.display()),
-    )?;
+    std::fs::write(&launcher, format!("#!/bin/sh\nexec {quoted} service on\n"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

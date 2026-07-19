@@ -282,7 +282,7 @@ pub enum DevicesCmd {
 }
 
 /// Options for `remux serve`.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct Args {
     /// Address to listen on. Bind to your Tailscale IP in production.
     #[arg(long, default_value = "127.0.0.1:7777")]
@@ -293,11 +293,13 @@ pub struct Args {
     pub session: String,
 
     /// TLS certificate path (PEM). Use `tailscale cert` to obtain one.
-    #[arg(long, requires = "tls_key")]
+    /// (No clap `requires` pair here: the other half may come from the
+    /// config file — completeness is checked after the merge.)
+    #[arg(long)]
     pub tls_cert: Option<PathBuf>,
 
     /// TLS private key path (PEM).
-    #[arg(long, requires = "tls_cert")]
+    #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
     /// Extra hostnames accepted in Host/Origin checks (e.g. your MagicDNS name).

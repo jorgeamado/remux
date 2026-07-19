@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// absent means "use the CLI value or the built-in default". Unknown keys are
 /// a hard error — a typo silently ignored would surface much later as
 /// "remux is broken", far from its cause.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Clone)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ServeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,8 +97,13 @@ pub fn apply(args: &mut Args, cfg: ServeConfig, explicit: &dyn Fn(&str) -> bool)
     if args.machine_name.is_none() {
         args.machine_name = cfg.machine_name;
     }
-    if args.tls_cert.is_none() && args.tls_key.is_none() {
+    // Cert and key merge independently: a config may hold the cert while the
+    // command line supplies a rotated key (post-merge validation still
+    // requires the pair to be complete).
+    if args.tls_cert.is_none() {
         args.tls_cert = cfg.tls_cert;
+    }
+    if args.tls_key.is_none() {
         args.tls_key = cfg.tls_key;
     }
     if !explicit("allowed_hosts") {
@@ -137,9 +142,34 @@ pub fn validate(args: &Args) -> anyhow::Result<()> {
         }
     }
     if let Some(url) = &args.url {
-        if crate::host_of_url(url).is_none() {
-            anyhow::bail!("url {url:?} is not a valid http(s) URL");
-        }
+        validate_public_url(url)?;
+    }
+    Ok(())
+}
+
+/// Strict shape check for the public URL: it ends up in pairing QRs and in
+/// menu-bar plugin actions, so "roughly URL-shaped" is not enough — no
+/// credentials, no whitespace/control characters, http(s) only, real host.
+pub fn validate_public_url(url: &str) -> anyhow::Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .with_context(|| format!("url {url:?} must start with http:// or https://"))?;
+    let host_port = rest.split('/').next().unwrap_or("");
+    if host_port.is_empty() {
+        anyhow::bail!("url {url:?} has no host");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("url {url:?} contains whitespace or control characters");
+    }
+    if host_port.contains('@') {
+        anyhow::bail!("url {url:?} must not contain credentials");
+    }
+    let ok = host_port
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    if !ok {
+        anyhow::bail!("url {url:?} has an invalid host");
     }
     Ok(())
 }
@@ -167,6 +197,8 @@ pub fn merged_for_save(
     }
     if explicit("tls_cert") {
         existing.tls_cert = args.tls_cert.clone();
+    }
+    if explicit("tls_key") {
         existing.tls_key = args.tls_key.clone();
     }
     if explicit("allowed_hosts") {
@@ -184,28 +216,50 @@ pub fn merged_for_save(
     existing
 }
 
-/// Atomic write: temp file in the target dir, then rename. Dir 0700,
-/// file 0600 (the file steers the daemon's security posture).
+/// Atomic write: unique temp file in the target dir (create_new — a
+/// pre-placed symlink or a concurrent writer cannot make us truncate some
+/// other file), 0600, fsync, rename. Dir forced to 0700 even if it already
+/// existed looser.
 pub fn save(path: &Path, cfg: &ServeConfig) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .context("config path has no parent directory")?;
     create_private_dir(dir)?;
     let body = toml::to_string_pretty(cfg).context("serializing config")?;
-    let tmp = dir.join(".config.toml.tmp");
-    write_private_file(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("moving config into place at {}", path.display()))?;
+    let tmp = dir.join(format!(
+        ".config.toml.tmp.{}.{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let write =
+        write_private_file(&tmp, &body).with_context(|| format!("writing {}", tmp.display()));
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) =
+        std::fs::rename(&tmp, path).with_context(|| format!("moving into {}", path.display()))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::PermissionsExt;
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true).mode(0o700);
     b.create(dir)
-        .with_context(|| format!("creating {}", dir.display()))
+        .with_context(|| format!("creating {}", dir.display()))?;
+    // create() is a no-op for a pre-existing dir — tighten it regardless.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("securing {}", dir.display()))
 }
 
 #[cfg(not(unix))]
@@ -219,8 +273,7 @@ fn write_private_file(path: &Path, body: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     f.write_all(body.as_bytes())?;

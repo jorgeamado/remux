@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use clap::Parser;
 use remux::{
     admin, attention, auth, chat, host_of_url, ingest, paneview, push, server, shell, tmux,
     topology, App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd,
@@ -31,11 +30,58 @@ async fn main() -> Result<()> {
         .context("no data dir")?
         .join("remux");
 
-    let args = match Cli::parse().cmd {
-        Cmd::Serve(args) => args,
+    // Parsed via ArgMatches (not Cli::parse) so the serve path can ask clap
+    // which flags were literally typed — config-file merging needs to know
+    // "explicit --listen" from "default --listen".
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    let args = match cli.cmd {
+        Cmd::Serve(mut args) => {
+            let sub = matches
+                .subcommand_matches("serve")
+                .expect("serve was just parsed");
+            let explicit =
+                |id: &str| sub.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+            let path = match &args.config {
+                Some(p) => p.clone(),
+                None => remux::config::default_path()?,
+            };
+            if args.save_config {
+                // Save-and-exit: existing declarative intent + the flags
+                // typed right now; defaults and derived values stay out.
+                let existing = if args.no_config {
+                    remux::config::ServeConfig::default()
+                } else {
+                    remux::config::load(&path)?
+                };
+                let merged = remux::config::merged_for_save(existing, &args, &explicit);
+                // Never persist a config that wouldn't start: run the same
+                // post-merge validation a real launch would.
+                let mut probe = args.clone();
+                remux::config::apply(&mut probe, merged.clone(), &|_| false);
+                remux::config::validate(&probe)?;
+                remux::config::save(&path, &merged)?;
+                println!("wrote {}", path.display());
+                println!("start with: remux serve");
+                return Ok(());
+            }
+            if !args.no_config {
+                let cfg = remux::config::load(&path)?;
+                remux::config::apply(&mut args, cfg, &explicit);
+            }
+            remux::config::validate(&args)?;
+            args
+        }
         Cmd::Pair => {
             let url = admin::request_pairing(&state_dir)?;
             print_pairing(&url);
+            return Ok(());
+        }
+        Cmd::Service { cmd } => {
+            remux::service::run(cmd)?;
             return Ok(());
         }
         Cmd::Devices { cmd } => {
@@ -163,7 +209,27 @@ async fn main() -> Result<()> {
                 ),
             }
         }
-        Cmd::Setup { cmd } => return setup_shell(cmd),
+        Cmd::Setup {
+            cmd,
+            yes,
+            uninstall,
+        } => match cmd {
+            Some(cmd) => return setup_shell(cmd),
+            None => {
+                let outcome = if uninstall {
+                    remux::setup_host::uninstall()?
+                } else {
+                    remux::setup_host::run(&remux::setup_host::Options { yes }, &state_dir)?
+                };
+                if let remux::setup_host::Outcome::Configured {
+                    pair_url: Some(url),
+                } = outcome
+                {
+                    print_pairing(&url);
+                }
+                return Ok(());
+            }
+        },
         Cmd::Emit { cmd } => match cmd {
             EmitCmd::NeedsInput {
                 pane,

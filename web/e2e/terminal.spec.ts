@@ -30,6 +30,9 @@ test.beforeAll(async () => {
       env: {
         ...process.env,
         XDG_DATA_HOME: dataDir,
+        // The daemon now reads $XDG_CONFIG_HOME/remux/config.toml; without
+        // this the test inherits the developer's real serve config.
+        XDG_CONFIG_HOME: dataDir,
         REMUX_TMUX_SOCKET: SOCK,
       },
       stdio: ["ignore", "pipe", "inherit"],

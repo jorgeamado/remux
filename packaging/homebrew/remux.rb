@@ -37,12 +37,27 @@ class Remux < Formula
     bin.install "remux"
   end
 
+  # `remux service` on a brew install drives `brew services`; this block is
+  # what it manages. PATH is set because the daemon invokes `tmux` by name.
+  service do
+    run [opt_bin/"remux", "serve"]
+    keep_alive false
+    working_dir Dir.home
+    log_path var/"log/remux.log"
+    error_log_path var/"log/remux.log"
+    environment_variables PATH: std_service_path_env
+  end
+
   def caveats
     <<~EOS
-      Start the daemon on your tailnet interface (never a public one):
+      One-command setup (detects Tailscale/ZeroTier/LAN, TLS, login service):
+        remux setup
+      Or run it by hand on your tailnet interface (never a public one):
         remux serve --listen <tailscale-ip>:7777
-      It prints a single-use pairing QR/link for your phone. See the README
-      for TLS via `tailscale cert` (required to install the PWA on iOS).
+      It prints a single-use pairing QR/link for your phone. Control the
+      login service with `remux service on|off|status`. A menu-bar toggle
+      for SwiftBar ships in the repo: packaging/swiftbar/remux.1m.sh.
+      `remux setup --uninstall` removes everything setup created.
     EOS
   end
 

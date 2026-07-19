@@ -3,12 +3,15 @@ pub mod agent;
 pub mod attention;
 pub mod auth;
 pub mod chat;
+pub mod config;
 pub mod feed;
 pub mod ingest;
 pub mod paneview;
 pub mod permit;
 pub mod push;
 pub mod server;
+pub mod service;
+pub mod setup_host;
 pub mod shell;
 pub mod tmux;
 pub mod topology;
@@ -42,10 +45,23 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: EmitCmd,
     },
-    /// One-time, opt-in setup for features that need host config.
+    /// Guided host setup (bare), or one-time opt-in feature setup (subcommand).
+    /// Bare `remux setup` probes connectivity, sorts out TLS, writes the
+    /// config file and can enroll the login service.
     Setup {
         #[command(subcommand)]
-        cmd: SetupCmd,
+        cmd: Option<SetupCmd>,
+        /// Accept the recommended answer for every question.
+        #[arg(long)]
+        yes: bool,
+        /// Undo what `remux setup` created (login service). Keeps the config.
+        #[arg(long)]
+        uninstall: bool,
+    },
+    /// Control the login service (start/stop now; on/off = also at login).
+    Service {
+        #[command(subcommand)]
+        cmd: service::ServiceCmd,
     },
     /// Test the notification pipeline end to end: counts down (so you can
     /// lock the phone — pushes are suppressed while you're typing), then
@@ -266,7 +282,7 @@ pub enum DevicesCmd {
 }
 
 /// Options for `remux serve`.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct Args {
     /// Address to listen on. Bind to your Tailscale IP in production.
     #[arg(long, default_value = "127.0.0.1:7777")]
@@ -277,11 +293,13 @@ pub struct Args {
     pub session: String,
 
     /// TLS certificate path (PEM). Use `tailscale cert` to obtain one.
-    #[arg(long, requires = "tls_key")]
+    /// (No clap `requires` pair here: the other half may come from the
+    /// config file — completeness is checked after the merge.)
+    #[arg(long)]
     pub tls_cert: Option<PathBuf>,
 
     /// TLS private key path (PEM).
-    #[arg(long, requires = "tls_cert")]
+    #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
     /// Extra hostnames accepted in Host/Origin checks (e.g. your MagicDNS name).
@@ -310,6 +328,27 @@ pub struct Args {
     /// Defaults to http(s)://<listen-addr>.
     #[arg(long)]
     pub url: Option<String>,
+
+    /// Print a pairing link at startup even if the config file says
+    /// `no-pair = true` (e.g. to pair a new phone against a service install).
+    #[arg(long, conflicts_with = "no_pair")]
+    pub pair_on_start: bool,
+
+    /// Config file to read (default: $XDG_CONFIG_HOME/remux/config.toml,
+    /// falling back to ~/.config/remux/config.toml). Flags typed on the
+    /// command line always override the file.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+
+    /// Ignore any config file: run from flags and built-in defaults only.
+    #[arg(long)]
+    pub no_config: bool,
+
+    /// Write the effective settings (the existing config plus the flags given
+    /// on this command line) to the config file and exit. After that, plain
+    /// `remux serve` starts with the same settings.
+    #[arg(long)]
+    pub save_config: bool,
 }
 
 /// An attention-worthy moment in a session. `kind`/`reason`/`source` ride

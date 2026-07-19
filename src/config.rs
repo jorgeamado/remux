@@ -164,27 +164,36 @@ pub fn validate_public_url(url: &str) -> anyhow::Result<()> {
     }
     // Split host from port ([v6]:port / host:port / bare), then check each
     // part properly — "roughly host-shaped" let `http://:7777` through.
-    let (host, port) = if let Some(rest6) = host_port.strip_prefix('[') {
+    let port = if let Some(rest6) = host_port.strip_prefix('[') {
         let (h, after) = rest6
             .split_once(']')
             .with_context(|| format!("url {url:?} has an unterminated [ipv6] host"))?;
-        (h, after.strip_prefix(':'))
+        // The brackets must hold an actual IPv6 address, and NOTHING may
+        // follow them except an optional :port.
+        h.parse::<std::net::Ipv6Addr>()
+            .ok()
+            .with_context(|| format!("url {url:?}: {h:?} is not an IPv6 address"))?;
+        match after {
+            "" => None,
+            p => Some(
+                p.strip_prefix(':')
+                    .with_context(|| format!("url {url:?} has junk after the [ipv6] host"))?,
+            ),
+        }
     } else {
-        match host_port.rsplit_once(':') {
+        let (host, port) = match host_port.rsplit_once(':') {
             Some((h, p)) => (h, Some(p)),
             None => (host_port, None),
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            anyhow::bail!("url {url:?} has an invalid host");
         }
+        port
     };
-    // ':' is legal only inside a bracketed IPv6 host, which was split off
-    // above — a leftover colon here means "http://:7777"-style junk.
-    let v6 = host_port.starts_with('[');
-    if host.is_empty()
-        || !host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || (v6 && c == ':'))
-    {
-        anyhow::bail!("url {url:?} has an invalid host");
-    }
     if let Some(p) = port {
         if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
             anyhow::bail!("url {url:?} has an invalid port");

@@ -426,15 +426,14 @@ const APP_BUNDLE_ID: &str = "io.github.jorgeamado.remux.launcher";
 /// bundle that happens to be called remux.app.
 #[cfg(target_os = "macos")]
 fn owns_app_bundle(app: &Path) -> bool {
-    // Match the exact key/value pair, not a substring anywhere in the file:
-    // only a bundle whose CFBundleIdentifier IS ours counts as ours.
-    let needle = format!("<key>CFBundleIdentifier</key><string>{APP_BUNDLE_ID}</string>");
-    std::fs::read_to_string(app.join("Contents/Info.plist"))
-        .map(|p| {
-            p.split_whitespace()
-                .collect::<String>()
-                .contains(&needle.split_whitespace().collect::<String>())
-        })
+    // A real plist parse (plutil ships with macOS): only a bundle whose
+    // TOP-LEVEL CFBundleIdentifier is ours counts — a substring match could
+    // be satisfied by a comment or a nested dict in a foreign bundle.
+    Command::new("plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == APP_BUNDLE_ID)
         .unwrap_or(false)
 }
 

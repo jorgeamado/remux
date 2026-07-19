@@ -165,13 +165,10 @@ pub fn propagates_xdg() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        // Propagation works only if WE would generate the unit (i.e. no
-        // packaged/foreign unit is installed yet).
-        !Command::new("systemctl")
-            .args(["--user", "cat", "remux.service"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        // Propagation works if no unit exists yet (we'd generate one) or if
+        // the installed unit is OUR generated one (ensure_unit refreshes it,
+        // env included). Only a packaged/foreign unit blocks propagation.
+        !SystemdUser::packaged_unit_installed()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -441,16 +438,33 @@ impl SystemdUser {
             .join(".config/systemd/user/remux.service"))
     }
 
-    /// The .deb ships a user unit; a tarball install has none. Generate one
-    /// only when systemd doesn't already know the name — a generated copy
-    /// must never shadow a packaged unit.
-    fn ensure_unit(&self) -> Result<()> {
+    /// True when our own generated unit file is installed.
+    fn unit_is_ours() -> bool {
+        Self::user_unit_path()
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|body| body.starts_with(UNIT_MARKER))
+            .unwrap_or(false)
+    }
+
+    /// True when systemd knows a remux.service that ISN'T our generated one
+    /// (the .deb's packaged unit, or something the user wrote themselves).
+    fn packaged_unit_installed() -> bool {
         let known = Command::new("systemctl")
             .args(["--user", "cat", "remux.service"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if known {
+        known && !Self::unit_is_ours()
+    }
+
+    /// The .deb ships a user unit; a tarball install has none. A packaged or
+    /// user-written unit is never touched; our OWN generated unit is
+    /// rewritten every time so the binary path and XDG environment stay
+    /// current (a stale generated unit is how setup ends up talking to a
+    /// daemon on different paths).
+    fn ensure_unit(&self) -> Result<()> {
+        if Self::packaged_unit_installed() {
             return Ok(());
         }
         let bin = crate::service::stable_exe()?;

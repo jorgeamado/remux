@@ -1,14 +1,20 @@
 # systemd user unit for the remux daemon.
 #
+# Settings live in ~/.config/remux/config.toml — write it with `remux setup`
+# (guided) or `remux serve <flags> --save-config`, then:
+#
+#   systemctl --user enable --now remux
+#   loginctl enable-linger $USER   # keep it running while logged out
+#
+# (`remux service on` does the enable for you.) The older REMUX_ARGS env file
+# still works and overrides the config file:
+#
 #   mkdir -p ~/.config/remux
 #   echo 'REMUX_ARGS=--listen 100.x.y.z:7777 --no-pair \
 #     --tls-cert /path/host.ts.net.crt --tls-key /path/host.ts.net.key \
 #     --allowed-host host.tailnet.ts.net' > ~/.config/remux/env
-#   systemctl --user enable --now remux
-#   loginctl enable-linger $USER   # keep it running while logged out
 #
-# To pair a device, run `remux serve` in a terminal once (it prints the QR),
-# or restart without --no-pair and read the journal.
+# To pair a device, run `remux pair` — never hunt the journal for tokens.
 
 [Unit]
 Description=remux — your persistent tmux session, on your phone

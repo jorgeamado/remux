@@ -95,13 +95,28 @@ cargo install --path .
 
 ## Run
 
+The quick way — one guided command:
+
+```sh
+remux setup
+```
+
+It detects how your phone can reach this machine (Tailscale with MagicDNS
+and automatic TLS, ZeroTier, WireGuard, or plain LAN), writes
+`~/.config/remux/config.toml`, offers to start remux at login, and prints a
+pairing QR. Every question has a sane default; `--yes` accepts them all,
+and `remux setup --uninstall` undoes everything it created.
+
+Or by hand:
+
 ```sh
 remux serve --listen <tailscale-ip>:7777
 ```
 
 On startup remux prints a pairing link and QR code (valid 10 minutes,
 reusable within that window). Open it on your phone over your tailnet and
-the device pairs and connects.
+the device pairs and connects. Add `--save-config` to any working command
+to persist its flags — after that, plain `remux serve` is enough.
 
 **iOS, for the full-screen app**: after pairing in Safari, tap Share → Add
 to Home Screen, open remux from the Home Screen, and paste the same pairing
@@ -144,6 +159,32 @@ remux serve \
 | `--machine-name` | hostname | Display name shown by multi-machine clients. |
 | `--url` | derived | Public URL used in the pairing QR. |
 | `--no-pair` | — | Don't print a pairing token at startup. |
+| `--pair-on-start` | — | Print one even if the config says `no-pair = true`. |
+| `--config` / `--no-config` | XDG path | Use a specific config file / none at all. |
+| `--save-config` | — | Write the effective settings to the config file and exit. |
+
+Every flag above the config rows can instead live in
+`~/.config/remux/config.toml` (same names, kebab-case; `$XDG_CONFIG_HOME`
+honored). A flag typed on the command line always overrides the file, and
+list flags replace the file's list. Easiest way to write it: `remux setup`,
+or append `--save-config` to a `remux serve` command that works.
+
+### Run at login & the menu bar
+
+```sh
+remux service on        # start now and at every login
+remux service off       # stop and stay off
+remux service status    # both axes: running? enabled at login?
+```
+
+`start`/`stop` act only on the running daemon without touching the at-login
+setting. Homebrew installs are driven through `brew services`; otherwise
+remux manages a LaunchAgent (macOS) or the systemd user unit (Linux).
+On macOS, `remux setup` can also drop a `remux.app` into `~/Applications`
+(open it to turn remux on from Launchpad/Spotlight), and a menu-bar
+toggle for [SwiftBar](https://github.com/swiftbar/SwiftBar) ships as
+`packaging/swiftbar/remux.1m.sh` — status dot, on/off, pair-a-device, and
+open-in-browser without a terminal.
 
 To pair another device later, run `remux pair` — it asks the running daemon
 for a fresh link over a local admin socket (0600, in the state dir; it never

@@ -29,6 +29,7 @@ fn test_app(dir: &std::path::Path, session: &str) -> Arc<App> {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     })
 }

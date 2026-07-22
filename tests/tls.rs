@@ -58,6 +58,7 @@ async fn https_listener_serves_health() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     tokio::spawn(async move {

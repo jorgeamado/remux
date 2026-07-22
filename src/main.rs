@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use remux::{
     admin, attention, auth, chat, host_of_url, ingest, paneview, push, server, shell, tmux,
-    topology, App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd,
+    topology, App, Cli, Cmd, DevicesCmd, EmitCmd, SetupCmd, VoiceCmd,
 };
 use std::sync::Arc;
 
@@ -155,6 +155,32 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Setup { cmd } => return setup_shell(cmd),
+        Cmd::Voice { cmd } => {
+            match cmd {
+                VoiceCmd::Download { model } => {
+                    remux::voice::download(&state_dir, &model).await?;
+                }
+                VoiceCmd::Status => {
+                    let built = cfg!(feature = "voice");
+                    println!(
+                        "build: {}",
+                        if built {
+                            "voice enabled"
+                        } else {
+                            "voice NOT compiled in"
+                        }
+                    );
+                    match remux::voice::resolve_model(None, &state_dir) {
+                        Some(p) => println!("model: {}", p.display()),
+                        None => println!(
+                            "model: none installed (run `remux voice download`) in {}",
+                            remux::voice::models_dir(&state_dir).display()
+                        ),
+                    }
+                }
+            }
+            return Ok(());
+        }
         Cmd::Emit { cmd } => match cmd {
             EmitCmd::NeedsInput {
                 pane,
@@ -313,6 +339,20 @@ async fn main() -> Result<()> {
     }
     warn_if_cert_stale(args.tls_cert.as_deref());
 
+    // Voice dictation: resolve the model now so availability is fixed for the
+    // daemon's lifetime (advertised to clients in every status frame).
+    let voice_model = remux::voice::resolve_model(args.voice_model.clone(), &state_dir);
+    match (&voice_model, cfg!(feature = "voice")) {
+        (_, false) if args.voice_model.is_some() => {
+            tracing::warn!("--voice-model ignored: this build lacks the `voice` feature")
+        }
+        (None, true) if args.voice_model.is_some() => {
+            tracing::warn!("--voice-model file not found — dictation disabled")
+        }
+        (Some(p), true) => tracing::info!("voice dictation enabled (model {})", p.display()),
+        _ => {}
+    }
+
     let app = Arc::new(App {
         allowed_hosts,
         auth,
@@ -330,6 +370,7 @@ async fn main() -> Result<()> {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: remux::voice::Voice::new(voice_model),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
 

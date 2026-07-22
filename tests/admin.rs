@@ -30,6 +30,7 @@ async fn admin_socket_mints_usable_pairing_tokens() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
@@ -83,6 +84,7 @@ async fn second_daemon_does_not_steal_live_admin_socket() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
@@ -122,6 +124,7 @@ async fn stale_socket_file_is_replaced() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app, &dir).unwrap();
@@ -150,6 +153,7 @@ async fn admin_socket_rejects_garbage() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();
@@ -192,6 +196,7 @@ async fn revoke_cascades_and_cancels_pairing() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::admin::spawn(app.clone(), &dir).unwrap();

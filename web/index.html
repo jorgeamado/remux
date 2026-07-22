@@ -107,6 +107,9 @@
                autocomplete="off" autocapitalize="off" autocorrect="off"
                spellcheck="false" placeholder="Type a command…" />
         <button id="composer-hist" class="btn" title="previous command">&#x25B4;</button>
+        <!-- Mic: hidden unless the daemon advertises voice (status frame). -->
+        <button id="composer-mic" class="btn" hidden title="dictate"
+                aria-label="dictate a command">&#x1F399;&#xFE0E;</button>
         <button id="composer-send" class="btn primary">&#x27A4;</button>
         <button id="keys-toggle" class="btn">&#x2304;</button>
       </div>

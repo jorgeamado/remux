@@ -391,7 +391,20 @@ pub fn normalize_transcript(raw: &str) -> String {
     if (text.ends_with('.') && !text.ends_with("..")) || text.ends_with(',') {
         text.pop();
     }
-    let words: Vec<&str> = text.split_whitespace().collect();
+    // Whisper writes prose: "That's enough. Minus, -help". Sentence
+    // punctuation glued to token ends breaks the dash joiner, and no shell
+    // token legitimately ends in `,` or a single non-`..` `.` mid-command —
+    // strip one such trailer per token ("main.py" and "cd .." unaffected).
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .map(|w| {
+            if w.len() > 1 && (w.ends_with(',') || (w.ends_with('.') && !w.ends_with(".."))) {
+                &w[..w.len() - 1]
+            } else {
+                w
+            }
+        })
+        .collect();
     let mut out: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
     let is_dash = |w: &str| {
@@ -413,6 +426,16 @@ pub fn normalize_transcript(raw: &str) -> String {
             && !is_dash(words[i + 1])
             && joinable(words[i + 1])
         {
+            out.push(format!("-{}", words[i + 1]));
+            i += 2;
+        } else if is_dash(words[i])
+            && i + 1 < words.len()
+            && words[i + 1].starts_with('-')
+            && !words[i + 1].starts_with("--")
+            && words[i + 1].len() > 1
+        {
+            // Whisper already rendered the second dash pair itself
+            // ("minus, -help" for `minus minus help`) — prepend ours.
             out.push(format!("-{}", words[i + 1]));
             i += 2;
         } else {
@@ -658,6 +681,21 @@ mod tests {
         assert_eq!(normalize_transcript("htop minus h"), "htop -h");
         assert_eq!(normalize_transcript("ls minus minus color"), "ls --color");
         assert_eq!(normalize_transcript("grep hyphen n foo"), "grep -n foo");
+    }
+
+    #[test]
+    fn normalize_survives_whisper_prose_punctuation() {
+        // real transcript: spoken `htop minus minus help`
+        assert_eq!(normalize_transcript("htop. Minus, -help"), "htop --help");
+        assert_eq!(
+            normalize_transcript("git status, minus minus short."),
+            "git status --short"
+        );
+        // token-edge cleanup never mangles dots that matter
+        assert_eq!(normalize_transcript("python3 main.py"), "python3 main.py");
+        assert_eq!(normalize_transcript("cd .. && ls"), "cd .. && ls");
+        // "minus --help" must not become ---help
+        assert_eq!(normalize_transcript("minus --help"), "minus --help");
     }
 
     fn dict(cmds: &[&str]) -> std::collections::HashSet<String> {

@@ -184,7 +184,8 @@ pub fn build_prompt(recent: &[String]) -> String {
 /// Conservative cleanup of whisper's prose-shaped output for a command box.
 /// Only two rules, both reviewable by the user before send:
 /// - strip ONE trailing `.` or `,` (whisper ends utterances like sentences);
-/// - join spoken dashes: `dash dash verbose` → `--verbose`, `dash i` → `-i`.
+/// - join spoken dashes — "dash", "minus" and "hyphen" all work:
+///   `dash dash verbose` → `--verbose`, `minus h` → `-h`.
 ///
 /// Everything else is preserved byte-for-byte — no rewriting, no guessing.
 pub fn normalize_transcript(raw: &str) -> String {
@@ -202,7 +203,11 @@ pub fn normalize_transcript(raw: &str) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut out: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
-    let is_dash = |w: &str| w.eq_ignore_ascii_case("dash");
+    let is_dash = |w: &str| {
+        w.eq_ignore_ascii_case("dash")
+            || w.eq_ignore_ascii_case("minus")
+            || w.eq_ignore_ascii_case("hyphen")
+    };
     let joinable = |w: &str| w.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
     while i < words.len() {
         if is_dash(words[i])
@@ -350,6 +355,10 @@ mod tests {
         assert_eq!(normalize_transcript("echo dash"), "echo dash");
         // "dash dash" with nothing joinable after stays literal-ish
         assert_eq!(normalize_transcript("dash dash"), "dash dash");
+        // "minus" and "hyphen" are spoken-dash aliases (mixable)
+        assert_eq!(normalize_transcript("htop minus h"), "htop -h");
+        assert_eq!(normalize_transcript("ls minus minus color"), "ls --color");
+        assert_eq!(normalize_transcript("grep hyphen n foo"), "grep -n foo");
     }
 
     #[test]

@@ -16,8 +16,12 @@ fn main() {
 #[cfg(feature = "voice")]
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let model = args.next().expect("usage: voice_smoke <model> <wav> [prompt]");
-    let wav = args.next().expect("usage: voice_smoke <model> <wav> [prompt]");
+    let model = args
+        .next()
+        .expect("usage: voice_smoke <model> <wav> [prompt]");
+    let wav = args
+        .next()
+        .expect("usage: voice_smoke <model> <wav> [prompt]");
     let prompt = args.next().unwrap_or_default();
 
     let pcm = read_wav_lei16_mono16k(&std::fs::read(wav)?)?;

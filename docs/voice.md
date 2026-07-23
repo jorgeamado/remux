@@ -49,8 +49,9 @@ text is inserted at the composer cursor for editing before send.
 
 Speak punctuation for flags: "git rebase **dash i** HEAD tilde three" —
 vocabulary bias improves word choice but cannot reliably invent unspoken
-structure. A conservative post-pass joins spoken dashes (`dash i` → `-i`,
-`dash dash workspace` → `--workspace`) and strips whisper's trailing period;
+structure. A conservative post-pass joins spoken dashes — "dash", "minus"
+and "hyphen" all work (`minus h` → `-h`, `dash dash workspace` →
+`--workspace`) — and strips whisper's trailing period;
 everything else is preserved byte-for-byte. Hidden page / dropped socket
 cancels the utterance rather than transcribing a truncated tail.
 

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod chat;
 pub mod feed;
 pub mod ingest;
+pub mod intent;
 pub mod paneview;
 pub mod permit;
 pub mod push;
@@ -266,6 +267,9 @@ pub enum VoiceCmd {
     },
     /// Show whether this build/host can transcribe (feature + model file).
     Status,
+    /// Test the Command-mode translator without a microphone: turn TEXT into
+    /// a proposed command and print the JSON proposal.
+    Translate { text: String },
 }
 
 #[derive(clap::Subcommand, Debug)]

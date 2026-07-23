@@ -177,6 +177,34 @@ async fn main() -> Result<()> {
                             remux::voice::models_dir(&state_dir).display()
                         ),
                     }
+                    let intent_model = remux::voice::resolve_intent_model(&state_dir);
+                    match remux::intent::backend(intent_model.as_deref()) {
+                        Some(remux::intent::Backend::Local { worker, model }) => {
+                            println!(
+                                "intent: local — worker {} model {}",
+                                worker.display(),
+                                model.display()
+                            )
+                        }
+                        Some(remux::intent::Backend::Cli) => println!("intent: claude CLI"),
+                        None => println!(
+                            "intent: unavailable (download a model with `remux voice \
+                             download --model qwen2.5-coder-1.5b` and install the \
+                             remux-intentd worker, or install the claude CLI)"
+                        ),
+                    }
+                }
+                VoiceCmd::Translate { text } => {
+                    let intent_model = remux::voice::resolve_intent_model(&state_dir);
+                    let backend = remux::intent::backend(intent_model.as_deref())
+                        .context("no intent translator on this host")?;
+                    let started = std::time::Instant::now();
+                    let proposal = tokio::task::spawn_blocking(move || {
+                        remux::intent::translate(&backend, &text, &[], remux::voice::CORE_COMMANDS)
+                    })
+                    .await??;
+                    eprintln!("({} ms)", started.elapsed().as_millis());
+                    println!("{}", serde_json::to_string_pretty(&proposal)?);
                 }
             }
             return Ok(());
@@ -370,7 +398,10 @@ async fn main() -> Result<()> {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
-        voice: remux::voice::Voice::new(voice_model),
+        voice: remux::voice::Voice::new(
+            voice_model,
+            remux::voice::resolve_intent_model(&state_dir),
+        ),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
 

@@ -461,6 +461,52 @@ button {
   }
 }
 
+/* Voice mode chip: compact, sits between history and mic. */
+#voice-mode {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  min-width: 34px;
+}
+
+/* Command-mode proposal card: heard text + proposed command, review-first. */
+#voice-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--input);
+}
+
+#voice-card .voice-heard {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#voice-card .voice-cmd {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+#voice-card .voice-note {
+  flex: 1;
+  font-size: 13px;
+}
+
+#voice-card .voice-warn {
+  flex-basis: 100%;
+  color: #e6a23c;
+  font-size: 12px;
+}
+
 /* ---------- key panel ---------- */
 
 #keyrow,

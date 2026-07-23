@@ -140,7 +140,12 @@ enum ClientMsg {
     /// Begin a voice utterance (dictation into the composer). Resets this
     /// connection's audio buffer. Available to observers too — the transcript
     /// only ever returns to this connection's composer, it types nothing.
-    VoiceStart,
+    /// `mode`: `text` (default) inserts the transcript; `command` runs the
+    /// intent translator and returns a reviewable proposal (voice_intent).
+    VoiceStart {
+        #[serde(default)]
+        mode: Option<String>,
+    },
     /// One chunk of the utterance: base64 of little-endian 16 kHz mono i16
     /// PCM. Ignored unless a voice_start is active.
     VoiceChunk {
@@ -163,6 +168,9 @@ enum ServerMsg<'a> {
         /// Host offers voice dictation (build feature + installed model) —
         /// gates the client's mic button.
         voice: bool,
+        /// Host can also translate spoken intent into a proposed command
+        /// (voice + a usable translator) — gates the Command/Text toggle.
+        voice_intent: bool,
     },
     Error {
         code: &'a str,
@@ -742,14 +750,18 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // (one in flight — inference is seconds of CPU).
     let mut voice_buf: Vec<i16> = Vec::new();
     let mut voice_active = false;
+    // Intent (Command) mode for the CURRENT utterance, latched at voice_start.
+    let mut voice_intent_mode = false;
     let voice_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let voice_avail = app.voice.available();
+    let intent_avail = voice_avail && crate::intent::backend(app.voice.intent_model()).is_some();
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
             session: &session,
             device: &device.name,
             voice: voice_avail,
+            voice_intent: intent_avail,
         })
     };
     let _ = out_tx.send(status("observer")).await;
@@ -1209,7 +1221,8 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             .await;
                         }
                     }
-                    Ok(ClientMsg::VoiceStart) => {
+                    Ok(ClientMsg::VoiceStart { mode }) => {
+                        voice_intent_mode = intent_avail && mode.as_deref() == Some("command");
                         if !voice_avail {
                             let _ = out_tx
                                 .send(json(&ServerMsg::VoiceError {
@@ -1283,25 +1296,60 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                 let sess = session.clone();
                                 let out = out_tx.clone();
                                 let busy = voice_busy.clone();
+                                let intent_mode = voice_intent_mode;
                                 tokio::spawn(async move {
                                     let res = tokio::task::spawn_blocking(move || {
                                         // Bias towards this session's recent
-                                        // commands (memory-only; never logged),
-                                        // then snap command-position tokens to
-                                        // the dictionary (PATH + recent).
+                                        // commands (memory-only; never logged).
                                         let recent = app.feed.recent_commands(&sess, 40);
                                         let prompt = voice::build_prompt(&recent);
-                                        app.voice.transcribe(&pcm, &prompt).map(|t| {
-                                            voice::correct_commands(
-                                                &t,
-                                                app.voice.path_commands(),
+                                        let text = app.voice.transcribe(&pcm, &prompt)?;
+                                        if intent_mode {
+                                            // Command mode: the transcript is
+                                            // natural prose; translate it to a
+                                            // reviewable proposal instead of
+                                            // token-fixing it.
+                                            if text.trim().is_empty() {
+                                                return Ok((text, None));
+                                            }
+                                            let backend =
+                                                crate::intent::backend(app.voice.intent_model())
+                                                    .ok_or_else(|| {
+                                                        anyhow::anyhow!("no intent backend")
+                                                    })?;
+                                            let proposal = crate::intent::translate(
+                                                &backend,
+                                                &text,
                                                 &recent,
-                                            )
-                                        })
+                                                voice::CORE_COMMANDS,
+                                            )?;
+                                            Ok((text, Some(proposal)))
+                                        } else {
+                                            // Text mode: snap command-position
+                                            // tokens to the dictionary.
+                                            Ok::<_, anyhow::Error>((
+                                                voice::correct_commands(
+                                                    &text,
+                                                    app.voice.path_commands(),
+                                                    &recent,
+                                                ),
+                                                None,
+                                            ))
+                                        }
                                     })
                                     .await;
                                     let msg = match res {
-                                        Ok(Ok(text)) if !text.trim().is_empty() => {
+                                        Ok(Ok((heard, Some(proposal)))) => {
+                                            // voice_intent: heard text + the
+                                            // validated proposal, this
+                                            // connection only.
+                                            let mut v =
+                                                serde_json::to_value(&proposal).unwrap_or_default();
+                                            v["type"] = "voice_intent".into();
+                                            v["heard"] = heard.into();
+                                            Message::Text(v.to_string().into())
+                                        }
+                                        Ok(Ok((text, None))) if !text.trim().is_empty() => {
                                             json(&ServerMsg::VoiceResult { text: &text })
                                         }
                                         Ok(Ok(_)) => json(&ServerMsg::VoiceError {

@@ -195,6 +195,30 @@ const CORE_PROMPT: &str = "cd ..; ls -la; pwd; git status; git log --oneline; ht
      docker ps -a; kubectl get pods; grep -rn main src; tail -f app.log; \
      cargo build --release; npm run dev; python3 main.py; curl -s localhost | jq .";
 
+/// Intent-translator models `remux voice download` accepts: name → (file,
+/// URL). Small instruct models that run on CPU; Qwen2.5-Coder is notably
+/// good at shell one-liners for its size.
+pub const KNOWN_INTENT_MODELS: &[(&str, &str, &str)] = &[
+    (
+        "qwen2.5-coder-1.5b",
+        "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    ),
+    (
+        "qwen2.5-coder-3b",
+        "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+    ),
+];
+
+/// Best installed intent model (same preference order as the registry).
+pub fn resolve_intent_model(state_dir: &Path) -> Option<PathBuf> {
+    KNOWN_INTENT_MODELS
+        .iter()
+        .map(|(_, file, _)| models_dir(state_dir).join(file))
+        .find(|p| p.exists())
+}
+
 pub fn models_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("models")
 }
@@ -226,18 +250,26 @@ pub struct Voice {
     /// service PATH can be narrower than an interactive shell's; the
     /// shell-hook-supplied PATH is a documented follow-up.)
     path_cmds: std::sync::OnceLock<std::collections::HashSet<String>>,
+    /// Resolved GGUF for the LOCAL intent translator (docs/voice.md), if
+    /// installed. Used by `intent::backend`.
+    intent_model: Option<PathBuf>,
     #[cfg(feature = "voice")]
     ctx: std::sync::OnceLock<Option<whisper_rs::WhisperContext>>,
 }
 
 impl Voice {
-    pub fn new(model_path: Option<PathBuf>) -> Self {
+    pub fn new(model_path: Option<PathBuf>, intent_model: Option<PathBuf>) -> Self {
         Self {
             model_path,
             path_cmds: std::sync::OnceLock::new(),
+            intent_model,
             #[cfg(feature = "voice")]
             ctx: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn intent_model(&self) -> Option<&Path> {
+        self.intent_model.as_deref()
     }
 
     /// Advertised to clients in the status frame; gates the mic button.
@@ -553,27 +585,37 @@ fn sound_match(
     hit.map(str::to_string)
 }
 
-/// `remux voice download`: fetch a ggml model from the official whisper.cpp
-/// repository on Hugging Face into the state dir. The model is a public
-/// artifact — writing it to disk carries no secrets.
+/// `remux voice download`: fetch a model (whisper ASR ggml, or a GGUF intent
+/// translator) from its official Hugging Face repository into the state dir.
+/// Models are public artifacts — writing them to disk carries no secrets.
 pub async fn download(state_dir: &Path, model: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    if !KNOWN_MODELS.contains(&model) {
+    let (dest, url) = if KNOWN_MODELS.contains(&model) {
+        let dest = model_file(state_dir, model);
+        let url =
+            format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin");
+        (dest, url)
+    } else if let Some((_, file, url)) = KNOWN_INTENT_MODELS.iter().find(|(n, _, _)| *n == model) {
+        (models_dir(state_dir).join(file), url.to_string())
+    } else {
         anyhow::bail!(
-            "unknown model {model:?} — one of: {}",
-            KNOWN_MODELS.join(", ")
+            "unknown model {model:?} — ASR: {}; intent: {}",
+            KNOWN_MODELS.join(", "),
+            KNOWN_INTENT_MODELS
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-    }
-    let dest = model_file(state_dir, model);
+    };
     if dest.exists() {
         println!("already installed: {}", dest.display());
         return Ok(());
     }
     std::fs::create_dir_all(models_dir(state_dir))?;
-    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin");
     println!("downloading {url}");
     let resp = reqwest::get(&url).await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);

@@ -398,6 +398,14 @@ interface ControlMsg {
   /** status frames: host offers voice dictation (gates the mic button).
       voice_result frames reuse `text`; voice_error reuses code/message. */
   voice?: boolean;
+  /** status frames: host can translate spoken intent into a command. */
+  voice_intent?: boolean;
+  /** voice_intent frames: what ASR heard + the validated proposal. */
+  heard?: string;
+  command?: string;
+  question?: string;
+  explanation?: string;
+  risk?: string;
 }
 
 /** A pane's structured view state, rendered as a custom interface. */
@@ -450,7 +458,7 @@ function handleControl(msg: ControlMsg): void {
       setStatus(sessionTitle, "connected");
       if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
-      setVoiceAvailable(msg.voice === true);
+      setVoiceAvailable(msg.voice === true, msg.voice_intent === true);
       setRole(nowController);
       renderTabs(); // session may have changed
       if (nowController) {
@@ -497,6 +505,9 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "voice_result":
       onVoiceResult(msg.text ?? "");
+      break;
+    case "voice_intent":
+      onVoiceIntent(msg);
       break;
     case "voice_error":
       onVoiceError(msg.message ?? "voice failed");
@@ -2396,8 +2407,16 @@ keysToggle.addEventListener("pointerdown", (ev) => {
 // inserted into the composer for review — dictation NEVER presses Enter.
 
 const micBtn = $<HTMLButtonElement>("composer-mic");
+const voiceModeBtn = $<HTMLButtonElement>("voice-mode");
 type MicState = "idle" | "rec" | "busy";
 let micState: MicState = "idle";
+// Command mode: speak intent naturally → reviewable proposal (voice_intent).
+// Text mode: literal transcript into the composer. Persisted preference;
+// only offered when the daemon advertises a translator.
+const VOICE_MODE_KEY = "remux-voice-mode";
+let voiceIntentAvail = false;
+let voiceMode: "command" | "text" =
+  localStorage.getItem(VOICE_MODE_KEY) === "text" ? "text" : "command";
 let micStream: MediaStream | null = null;
 let micCtx: AudioContext | null = null;
 let micBusyTimer: number | undefined;
@@ -2410,10 +2429,35 @@ let micSentAny = false;
 const VOICE_CHUNK_SAMPLES = 8000;
 const VOICE_RATE = 16000;
 
-function setVoiceAvailable(on: boolean): void {
+function setVoiceAvailable(on: boolean, intent: boolean): void {
   micBtn.hidden = !on;
+  voiceIntentAvail = intent;
+  voiceModeBtn.hidden = !on || !intent;
+  renderVoiceMode();
   if (!on && micState !== "idle") voiceTeardown("idle");
 }
+
+function activeVoiceMode(): "command" | "text" {
+  return voiceIntentAvail ? voiceMode : "text";
+}
+
+function renderVoiceMode(): void {
+  voiceModeBtn.textContent = activeVoiceMode() === "command" ? "cmd" : "txt";
+  voiceModeBtn.classList.toggle("primary", activeVoiceMode() === "command");
+  micBtn.title = activeVoiceMode() === "command" ? "say what you want" : "dictate text";
+}
+
+voiceModeBtn.addEventListener("pointerdown", (ev) => {
+  ev.preventDefault();
+  voiceMode = voiceMode === "command" ? "text" : "command";
+  localStorage.setItem(VOICE_MODE_KEY, voiceMode);
+  renderVoiceMode();
+  showHint(
+    voiceMode === "command"
+      ? "Command mode — say what you want, e.g. “show processes sorted by memory”"
+      : "Text mode — the transcript is inserted literally"
+  );
+});
 
 function setMicState(s: MicState): void {
   micState = s;
@@ -2508,7 +2552,7 @@ async function voiceStart(): Promise<void> {
     mute.gain.value = 0;
     node.connect(mute);
     mute.connect(ctx.destination);
-    sendJson({ type: "voice_start" });
+    sendJson({ type: "voice_start", mode: activeVoiceMode() });
   } catch (err) {
     console.warn("voice capture failed:", err);
     voiceTeardown("idle");
@@ -2523,11 +2567,15 @@ function voiceFinish(): void {
   voiceTeardown(spoke ? "busy" : "idle");
   if (!spoke) return; // mic never produced audio — nothing to transcribe
   sendJson({ type: "voice_end" });
-  // The daemon answers with voice_result or voice_error; if the socket drops
-  // in between, don't leave the button spinning forever.
-  micBusyTimer = window.setTimeout(() => {
-    if (micState === "busy") setMicState("idle");
-  }, 30_000);
+  // The daemon answers with voice_result/voice_intent or voice_error; if the
+  // socket drops in between, don't leave the button spinning forever. Command
+  // mode includes an LLM round-trip on top of ASR — longer leash.
+  micBusyTimer = window.setTimeout(
+    () => {
+      if (micState === "busy") setMicState("idle");
+    },
+    activeVoiceMode() === "command" ? 75_000 : 30_000
+  );
 }
 
 function voiceCancel(): void {
@@ -2539,6 +2587,75 @@ function voiceCancel(): void {
 /// connection) — just put the local machine back to idle.
 function voiceReset(): void {
   if (micState !== "idle") voiceTeardown("idle");
+  dismissVoiceCard();
+}
+
+/// Proposal card (Command mode): shows what ASR heard and the translator's
+/// proposal separately — so the user can tell a mishearing from a bad
+/// translation. Nothing is inserted, let alone sent, without a tap.
+let voiceCard: HTMLDivElement | null = null;
+
+function dismissVoiceCard(): void {
+  voiceCard?.remove();
+  voiceCard = null;
+}
+
+function onVoiceIntent(msg: ControlMsg): void {
+  clearTimeout(micBusyTimer);
+  setMicState("idle");
+  dismissVoiceCard();
+  const card = document.createElement("div");
+  card.id = "voice-card";
+  const heard = document.createElement("div");
+  heard.className = "voice-heard";
+  heard.textContent = `Heard: “${msg.heard ?? ""}”`;
+  card.appendChild(heard);
+
+  if (msg.command) {
+    const cmd = document.createElement("code");
+    cmd.className = "voice-cmd";
+    cmd.textContent = msg.command;
+    card.appendChild(cmd);
+    if (msg.risk === "elevated") {
+      const warn = document.createElement("div");
+      warn.className = "voice-warn";
+      warn.textContent = "⚠ destructive/privileged — double-check before sending";
+      card.appendChild(warn);
+    } else if (msg.risk === "unknown") {
+      const warn = document.createElement("div");
+      warn.className = "voice-warn";
+      warn.textContent = "command not recognized on this host";
+      card.appendChild(warn);
+    }
+    const use = document.createElement("button");
+    use.className = "btn primary";
+    use.textContent = "Use";
+    use.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      insertIntoComposer(msg.command ?? "");
+      composerInput.focus();
+      dismissVoiceCard();
+    });
+    card.appendChild(use);
+  } else {
+    const note = document.createElement("div");
+    note.className = "voice-note";
+    note.textContent =
+      msg.question ?? msg.explanation ?? "couldn't turn that into a command";
+    card.appendChild(note);
+  }
+
+  const close = document.createElement("button");
+  close.className = "btn";
+  close.textContent = "✕";
+  close.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    dismissVoiceCard();
+  });
+  card.appendChild(close);
+
+  composer.parentElement?.insertBefore(card, composer);
+  voiceCard = card;
 }
 
 function onVoiceResult(text: string): void {

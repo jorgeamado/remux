@@ -58,13 +58,30 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 whisper-rs = { version = "0.14", optional = true }
+llama-cpp-2 = { version = "0.1", optional = true }
+encoding_rs = { version = "0.8", optional = true }
 
 # Voice dictation (docs/voice.md) is opt-in at BUILD time: whisper-rs compiles
 # whisper.cpp (needs cmake + a C/C++ toolchain), so the default build stays
 # lean. `voice-metal` adds Apple GPU inference on macOS.
+#
+# `intent` builds the SEPARATE `remux-intentd` worker (llama.cpp + a small
+# GGUF model) — the local spoken-intent → command translator. It is a second
+# binary on purpose: whisper-rs and llama-cpp-2 both bundle ggml statically
+# (their symbols collide in one link), and a worker keeps C++ inference
+# crashes out of the daemon. Build it separately:
+#   cargo build --release --features intent --bin remux-intentd
+# The daemon (any build) uses the worker when it sits next to the remux
+# binary or on PATH; otherwise Command mode falls back to the `claude` CLI.
 [features]
 voice = ["dep:whisper-rs"]
 voice-metal = ["voice", "whisper-rs/metal"]
+intent = ["dep:llama-cpp-2", "dep:encoding_rs"]
+
+[[bin]]
+name = "remux-intentd"
+path = "src/bin/intentd.rs"
+required-features = ["intent"]
 
 [dev-dependencies]
 rcgen = "0.14"

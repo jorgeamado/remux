@@ -74,6 +74,39 @@ Capture path: `getUserMedia` → AudioWorklet ships raw Float32 blocks →
 main thread linear-resamples to 16 kHz (Web Speech API is not used: broken
 in standalone iOS PWAs, no vocabulary control, and it ships audio to Apple).
 
+## Command (intent) mode
+
+Literal dictation of shell syntax fights the ASR's nature — whisper is
+prose-trained, and "minus minus help" has no conversational grammar (the
+V1 field results made this vivid: spoken `htop minus minus help` →
+"That's enough. Minus, -help"). Command mode embraces that: **say what you
+want naturally** — "show processes sorted by memory" — whisper transcribes
+the prose (its strength), and a translator turns it into ONE proposed
+command, shown in a card with what was heard, for review before anything
+reaches the composer.
+
+- Translator backends, local preferred:
+  - **Local** (`intent` cargo feature): llama.cpp running a small GGUF
+    instruct model — `remux voice download --model qwen2.5-coder-1.5b`
+    (~1 GB). Fully on-host like the ASR — nothing leaves your machines —
+    and decoding is **GBNF-grammar-constrained**: output that isn't our
+    JSON schema is unrepresentable. Model stays loaded after first use.
+  - **CLI fallback**: `claude -p` (haiku) reusing the host's existing
+    Claude Code auth when no local model is installed.
+  Both get no tools, no execution, advisory context only (recent commands +
+  core command list). Structured result: `propose` / `clarify` / `refuse`.
+  Test either without a microphone: `remux voice translate "show processes
+  sorted by memory"`.
+- Deterministic validation in `src/intent.rs`: single line, length cap, no
+  control bytes; a rule-based risk lint (`sudo`, `rm`, `--force`, …) drives
+  the ⚠ warning — the model never grades its own safety.
+- Nothing is auto-inserted and nothing is ever sent: "Use" copies the
+  proposal into the composer, where the normal edit-before-send flow (and
+  your eyes) remain the boundary. `clarify` shows the question instead.
+- The `cmd`/`txt` chip next to the mic switches modes; Text mode remains
+  the literal transcript path (good for commit messages, search strings,
+  chat prompts). The chip only appears when the daemon has a translator.
+
 ## Vocabulary biasing
 
 Two layers, both rebuilt/applied per utterance:

@@ -76,14 +76,25 @@ in standalone iOS PWAs, no vocabulary control, and it ships audio to Apple).
 
 ## Vocabulary biasing
 
-The whisper `initial_prompt` is rebuilt per utterance from
-`Feed::recent_commands` for this session (memory-only, newest first, capped
-at ~700 bytes) — command-shaped text that biases the decoder towards the
-tools, flags and paths actually in play. Deliberately NOT included in V1:
-executing installed programs with `--help` to harvest flags (arbitrary
-executables can hang or have side effects). Follow-ups, in rough order:
-visible-pane tokens, PATH basenames from the shell hook, completion specs,
-and a lattice-constrained correction pass over low-confidence spans.
+Two layers, both rebuilt/applied per utterance:
+
+1. **Soft bias**: the whisper `initial_prompt` from `Feed::recent_commands`
+   for this session (memory-only, newest first, capped at ~700 bytes) —
+   command-shaped text that biases the decoder towards the tools, flags and
+   paths actually in play. Needs the shell hook (`remux setup shell`) to
+   populate the feed.
+2. **Dictionary correction** at command positions (line start, after
+   `sudo`/`|`/`&&`/`||`/`;`) against PATH executable basenames + recent
+   first-words: case fix (`Docker` → `docker`), split-name join (`h top` →
+   `htop`), and a letter-sound match for spelled-out commands whisper
+   renders ALL-CAPS (`BWG` → `pwd`; B/P and D/G rhyme said as letters),
+   only on a unique same-length hit. Arguments and flags are never touched.
+
+Deliberately NOT included: executing installed programs with `--help` to
+harvest flags (arbitrary executables can hang or have side effects).
+Follow-ups, in rough order: visible-pane tokens, the interactive shell's
+PATH via the hook (the daemon's service PATH can be narrower), completion
+specs, and a lattice-constrained correction pass over low-confidence spans.
 
 ## Privacy rules
 

@@ -1286,10 +1286,18 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                                 tokio::spawn(async move {
                                     let res = tokio::task::spawn_blocking(move || {
                                         // Bias towards this session's recent
-                                        // commands (memory-only; never logged).
+                                        // commands (memory-only; never logged),
+                                        // then snap command-position tokens to
+                                        // the dictionary (PATH + recent).
                                         let recent = app.feed.recent_commands(&sess, 40);
                                         let prompt = voice::build_prompt(&recent);
-                                        app.voice.transcribe(&pcm, &prompt)
+                                        app.voice.transcribe(&pcm, &prompt).map(|t| {
+                                            voice::correct_commands(
+                                                &t,
+                                                app.voice.path_commands(),
+                                                &recent,
+                                            )
+                                        })
                                     })
                                     .await;
                                     let msg = match res {

@@ -42,6 +42,159 @@ pub const KNOWN_MODELS: &[&str] = &[
     "large-v3-turbo",
 ];
 
+/// Shipped core dictionary: ubiquitous commands/tools, merged into the
+/// correction dictionary alongside PATH basenames and recent commands —
+/// insurance for narrow service PATHs and fresh sessions with no history.
+pub const CORE_COMMANDS: &[&str] = &[
+    // shell builtins & navigation
+    "cd",
+    "ls",
+    "pwd",
+    "echo",
+    "cat",
+    "export",
+    "source",
+    "alias",
+    "kill",
+    "jobs",
+    "type",
+    "which",
+    "env",
+    "history",
+    "exit",
+    "clear", // core utils
+    "grep",
+    "sed",
+    "awk",
+    "find",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "cp",
+    "mv",
+    "rm",
+    "mkdir",
+    "touch",
+    "chmod",
+    "chown",
+    "ln",
+    "du",
+    "df",
+    "ps",
+    "top",
+    "htop",
+    "btop",
+    "man",
+    "xargs",
+    "sort",
+    "uniq",
+    "wc",
+    "diff",
+    "tee",
+    "tr",
+    "cut",
+    "date",
+    "whoami",
+    "uname",
+    "watch",
+    "tar",
+    "zip",
+    "unzip",
+    "gzip",
+    "open", // net & remote
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "rsync",
+    "ping",
+    "dig",
+    "netstat",
+    "lsof",
+    "nc",
+    "tailscale", // package managers & system
+    "brew",
+    "apt",
+    "dpkg",
+    "pacman",
+    "systemctl",
+    "journalctl",
+    "crontab",
+    "sudo",
+    // dev tools
+    "git",
+    "gh",
+    "glab",
+    "lazygit",
+    "docker",
+    "podman",
+    "kubectl",
+    "helm",
+    "terraform",
+    "make",
+    "cmake",
+    "gcc",
+    "clang",
+    "gdb",
+    "lldb",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "node",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "deno",
+    "bun",
+    "ruby",
+    "gem",
+    "bundle",
+    "go",
+    "cargo",
+    "rustc",
+    "rustup",
+    "java",
+    "mvn",
+    "gradle",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "redis-cli",
+    "tmux",
+    "screen",
+    "vim",
+    "nvim",
+    "emacs",
+    "nano",
+    "code",
+    "jq",
+    "yq",
+    "fzf",
+    "rg",
+    "fd",
+    "bat",
+    "eza",
+    "delta",
+    "just",
+    "mise",
+    "direnv",
+    "claude",
+    "codex",
+    "aws",
+    "gcloud",
+    "az",
+    "remux",
+];
+
+/// Command-shaped prompt seed used when the session has no recent commands
+/// (no shell hook, fresh session) — some bias beats none.
+const CORE_PROMPT: &str = "cd ..; ls -la; pwd; git status; git log --oneline; htop; \
+     docker ps -a; kubectl get pods; grep -rn main src; tail -f app.log; \
+     cargo build --release; npm run dev; python3 main.py; curl -s localhost | jq .";
+
 pub fn models_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("models")
 }
@@ -68,6 +221,11 @@ pub fn resolve_model(explicit: Option<PathBuf>, state_dir: &Path) -> Option<Path
 #[derive(Default)]
 pub struct Voice {
     model_path: Option<PathBuf>,
+    /// Executable basenames on the daemon's PATH — the command dictionary for
+    /// post-ASR correction. Scanned once, on first utterance. (The daemon's
+    /// service PATH can be narrower than an interactive shell's; the
+    /// shell-hook-supplied PATH is a documented follow-up.)
+    path_cmds: std::sync::OnceLock<std::collections::HashSet<String>>,
     #[cfg(feature = "voice")]
     ctx: std::sync::OnceLock<Option<whisper_rs::WhisperContext>>,
 }
@@ -76,6 +234,7 @@ impl Voice {
     pub fn new(model_path: Option<PathBuf>) -> Self {
         Self {
             model_path,
+            path_cmds: std::sync::OnceLock::new(),
             #[cfg(feature = "voice")]
             ctx: std::sync::OnceLock::new(),
         }
@@ -84,6 +243,33 @@ impl Voice {
     /// Advertised to clients in the status frame; gates the mic button.
     pub fn available(&self) -> bool {
         cfg!(feature = "voice") && self.model_path.is_some()
+    }
+
+    /// Executable basenames on PATH (cached). Blocking on first call — use
+    /// from the same `spawn_blocking` context as transcription.
+    pub fn path_commands(&self) -> &std::collections::HashSet<String> {
+        self.path_cmds.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let mut out = std::collections::HashSet::new();
+            let path = std::env::var("PATH").unwrap_or_default();
+            for dir in std::env::split_paths(&path) {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let Ok(meta) = e.metadata() else { continue };
+                    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                    if let Some(name) = e.file_name().to_str() {
+                        if out.len() < 20_000 {
+                            out.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+            out
+        })
     }
 
     /// Transcribe one utterance. Blocking (model load on first use, then
@@ -163,6 +349,8 @@ pub fn decode_pcm(b64: &str) -> Option<Vec<i16>> {
 /// Build the whisper initial_prompt from this session's recent commands
 /// (newest first, memory-only). Command-shaped text biases the decoder
 /// towards the vocabulary actually in play: tool names, flags, paths.
+/// With no history at all (no shell hook, fresh session) fall back to the
+/// generic core seed — some bias beats none.
 pub fn build_prompt(recent: &[String]) -> String {
     let mut out = String::new();
     for cmd in recent {
@@ -177,6 +365,9 @@ pub fn build_prompt(recent: &[String]) -> String {
             out.push_str("; ");
         }
         out.push_str(cmd);
+    }
+    if out.is_empty() {
+        return CORE_PROMPT.to_string();
     }
     out
 }
@@ -230,6 +421,113 @@ pub fn normalize_transcript(raw: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+/// Correct tokens in COMMAND position (start of line, after `sudo`, `|`,
+/// `&&`, `||`, `;`) against the command dictionary: PATH basenames plus the
+/// first words of this session's recent commands. Three conservative moves,
+/// tried in order, only when the spoken token is NOT already a known command:
+/// - case fix: `Docker` → `docker`;
+/// - pair join: `h top` → `htop` (whisper splits unfamiliar names);
+/// - letter-sound match for short spelled-out commands: `BWG` → `pwd`
+///   (B/P, D/G… rhyme when said as letters — the classic E-set confusion),
+///   applied only on a UNIQUE same-length dictionary hit.
+///
+/// Arguments and flags are never touched — only what the shell would resolve
+/// as a command name, and the user still reviews before send.
+pub fn correct_commands(
+    text: &str,
+    path_cmds: &std::collections::HashSet<String>,
+    recent: &[String],
+) -> String {
+    let recent_first: std::collections::HashSet<&str> = recent
+        .iter()
+        .filter_map(|c| c.split_whitespace().next())
+        .collect();
+    let known =
+        |w: &str| recent_first.contains(w) || path_cmds.contains(w) || CORE_COMMANDS.contains(&w);
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut cmd_pos = true;
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if cmd_pos && !known(w) {
+            let lower = w.to_lowercase();
+            if known(&lower) {
+                out.push(lower);
+                (i, cmd_pos) = (i + 1, false);
+                continue;
+            }
+            if i + 1 < words.len() {
+                let joined = format!("{lower}{}", words[i + 1].to_lowercase());
+                if known(&joined) {
+                    out.push(joined);
+                    (i, cmd_pos) = (i + 2, false);
+                    continue;
+                }
+            }
+            if let Some(hit) = sound_match(w, &recent_first, path_cmds) {
+                out.push(hit);
+                (i, cmd_pos) = (i + 1, false);
+                continue;
+            }
+        }
+        cmd_pos = matches!(w, "sudo" | "|" | "&&" | "||" | ";") || w.ends_with('|');
+        out.push(w.to_string());
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Letter-name sound classes: letters that rhyme when spoken ("bee"/"pee"/
+/// "dee"/"gee"…, "ef"/"es"/"ex", "el"/"em"/"en"). Two spelled-out tokens
+/// match when their class strings are equal — `bwg` ≡ `pwd`.
+fn sound_class(c: char) -> char {
+    match c {
+        'b' | 'c' | 'd' | 'e' | 'g' | 'p' | 't' | 'v' | 'z' => 'e',
+        'a' | 'j' | 'k' => 'a',
+        'i' | 'y' => 'i',
+        'q' | 'u' => 'u',
+        'f' | 's' | 'x' => 'f',
+        'l' | 'm' | 'n' => 'l',
+        other => other,
+    }
+}
+
+/// Unique same-length, same-sound-class dictionary hit for a short spelled-
+/// out command. Fires ONLY on tokens whisper rendered ALL-CAPS (its tell for
+/// letter-by-letter speech: `BWG`, `P.W.D.`) — never on ordinary words.
+/// Ambiguity (two candidates) means no correction.
+fn sound_match(
+    raw: &str,
+    recent_first: &std::collections::HashSet<&str>,
+    path_cmds: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let token: String = raw.chars().filter(|c| *c != '.').collect();
+    if !(2..=6).contains(&token.len()) || !token.chars().all(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let token = token.to_lowercase();
+    let classes: String = token.chars().map(sound_class).collect();
+    let mut hit: Option<&str> = None;
+    for cand in recent_first
+        .iter()
+        .copied()
+        .chain(path_cmds.iter().map(|s| s.as_str()))
+        .chain(CORE_COMMANDS.iter().copied())
+    {
+        if cand.len() == token.len() && cand.chars().map(sound_class).collect::<String>() == classes
+        {
+            match hit {
+                None => hit = Some(cand),
+                Some(prev) if prev != cand => return None, // ambiguous — leave it
+                Some(_) => {}
+            }
+        }
+    }
+    hit.map(str::to_string)
 }
 
 /// `remux voice download`: fetch a ggml model from the official whisper.cpp
@@ -324,7 +622,8 @@ mod tests {
             .map(|i| format!("command-number-{i} --flag"))
             .collect();
         assert!(build_prompt(&many).len() <= 700);
-        assert!(build_prompt(&[]).is_empty());
+        // no history → the shipped core seed, never an empty prompt
+        assert_eq!(build_prompt(&[]), CORE_PROMPT);
     }
 
     #[test]
@@ -359,6 +658,60 @@ mod tests {
         assert_eq!(normalize_transcript("htop minus h"), "htop -h");
         assert_eq!(normalize_transcript("ls minus minus color"), "ls --color");
         assert_eq!(normalize_transcript("grep hyphen n foo"), "grep -n foo");
+    }
+
+    fn dict(cmds: &[&str]) -> std::collections::HashSet<String> {
+        cmds.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn correct_case_fixes_command_position_only() {
+        let path = dict(&["docker", "grep"]);
+        assert_eq!(correct_commands("Docker ps -a", &path, &[]), "docker ps -a");
+        // args are never touched, later command positions are
+        assert_eq!(
+            correct_commands("Docker ps | Grep foo", &path, &[]),
+            "docker ps | grep foo"
+        );
+        assert_eq!(
+            correct_commands("echo Docker", &dict(&["echo"]), &[]),
+            "echo Docker"
+        );
+        // sudo keeps command position
+        assert_eq!(
+            correct_commands("sudo Docker ps", &path, &[]),
+            "sudo docker ps"
+        );
+    }
+
+    #[test]
+    fn correct_joins_split_command_names() {
+        let path = dict(&["htop"]);
+        assert_eq!(correct_commands("h top -h", &path, &[]), "htop -h");
+        assert_eq!(correct_commands("H top", &path, &[]), "htop");
+        // htop is in the shipped core dictionary even with a bare PATH
+        assert_eq!(correct_commands("h top", &dict(&[]), &[]), "htop");
+        // no dictionary hit anywhere → left alone
+        assert_eq!(correct_commands("h zork", &dict(&[]), &[]), "h zork");
+    }
+
+    #[test]
+    fn correct_matches_spelled_out_commands_by_letter_sound() {
+        let path = dict(&["pwd", "ls", "sed"]);
+        // B/P and G/D rhyme as letters; unique hit → corrected
+        assert_eq!(correct_commands("BWG", &path, &[]), "pwd");
+        assert_eq!(correct_commands("P.W.D.", &path, &[]), "pwd");
+        // lowercase words never sound-match (whisper caps spelled letters)
+        assert_eq!(correct_commands("bwg", &path, &[]), "bwg");
+        // ambiguity → no correction
+        let ambiguous = dict(&["pwd", "twd"]);
+        assert_eq!(correct_commands("BWG", &ambiguous, &[]), "BWG");
+        // recent commands count as dictionary too
+        let recent = vec!["kubectl get pods".to_string()];
+        assert_eq!(
+            correct_commands("Kubectl get pods", &dict(&[]), &recent),
+            "kubectl get pods"
+        );
     }
 
     #[test]

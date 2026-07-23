@@ -66,6 +66,7 @@ async fn attention_dispatches_vapid_push_and_prunes_gone() {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     app.push

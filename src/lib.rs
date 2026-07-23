@@ -12,6 +12,7 @@ pub mod server;
 pub mod shell;
 pub mod tmux;
 pub mod topology;
+pub mod voice;
 pub mod ws;
 
 use clap::Parser;
@@ -70,6 +71,11 @@ pub enum Cmd {
         /// One-line summary shown on the card (stand-in for a command).
         #[arg(long, default_value = "echo hello from remux   # test approval")]
         summary: String,
+    },
+    /// Voice dictation (opt-in): manage the host-side speech-to-text model.
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
     },
     /// Stream a pane view: read newline-delimited JSON snapshots on stdin and
     /// forward them to the running daemon as this pane's structured view, which
@@ -249,6 +255,20 @@ pub enum SetupCmd {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum VoiceCmd {
+    /// Download a whisper.cpp model (ggml) into remux's state dir. Dictation
+    /// activates on the next daemon start; the binary must be built with the
+    /// `voice` feature (`cargo build --release --features voice`).
+    Download {
+        /// Model name, e.g. base.en (fast) or small.en (more accurate).
+        #[arg(long, default_value = "base.en")]
+        model: String,
+    },
+    /// Show whether this build/host can transcribe (feature + model file).
+    Status,
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum DevicesCmd {
     /// List paired devices.
     List,
@@ -297,6 +317,12 @@ pub struct Args {
     /// Defaults to http(s)://<listen-addr>.
     #[arg(long)]
     pub url: Option<String>,
+
+    /// Whisper model file for voice dictation (ggml .bin). Defaults to the
+    /// best model installed by `remux voice download`. Only meaningful in a
+    /// build with the `voice` feature.
+    #[arg(long)]
+    pub voice_model: Option<PathBuf>,
 }
 
 /// An attention-worthy moment in a session. `kind`/`reason`/`source` ride
@@ -373,6 +399,10 @@ pub struct App {
     pub dash_windows: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Per-session shell command feed (M4c), fed by the shell datagram socket.
     pub feed: feed::Feed,
+    /// Host-side voice transcription (opt-in; disabled unless built with the
+    /// `voice` feature AND a model is installed). Audio and transcripts are
+    /// memory-only, per connection.
+    pub voice: voice::Voice,
     /// Session names whose busy→quiet detector should reset — sent when a
     /// precise `command_finished` arrives (M4c), so the heuristic doesn't
     /// *also* fire "went quiet" for the same command. Consumed by the

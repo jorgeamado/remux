@@ -1,4 +1,4 @@
-use crate::{paneview, tmux, App};
+use crate::{paneview, tmux, voice, App};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -53,6 +53,12 @@ const CHAT_SEND_MAX: usize = 8 * 1024;
 const PRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const PRESS_REPLAY_IDS: usize = 32;
 const PRESS_MAX_REQUEST_ID: usize = 64;
+/// Voice dictation: cap on one utterance's buffered audio (~1.9 MiB of
+/// 16 kHz mono i16). The buffer is per connection, memory-only, and dropped
+/// on end/cancel/disconnect.
+const VOICE_MAX_SAMPLES: usize = voice::SAMPLE_RATE * voice::MAX_UTTERANCE_SECS;
+/// Reject utterances shorter than this (250 ms) — a stray tap, not speech.
+const VOICE_MIN_SAMPLES: usize = voice::SAMPLE_RATE / 4;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -131,6 +137,19 @@ enum ClientMsg {
     ChatMode {
         pane: String,
     },
+    /// Begin a voice utterance (dictation into the composer). Resets this
+    /// connection's audio buffer. Available to observers too — the transcript
+    /// only ever returns to this connection's composer, it types nothing.
+    VoiceStart,
+    /// One chunk of the utterance: base64 of little-endian 16 kHz mono i16
+    /// PCM. Ignored unless a voice_start is active.
+    VoiceChunk {
+        data: String,
+    },
+    /// Utterance done: transcribe the buffer and reply with voice_result.
+    VoiceEnd,
+    /// Abandon the utterance (mic dismissed, page hidden): drop the buffer.
+    VoiceCancel,
     Ping,
 }
 
@@ -141,6 +160,9 @@ enum ServerMsg<'a> {
         state: &'a str,
         session: &'a str,
         device: &'a str,
+        /// Host offers voice dictation (build feature + installed model) —
+        /// gates the client's mic button.
+        voice: bool,
     },
     Error {
         code: &'a str,
@@ -174,6 +196,19 @@ enum ServerMsg<'a> {
     TerminalPressResult {
         request_id: &'a str,
         status: &'a str,
+    },
+    /// Transcript of a finished utterance — only ever sent to the connection
+    /// that streamed the audio. The client puts it in the composer; nothing
+    /// is typed or executed.
+    VoiceResult {
+        text: &'a str,
+    },
+    /// A voice problem the mic UI should surface (unavailable, too long,
+    /// transcription failed). Distinct from `Error` so the client can reset
+    /// its mic state machine without inspecting generic error codes.
+    VoiceError {
+        code: &'a str,
+        message: &'a str,
     },
     Pong,
 }
@@ -702,11 +737,19 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
     // against client-side double-fire, e.g. iOS pointer duplication).
     let mut last_press: Option<std::time::Instant> = None;
     let mut press_seen: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // Voice dictation: the utterance being streamed (memory-only, bounded)
+    // and whether a transcription task is still running for this connection
+    // (one in flight — inference is seconds of CPU).
+    let mut voice_buf: Vec<i16> = Vec::new();
+    let mut voice_active = false;
+    let voice_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let voice_avail = app.voice.available();
     let status = |state: &str| {
         json(&ServerMsg::Status {
             state,
             session: &session,
             device: &device.name,
+            voice: voice_avail,
         })
     };
     let _ = out_tx.send(status("observer")).await;
@@ -1165,6 +1208,130 @@ async fn handle(socket: WebSocket, app: Arc<App>) -> anyhow::Result<()> {
                             })
                             .await;
                         }
+                    }
+                    Ok(ClientMsg::VoiceStart) => {
+                        if !voice_avail {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::VoiceError {
+                                    code: "voice_unavailable",
+                                    message: "voice input is not enabled on this host",
+                                }))
+                                .await;
+                        } else if voice_busy.load(std::sync::atomic::Ordering::Relaxed) {
+                            let _ = out_tx
+                                .send(json(&ServerMsg::VoiceError {
+                                    code: "voice_busy",
+                                    message: "still transcribing the last utterance",
+                                }))
+                                .await;
+                        } else {
+                            voice_active = true;
+                            voice_buf.clear();
+                        }
+                    }
+                    Ok(ClientMsg::VoiceChunk { data }) => {
+                        // Chunks are only buffered inside an active utterance,
+                        // so a client can't grow the buffer without voice being
+                        // offered (voice_start gates on availability).
+                        if voice_active {
+                            match voice::decode_pcm(&data) {
+                                Some(samples)
+                                    if voice_buf.len() + samples.len() <= VOICE_MAX_SAMPLES =>
+                                {
+                                    voice_buf.extend_from_slice(&samples);
+                                }
+                                Some(_) => {
+                                    voice_active = false;
+                                    voice_buf = Vec::new(); // release, don't retain capacity
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::VoiceError {
+                                            code: "voice_too_long",
+                                            message: "utterance too long (60s max)",
+                                        }))
+                                        .await;
+                                }
+                                None => {
+                                    voice_active = false;
+                                    voice_buf = Vec::new();
+                                    let _ = out_tx
+                                        .send(json(&ServerMsg::VoiceError {
+                                            code: "voice_bad_chunk",
+                                            message: "malformed audio chunk",
+                                        }))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(ClientMsg::VoiceEnd) => {
+                        if voice_active {
+                            voice_active = false;
+                            let pcm = std::mem::take(&mut voice_buf);
+                            if pcm.len() < VOICE_MIN_SAMPLES {
+                                let _ = out_tx
+                                    .send(json(&ServerMsg::VoiceError {
+                                        code: "voice_too_short",
+                                        message: "didn't catch that",
+                                    }))
+                                    .await;
+                            } else {
+                                // Transcribe off the receive loop so keystrokes
+                                // keep flowing during the seconds of inference;
+                                // the result goes back through out_tx.
+                                voice_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let app = app.clone();
+                                let sess = session.clone();
+                                let out = out_tx.clone();
+                                let busy = voice_busy.clone();
+                                tokio::spawn(async move {
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        // Bias towards this session's recent
+                                        // commands (memory-only; never logged),
+                                        // then snap command-position tokens to
+                                        // the dictionary (PATH + recent).
+                                        let recent = app.feed.recent_commands(&sess, 40);
+                                        let prompt = voice::build_prompt(&recent);
+                                        app.voice.transcribe(&pcm, &prompt).map(|t| {
+                                            voice::correct_commands(
+                                                &t,
+                                                app.voice.path_commands(),
+                                                &recent,
+                                            )
+                                        })
+                                    })
+                                    .await;
+                                    let msg = match res {
+                                        Ok(Ok(text)) if !text.trim().is_empty() => {
+                                            json(&ServerMsg::VoiceResult { text: &text })
+                                        }
+                                        Ok(Ok(_)) => json(&ServerMsg::VoiceError {
+                                            code: "voice_empty",
+                                            message: "didn't catch that",
+                                        }),
+                                        Ok(Err(e)) => {
+                                            tracing::warn!("voice transcription failed: {e:#}");
+                                            json(&ServerMsg::VoiceError {
+                                                code: "voice_failed",
+                                                message: "transcription failed",
+                                            })
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("voice task failed: {e:#}");
+                                            json(&ServerMsg::VoiceError {
+                                                code: "voice_failed",
+                                                message: "transcription failed",
+                                            })
+                                        }
+                                    };
+                                    let _ = out.send(msg).await;
+                                    busy.store(false, std::sync::atomic::Ordering::Relaxed);
+                                });
+                            }
+                        }
+                    }
+                    Ok(ClientMsg::VoiceCancel) => {
+                        voice_active = false;
+                        voice_buf = Vec::new();
                     }
                     Ok(ClientMsg::Ping) => {
                         let _ = out_tx.send(json(&ServerMsg::Pong)).await;

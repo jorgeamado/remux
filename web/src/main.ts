@@ -315,6 +315,7 @@ function connect(): void {
     clearPermissionCards();
     clearFeed();
     clearPaneViews();
+    voiceReset(); // an in-flight utterance/transcription died with the socket
     stopPing();
     if (!intentionalClose) {
       setStatus("offline — reconnecting…", "offline");
@@ -394,6 +395,9 @@ interface ControlMsg {
   /** terminal_press_result frames: echoed request id + outcome */
   request_id?: string;
   status?: string;
+  /** status frames: host offers voice dictation (gates the mic button).
+      voice_result frames reuse `text`; voice_error reuses code/message. */
+  voice?: boolean;
 }
 
 /** A pane's structured view state, rendered as a custom interface. */
@@ -446,6 +450,7 @@ function handleControl(msg: ControlMsg): void {
       setStatus(sessionTitle, "connected");
       if (pingTimer === undefined) startPing();
       const nowController = msg.state === "controller";
+      setVoiceAvailable(msg.voice === true);
       setRole(nowController);
       renderTabs(); // session may have changed
       if (nowController) {
@@ -489,6 +494,12 @@ function handleControl(msg: ControlMsg): void {
       break;
     case "terminal_press_result":
       onPressResult(msg);
+      break;
+    case "voice_result":
+      onVoiceResult(msg.text ?? "");
+      break;
+    case "voice_error":
+      onVoiceError(msg.message ?? "voice failed");
       break;
     case "pong": {
       const rtt = Math.max(1, Math.round(performance.now() - pingSentAt));
@@ -2374,6 +2385,191 @@ keysToggle.addEventListener("pointerdown", (ev) => {
   ev.preventDefault();
   keypanel.hidden = !keypanel.hidden;
   keysToggle.textContent = keypanel.hidden ? "⌃" : "⌄";
+});
+
+// ---------- voice dictation (opt-in; docs/voice.md) ----------
+// The daemon advertises `voice` in its status frame only when built with the
+// feature and a whisper model is installed — otherwise the mic button stays
+// hidden and none of this runs. Tap to record, tap again to transcribe:
+// getUserMedia → AudioWorklet (raw Float32 at the context rate) → downsample
+// to 16 kHz mono i16 → base64 chunks over the control WS. The transcript is
+// inserted into the composer for review — dictation NEVER presses Enter.
+
+const micBtn = $<HTMLButtonElement>("composer-mic");
+type MicState = "idle" | "rec" | "busy";
+let micState: MicState = "idle";
+let micStream: MediaStream | null = null;
+let micCtx: AudioContext | null = null;
+let micBusyTimer: number | undefined;
+// Downsampled samples not yet sent (flushed every VOICE_CHUNK_SAMPLES).
+let micPending: number[] = [];
+let micSentAny = false;
+
+// ~0.5 s per chunk: 8000 samples * 2 B → ~21 KB base64, well under the
+// daemon's 64 KiB frame cap and its text-message rate budget.
+const VOICE_CHUNK_SAMPLES = 8000;
+const VOICE_RATE = 16000;
+
+function setVoiceAvailable(on: boolean): void {
+  micBtn.hidden = !on;
+  if (!on && micState !== "idle") voiceTeardown("idle");
+}
+
+function setMicState(s: MicState): void {
+  micState = s;
+  micBtn.classList.toggle("rec", s === "rec");
+  micBtn.classList.toggle("busy", s === "busy");
+}
+
+/// Linear-interpolation downsampler with carry across blocks. The worklet
+/// (public/voice-worklet.js — a real file; the CSP forbids blob: modules)
+/// just ships raw input blocks; resampling happens here where it's easier
+/// to keep fractional state across blocks.
+function makeDownsampler(srcRate: number): (block: Float32Array) => void {
+  const step = srcRate / VOICE_RATE;
+  let carry = new Float32Array(0);
+  let pos = 0; // fractional read position into carry+block
+  return (block: Float32Array) => {
+    const buf = new Float32Array(carry.length + block.length);
+    buf.set(carry);
+    buf.set(block, carry.length);
+    while (pos + 1 < buf.length) {
+      const i = Math.floor(pos);
+      const frac = pos - i;
+      const s = buf[i] * (1 - frac) + buf[i + 1] * frac;
+      micPending.push(Math.max(-32768, Math.min(32767, Math.round(s * 32767))));
+      pos += step;
+    }
+    const keep = Math.floor(pos);
+    carry = buf.slice(keep);
+    pos -= keep;
+    while (micPending.length >= VOICE_CHUNK_SAMPLES) {
+      voiceSendChunk(micPending.splice(0, VOICE_CHUNK_SAMPLES));
+    }
+  };
+}
+
+function voiceSendChunk(samples: number[]): void {
+  if (samples.length === 0) return;
+  const bytes = new Uint8Array(new Int16Array(samples).buffer);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  sendJson({ type: "voice_chunk", data: btoa(bin) });
+  micSentAny = true;
+}
+
+/// Stop capture hardware/graph. Does not touch the daemon-side utterance.
+function voiceStopCapture(): void {
+  micStream?.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  void micCtx?.close();
+  micCtx = null;
+  micPending = [];
+}
+
+function voiceTeardown(next: MicState): void {
+  voiceStopCapture();
+  clearTimeout(micBusyTimer);
+  setMicState(next);
+}
+
+async function voiceStart(): Promise<void> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // Create/resume the AudioContext synchronously in the tap gesture — iOS
+  // refuses to start one later.
+  micCtx = new AudioContext();
+  void micCtx.resume();
+  setMicState("rec");
+  micPending = [];
+  micSentAny = false;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    const ctx = micCtx;
+    if (!ctx || micState !== "rec") return; // cancelled while permission was up
+    await ctx.audioWorklet.addModule("/voice-worklet.js");
+    if (micState !== "rec" || !micStream) return;
+    const source = ctx.createMediaStreamSource(micStream);
+    const node = new AudioWorkletNode(ctx, "remux-pcm", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    const feed = makeDownsampler(ctx.sampleRate);
+    node.port.onmessage = (ev) => {
+      if (micState === "rec") feed(ev.data as Float32Array);
+    };
+    source.connect(node);
+    // Keep the node pulled by the graph without audible output.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    node.connect(mute);
+    mute.connect(ctx.destination);
+    sendJson({ type: "voice_start" });
+  } catch (err) {
+    console.warn("voice capture failed:", err);
+    voiceTeardown("idle");
+    showHint("Microphone unavailable");
+  }
+}
+
+function voiceFinish(): void {
+  // Flush the sub-chunk tail before ending the utterance.
+  voiceSendChunk(micPending.splice(0));
+  const spoke = micSentAny;
+  voiceTeardown(spoke ? "busy" : "idle");
+  if (!spoke) return; // mic never produced audio — nothing to transcribe
+  sendJson({ type: "voice_end" });
+  // The daemon answers with voice_result or voice_error; if the socket drops
+  // in between, don't leave the button spinning forever.
+  micBusyTimer = window.setTimeout(() => {
+    if (micState === "busy") setMicState("idle");
+  }, 30_000);
+}
+
+function voiceCancel(): void {
+  if (micState === "rec") sendJson({ type: "voice_cancel" });
+  voiceTeardown("idle");
+}
+
+/// Socket died: nothing to tell the daemon (its buffer drops with the
+/// connection) — just put the local machine back to idle.
+function voiceReset(): void {
+  if (micState !== "idle") voiceTeardown("idle");
+}
+
+function onVoiceResult(text: string): void {
+  clearTimeout(micBusyTimer);
+  setMicState("idle");
+  if (!text) return;
+  insertIntoComposer(text);
+  composerInput.focus();
+}
+
+function onVoiceError(message: string): void {
+  clearTimeout(micBusyTimer);
+  if (micState === "rec") voiceTeardown("idle");
+  else setMicState("idle");
+  showHint(message);
+}
+
+micBtn.addEventListener("pointerdown", (ev) => {
+  ev.preventDefault(); // keep composer focus semantics like the other buttons
+  if (micState === "idle") void voiceStart();
+  else if (micState === "rec") voiceFinish();
+  // busy: ignore taps until the result/error lands
+});
+
+// A hidden page can't record (iOS mutes the track anyway) — drop the
+// utterance rather than transcribe a truncated tail.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && micState === "rec") voiceCancel();
+});
+window.addEventListener("pagehide", () => {
+  if (micState === "rec") voiceCancel();
 });
 
 // ---------- wire up ----------

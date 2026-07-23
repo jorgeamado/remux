@@ -33,6 +33,7 @@ pub async fn start_server(session: &str) -> (SocketAddr, Arc<App>) {
         pane_views: Default::default(),
         dash_windows: Default::default(),
         feed: Default::default(),
+        voice: Default::default(),
         detector_reset: tokio::sync::broadcast::channel(16).0,
     });
     remux::attention::spawn(app.clone());

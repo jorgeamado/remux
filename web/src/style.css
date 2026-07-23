@@ -442,6 +442,25 @@ button {
   min-height: 36px;
 }
 
+/* Mic states: red pulse while capturing, dimmed fast pulse while the host
+   transcribes. Idle inherits plain .btn. */
+#composer-mic.rec {
+  color: #f55;
+  border-color: #f55;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+
+#composer-mic.busy {
+  opacity: 0.5;
+  animation: mic-pulse 0.5s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
 /* ---------- key panel ---------- */
 
 #keyrow,

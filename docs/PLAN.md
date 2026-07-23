@@ -597,19 +597,19 @@ a real gap.
   remux fully VPN-agnostic (today Tailscale is only "special" because
   `tailscale cert` is the zero-config way to satisfy iOS's trusted-TLS
   requirement — there is no code dependency on it).
-- **Voice input for the composer** (idea, decide later) — dictate commands to the
-  phone composer by speech, but with a *domain-adapted* recognizer rather than a
-  generic dictation engine: bias/condition the speech-to-text on the CLI
-  vocabulary actually in play — installed tools' names, their subcommands/flags
-  (from `--help`/completion specs/man pages), symbols and paths visible in the
-  pane, and recent shell history — so it transcribes `git rebase -i HEAD~3`, not
-  "git rebase eye head three". Open questions to resolve when we pick this up:
-  (a) contextual biasing / hotword lists over a general STT vs. a small
-  fine-tuned model; (b) where the dictionary comes from and how it's kept current
-  per session/host; (c) on-device vs server inference under the secrets posture —
-  spoken commands and their transcripts can carry secrets, so audio/text should
-  stay memory-only and most likely on-device. Fits the composer, not the raw
-  terminal (the composer is already the edit-before-send surface).
+- **Voice input for the composer** — V1 shipped (docs/voice.md): opt-in
+  `voice` cargo feature + `remux voice download`; the phone streams 16 kHz
+  PCM over the control WS and the *daemon host* transcribes with whisper.cpp,
+  the initial_prompt biased on this session's recent commands. The original
+  open questions resolved as: (a) contextual biasing + a conservative
+  deterministic post-pass, not a fine-tuned model (the vocabulary changes per
+  host/session); (b) V1 dictionary = the memory-only command feed, rebuilt
+  per utterance — pane tokens, PATH basenames and completion specs are the
+  V2 follow-ups; (c) host-side inference IS within the secrets posture — the
+  daemon host already sees all terminal I/O; audio/transcripts stay
+  memory-only and per-connection. Fits the composer, not the raw terminal
+  (the composer is already the edit-before-send surface); dictation never
+  presses Enter.
 
 ## Sequencing rationale
 

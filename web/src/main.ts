@@ -2400,7 +2400,6 @@ type MicState = "idle" | "rec" | "busy";
 let micState: MicState = "idle";
 let micStream: MediaStream | null = null;
 let micCtx: AudioContext | null = null;
-let micWorkletUrl: string | null = null;
 let micBusyTimer: number | undefined;
 // Downsampled samples not yet sent (flushed every VOICE_CHUNK_SAMPLES).
 let micPending: number[] = [];
@@ -2422,23 +2421,10 @@ function setMicState(s: MicState): void {
   micBtn.classList.toggle("busy", s === "busy");
 }
 
-/// The worklet just ships raw input blocks to the main thread; resampling
-/// happens here where it's easier to keep fractional state across blocks.
-function voiceWorkletUrl(): string {
-  if (!micWorkletUrl) {
-    const src = `registerProcessor("remux-pcm", class extends AudioWorkletProcessor {
-      process(inputs) {
-        const ch = inputs[0] && inputs[0][0];
-        if (ch) this.port.postMessage(ch.slice(0));
-        return true;
-      }
-    });`;
-    micWorkletUrl = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-  }
-  return micWorkletUrl;
-}
-
-/// Linear-interpolation downsampler with carry across blocks.
+/// Linear-interpolation downsampler with carry across blocks. The worklet
+/// (public/voice-worklet.js — a real file; the CSP forbids blob: modules)
+/// just ships raw input blocks; resampling happens here where it's easier
+/// to keep fractional state across blocks.
 function makeDownsampler(srcRate: number): (block: Float32Array) => void {
   const step = srcRate / VOICE_RATE;
   let carry = new Float32Array(0);
@@ -2504,7 +2490,7 @@ async function voiceStart(): Promise<void> {
     });
     const ctx = micCtx;
     if (!ctx || micState !== "rec") return; // cancelled while permission was up
-    await ctx.audioWorklet.addModule(voiceWorkletUrl());
+    await ctx.audioWorklet.addModule("/voice-worklet.js");
     if (micState !== "rec" || !micStream) return;
     const source = ctx.createMediaStreamSource(micStream);
     const node = new AudioWorkletNode(ctx, "remux-pcm", {
@@ -2523,7 +2509,8 @@ async function voiceStart(): Promise<void> {
     node.connect(mute);
     mute.connect(ctx.destination);
     sendJson({ type: "voice_start" });
-  } catch {
+  } catch (err) {
+    console.warn("voice capture failed:", err);
     voiceTeardown("idle");
     showHint("Microphone unavailable");
   }
